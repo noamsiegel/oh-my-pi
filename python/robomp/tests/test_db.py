@@ -758,6 +758,32 @@ def test_pr_review_posted_finding_status_update_by_comment(db: Database) -> None
     assert db.list_pr_review_posted_findings("octo/widget", 12)[0].status == "resolved"
 
 
+def test_pr_review_posted_finding_normalizes_nested_suggestion(db: Database) -> None:
+    count = db.record_pr_review_posted_findings(
+        issue_key="octo/widget#13",
+        repo="octo/widget",
+        pr_number=13,
+        head_sha="abc",
+        review_id=45,
+        findings=[
+            {
+                "path": "src/a.ts",
+                "line": 10,
+                "body": "Fix this bug.",
+                "severity": "required",
+                "intent": "bug",
+                "suggestion": {"kind": "github_suggestion", "replacement": "return true;"},
+            }
+        ],
+        posted_comments=[{"id": 56, "path": "src/a.ts", "line": 10, "body": "Fix this bug."}],
+    )
+
+    rows = db.list_pr_review_posted_findings("octo/widget", 13)
+    assert count == 1
+    assert rows[0].suggestion_replacement == "return true;"
+    assert rows[0].suggestion_hash
+
+
 def test_pr_review_gap_event_dedupes_and_lists(db: Database) -> None:
     kwargs = dict(
         gap_kind="missed_by_agent",

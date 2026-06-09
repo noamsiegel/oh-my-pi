@@ -133,6 +133,7 @@ submit_pr_review(body="<summary>", event="APPROVE|REQUEST_CHANGES|COMMENT")
 - Use the event recommended by `validate_pr_review`: `REQUEST_CHANGES` for any critical/required finding,
   `APPROVE` when clean, `COMMENT` only for advisory/no-review-request or explicit environment/
   self-authored limitations.
+- Do not submit REQUEST_CHANGES unless at least one validated inline finding will be posted; resolve stale verify-status body concerns or add a concrete anchored finding first.
 - Self-authored PRs cannot accept terminal reviews from the author; use `COMMENT` and say it
   would otherwise approve/request changes.
 - The body summary must be 2–5 terse lines above the automatically appended Review process details.

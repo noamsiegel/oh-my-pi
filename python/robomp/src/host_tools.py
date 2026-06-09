@@ -1611,6 +1611,8 @@ def _build_delegate_pr_review(bindings: ToolBindings) -> HostTool[Any, Any]:
                                 result_path,
                                 "--model-family",
                                 selected_family,
+                                "--model",
+                                candidate_label,
                                 "--out",
                                 ingest_path,
                             ],
@@ -1676,7 +1678,7 @@ def _build_delegate_pr_review(bindings: ToolBindings) -> HostTool[Any, Any]:
                 "domains_covered": [domain],
                 "completed": True,
                 "result_path": str(result_path),
-                "model": selected_model,
+                "model": selected_model_label,
                 "model_family": selected_family,
             }
             if isinstance(reviewers, list):
@@ -1684,6 +1686,8 @@ def _build_delegate_pr_review(bindings: ToolBindings) -> HostTool[Any, Any]:
                     if isinstance(candidate, dict) and candidate.get("id") == reviewer and domain in candidate.get("domains_covered", []):
                         entry = candidate
                         break
+                entry["model"] = selected_model_label
+                entry["model_family"] = selected_family
                 if failures:
                     entry["model_attempts"] = {"selected": selected_model_label, "failures": failures}
                 _write_control_json(bindings, metadata_path, metadata)
@@ -2095,6 +2099,18 @@ def _pr_review_file_paths(evidence: Mapping[str, Any]) -> list[str]:
     return out
 
 
+def _pr_review_evidence_int(evidence: Mapping[str, Any], key: str) -> int | None:
+    value = evidence.get(key)
+    if isinstance(value, int):
+        return value
+    view = evidence.get("view")
+    if isinstance(view, Mapping):
+        view_value = view.get(key)
+        if isinstance(view_value, int):
+            return view_value
+    return None
+
+
 def _pr_review_process_report(
     bindings: ToolBindings,
     *,
@@ -2114,10 +2130,12 @@ def _pr_review_process_report(
     recommendation_source = recommendation or validated_recommendation
 
     file_paths = _pr_review_file_paths(evidence)
-    changed_files = evidence.get("changed_files")
+    changed_files = _pr_review_evidence_int(evidence, "changed_files")
+    if changed_files is None:
+        changed_files = _pr_review_evidence_int(evidence, "changedFiles")
     changed_count = changed_files if isinstance(changed_files, int) else len(file_paths)
-    additions = evidence.get("additions")
-    deletions = evidence.get("deletions")
+    additions = _pr_review_evidence_int(evidence, "additions")
+    deletions = _pr_review_evidence_int(evidence, "deletions")
     head_sha = evidence.get("head_sha")
     head_short = head_sha[:12] if isinstance(head_sha, str) and head_sha else "unknown"
     sampled_paths = file_paths[:12]
@@ -2284,6 +2302,7 @@ def _build_submit_pr_review(bindings: ToolBindings) -> HostTool[Any, Any]:
             msg = "submit_pr_review requires a non-empty 'body'."
             _audit(bindings, "submit_pr_review", args, error=msg)
             _raise_command(msg)
+        requested_body = body.strip()
         requested_event = str(args.get("event") or "COMMENT").upper()
         terminal_enabled = bool(bindings.settings and bindings.settings.pr_review_terminal_events)
         if requested_event not in _PR_REVIEW_EVENTS:
@@ -2351,7 +2370,12 @@ def _build_submit_pr_review(bindings: ToolBindings) -> HostTool[Any, Any]:
             staged_count = len(staged)
             comments = [_review_comment_to_payload(comment) for comment in staged]
             submit_body = body.strip()
-        operation_suffix = _side_effect_payload_suffix({"body": submit_body, "comments": comments, "event": raw_event})
+        if raw_event == "REQUEST_CHANGES" and len(comments) == 0:
+            msg = "REQUEST_CHANGES would post zero inline comments"
+            _audit(bindings, "submit_pr_review", args, error=msg)
+            _raise_command(msg)
+        operation_body = requested_body if pr_review_payload_available else submit_body
+        operation_suffix = _side_effect_payload_suffix({"body": operation_body, "comments": comments, "event": raw_event})
         operation_key = f"submit_pr_review:{bindings.issue_key}:{raw_event}:{operation_suffix}"
         if not bindings.db.reserve_side_effect(operation_key):
             if bindings.db.side_effect_succeeded(operation_key):
@@ -2378,7 +2402,7 @@ def _build_submit_pr_review(bindings: ToolBindings) -> HostTool[Any, Any]:
             _raise_command(f"GitHub rejected PR review: {exc.status} {exc.message}")
         completed_head_sha: str | None = None
         posted_findings_count = 0
-        posted_findings_warning: str | None = None
+        tracking_failure: str | None = None
         if pr_review_payload_available:
             paths = pr_review_paths(bindings.workspace)
             try:
@@ -2389,25 +2413,28 @@ def _build_submit_pr_review(bindings: ToolBindings) -> HostTool[Any, Any]:
                     findings = []
                 head_sha = evidence_data.get("head_sha") if isinstance(evidence_data, dict) else None
                 completed_head_sha = head_sha if isinstance(head_sha, str) else None
-                posted_comments = _run_coro(
-                    bindings.loop,
-                    bindings.github.list_review_comments_for_review(
-                        bindings.repo.full_name,
-                        bindings.default_comment_number,
-                        review.id,
-                    ),
-                )
-                posted_findings_count = bindings.db.record_pr_review_posted_findings(
-                    issue_key=bindings.issue_key,
-                    repo=bindings.repo.full_name,
-                    pr_number=bindings.default_comment_number,
-                    head_sha=completed_head_sha,
-                    review_id=review.id,
-                    findings=findings,
-                    posted_comments=[asdict(comment) for comment in posted_comments],
-                )
+                if findings or comments:
+                    posted_comments = _run_coro(
+                        bindings.loop,
+                        bindings.github.list_review_comments_for_review(
+                            bindings.repo.full_name,
+                            bindings.default_comment_number,
+                            review.id,
+                        ),
+                    )
+                    posted_findings_count = bindings.db.record_pr_review_posted_findings(
+                        issue_key=bindings.issue_key,
+                        repo=bindings.repo.full_name,
+                        pr_number=bindings.default_comment_number,
+                        head_sha=completed_head_sha,
+                        review_id=review.id,
+                        findings=findings,
+                        posted_comments=[asdict(comment) for comment in posted_comments],
+                    )
+                    if len(findings) > 0 and posted_findings_count < len(findings):
+                        tracking_failure = f"posted {posted_findings_count} of {len(findings)} finding(s)"
             except Exception as exc:
-                posted_findings_warning = str(exc)
+                tracking_failure = str(exc)
         bindings.db.record_pr_review_completed_review(
             issue_key=bindings.issue_key,
             repo=bindings.repo.full_name,
@@ -2431,8 +2458,11 @@ def _build_submit_pr_review(bindings: ToolBindings) -> HostTool[Any, Any]:
             result["posted_findings"] = posted_findings_count
             result["recommended_event"] = recommended_event
             result["recommendation_reason"] = recommendation.get("reason")
-            if posted_findings_warning is not None:
-                result["posted_findings_warning"] = posted_findings_warning
+        if tracking_failure is not None:
+            bindings.db.mark_side_effect_succeeded(operation_key)
+            msg = f"PR review submitted id={review.id} but posted finding tracking failed: {tracking_failure}"
+            _audit(bindings, "submit_pr_review", args, error=msg)
+            _raise_command(msg)
         bindings.db.mark_side_effect_succeeded(operation_key)
         _audit(bindings, "submit_pr_review", args, result=result)
         suffix = f"; requested_event={requested_event}" if requested_event != raw_event else ""

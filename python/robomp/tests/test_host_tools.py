@@ -1188,6 +1188,43 @@ def test_submit_pr_review_uses_blocking_recommendation_to_request_changes_even_i
     assert "requested_event=APPROVE" in result
 
 
+
+def test_submit_pr_review_refuses_request_changes_without_inline_comments(
+    db: Database, tmp_path: Path
+) -> None:
+    called = False
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal called
+        if request.method == "POST" and request.url.path.endswith("/reviews"):
+            called = True
+            return httpx.Response(200, json={"id": 49, "user": {"login": "robomp-bot"}, "body": "", "state": "CHANGES_REQUESTED"})
+        return httpx.Response(404, json={"message": "unrouted"})
+
+    bindings, loop, t = _review_bindings(db, tmp_path, httpx.MockTransport(handler))
+    helper = tmp_path / "pr-review-helper.js"
+    _seed_pr_review_payload_state(
+        bindings,
+        helper,
+        recommendation_event="REQUEST_CHANGES",
+        blocking_count=1,
+        findings=[],
+    )
+    bindings = replace(bindings, settings=Settings.model_construct(pr_review_terminal_events=True, pr_review_helper=helper))
+    try:
+        stage_tool = next(x for x in build(bindings) if x.name == "pr_review_comment")
+        submit_tool = next(x for x in build(bindings) if x.name == "submit_pr_review")
+        stage_tool.execute({"path": "src/app.py", "line": 12, "body": "staged"}, _ctx())
+        with pytest.raises(RpcCommandError, match="REQUEST_CHANGES would post zero inline comments"):
+            submit_tool.execute({"body": "summary", "event": "APPROVE"}, _ctx())
+    finally:
+        _stop_loop(loop, t)
+
+    assert called is False
+    staged = db.list_staged_review_comments(bindings.issue_key)
+    assert len(staged) == 1
+    assert staged[0].body == "staged"
+
 def test_submit_pr_review_keeps_comment_for_advisory_recommendation(db: Database, tmp_path: Path) -> None:
     captured: dict[str, Any] = {}
 
@@ -1264,10 +1301,12 @@ def test_submit_pr_review_process_report_lists_delegated_models_and_diff_evidenc
             ]
         },
         evidence={
-            "view": {"files": [{"path": "apps/hoa/api/actions/fundingrequest.py"}]},
-            "changed_files": 1,
-            "additions": 12,
-            "deletions": 3,
+            "view": {
+                "changedFiles": 1,
+                "additions": 12,
+                "deletions": 3,
+                "files": [{"path": "apps/hoa/api/actions/fundingrequest.py"}],
+            },
             "head_sha": "abcdef1234567890",
         },
     )
@@ -1298,11 +1337,15 @@ def test_submit_pr_review_process_report_lists_delegated_models_and_diff_evidenc
     assert "Dependency/callsite review" in body
 
 
-def test_submit_pr_review_posted_comment_fetch_failure_is_advisory(db: Database, tmp_path: Path) -> None:
+def test_submit_pr_review_posted_comment_fetch_failure_fails_loudly_after_post(db: Database, tmp_path: Path) -> None:
     captured: dict[str, Any] = {}
+    post_count = 0
+    second_result = ""
 
     def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal post_count
         if request.method == "POST" and request.url.path.endswith("/reviews"):
+            post_count += 1
             captured["body"] = json.loads(request.content)
             return httpx.Response(
                 200,
@@ -1326,13 +1369,16 @@ def test_submit_pr_review_posted_comment_fetch_failure_is_advisory(db: Database,
         stage_tool = next(x for x in build(bindings) if x.name == "pr_review_comment")
         submit_tool = next(x for x in build(bindings) if x.name == "submit_pr_review")
         stage_tool.execute({"path": "src/app.py", "line": 12, "body": "finding"}, _ctx())
-        result = submit_tool.execute({"body": "summary", "event": "COMMENT"}, _ctx())
+        with pytest.raises(RpcCommandError, match="PR review submitted id=46 but posted finding tracking failed"):
+            submit_tool.execute({"body": "summary", "event": "COMMENT"}, _ctx())
+        second_result = submit_tool.execute({"body": "summary", "event": "COMMENT"}, _ctx())
     finally:
         _stop_loop(loop, t)
 
-    assert "submitted PR review id=46" in result
-    assert db.list_staged_review_comments(bindings.issue_key) == []
+    assert "body" in captured
     assert db.list_pr_review_posted_findings("octo/widget", 99) == []
+    assert "side effect already succeeded" in second_result
+    assert post_count == 1
 
 
 def test_submit_pr_review_self_authored_terminal_event_downgrades_to_comment(db: Database, tmp_path: Path) -> None:
@@ -1347,7 +1393,7 @@ def test_submit_pr_review_self_authored_terminal_event_downgrades_to_comment(db:
 
     bindings, loop, t = _review_bindings(db, tmp_path, httpx.MockTransport(handler))
     helper = tmp_path / "pr-review-helper.js"
-    _seed_pr_review_payload_state(bindings, helper, recommendation_event="APPROVE", blocking_count=0)
+    _seed_pr_review_payload_state(bindings, helper, recommendation_event="APPROVE", blocking_count=0, findings=[])
     bindings = replace(
         bindings,
         issue=replace(bindings.issue, author="noamsiegel"),
@@ -1426,7 +1472,8 @@ if (cmd === "classify") {
     domains_covered: [domain],
     completed: true,
     result_path: arg("--result-path"),
-    model_family: arg("--model-family")
+    model_family: arg("--model-family"),
+    model: arg("--model")
   });
   await Bun.write(metadataPath, JSON.stringify(metadata));
   await Bun.write(out, JSON.stringify({ok: true}));
@@ -1606,17 +1653,31 @@ def test_pr_review_suggestion_reaches_submit_payload(db: Database, tmp_path: Pat
     captured: dict[str, Any] = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
-        captured["body"] = json.loads(request.content)
-        return httpx.Response(
-            200,
-            json={
-                "id": 48,
-                "user": {"login": "robomp-bot"},
-                "body": captured["body"]["body"],
-                "state": "CHANGES_REQUESTED",
-                "submitted_at": "t",
-            },
-        )
+        if request.method == "POST" and request.url.path.endswith("/reviews"):
+            captured["body"] = json.loads(request.content)
+            return httpx.Response(
+                200,
+                json={
+                    "id": 48,
+                    "user": {"login": "robomp-bot"},
+                    "body": captured["body"]["body"],
+                    "state": "CHANGES_REQUESTED",
+                    "submitted_at": "t",
+                },
+            )
+        if request.method == "GET" and request.url.path.endswith("/reviews/48/comments"):
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "id": 4801,
+                        "path": "src/app.py",
+                        "line": 12,
+                        "body": "Use the narrower guard.\n\n```suggestion\nif value is not None:\n    return value\n```",
+                    }
+                ],
+            )
+        return httpx.Response(404, json={"message": "unrouted"})
 
     helper = tmp_path / "pr-review-helper.js"
     _write_pr_review_helper(helper)
@@ -1666,6 +1727,8 @@ def test_pr_review_suggestion_reaches_submit_payload(db: Database, tmp_path: Pat
             "body": "Use the narrower guard.\n\n```suggestion\nif value is not None:\n    return value\n```",
         }
     ]
+    posted = db.list_pr_review_posted_findings("octo/widget", 99)
+    assert posted[0].suggestion_replacement == "if value is not None:\n    return value"
 
 def test_validate_pr_review_requires_delegate_for_required_domains(db: Database, tmp_path: Path) -> None:
     helper = tmp_path / "pr-review-helper.js"
@@ -1754,6 +1817,7 @@ def test_delegate_pr_review_writes_metadata_and_unblocks_validate(
     assert _Rpc.attempts[:1] == ["anthropic/claude-opus-4-8"]
     assert _Rpc.kwargs_seen[0]["tools"] == ("read", "search")
     assert metadata["delegated_reviewers"][0]["model_family"] == "anthropic"
+    assert metadata["delegated_reviewers"][0]["model"] == "anthropic/claude-opus-4-8"
     assert "SecurityReviewer" in delegated
     assert "PR review delegation gate passed" in validated
 
@@ -1762,6 +1826,85 @@ def test_delegate_pr_review_uses_read_only_tools(
     db: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     test_delegate_pr_review_writes_metadata_and_unblocks_validate(db, tmp_path, monkeypatch)
+
+
+def test_delegate_pr_review_metadata_model_renders_in_process_report(
+    db: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path.endswith("/reviews"):
+            captured["body"] = json.loads(request.content)
+            return httpx.Response(
+                200,
+                json={"id": 52, "user": {"login": "robomp-bot"}, "body": captured["body"]["body"], "state": "APPROVED", "submitted_at": "t"},
+            )
+        if request.method == "GET" and request.url.path.endswith("/reviews/52/comments"):
+            return httpx.Response(200, json=[])
+        return httpx.Response(404, json={"message": "unrouted"})
+
+    helper = tmp_path / "pr-review-helper.js"
+    _write_pr_review_helper(helper)
+    bindings, loop, t = _review_bindings(db, tmp_path, httpx.MockTransport(handler))
+    bindings = replace(
+        bindings,
+        settings=Settings.model_construct(
+            pr_review_terminal_events=True,
+            pr_review_helper=helper,
+            request_timeout_seconds=30.0,
+            task_timeout_seconds=30.0,
+            model="openai-codex/gpt-5.5",
+            pr_review_delegate_models_raw="anthropic/claude-opus-4-8",
+            pr_review_delegate_model_map_raw="security=anthropic/claude-opus-4-8",
+        ),
+    )
+    paths = pr_review_paths(bindings.workspace)
+    save_json_checked(paths.evidence, {"head_sha": "payload-sha"})
+    save_json_checked(paths.classification, {"delegation_required": True, "domains_required": ["security", "correctness"]})
+
+    class _Turn:
+        def require_assistant_text(self) -> str:
+            return "overall: clean\nsummary: ok\nmodel_family: anthropic\nfindings: []\n"
+
+    class _Rpc:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+        def prompt_and_wait(self, prompt: str, *, timeout: float):
+            assert "security" in prompt
+            return _Turn()
+
+    monkeypatch.setattr(host_tools, "RpcClient", _Rpc)
+    try:
+        delegate = next(x for x in build(bindings) if x.name == "delegate_pr_review")
+        submit = next(x for x in build(bindings) if x.name == "submit_pr_review")
+        delegate.execute({}, _ctx())
+        metadata = json.loads(paths.metadata.read_text(encoding="utf-8"))
+        _seed_pr_review_payload_state(
+            bindings,
+            helper,
+            recommendation_event="APPROVE",
+            blocking_count=0,
+            optional_count=0,
+            recommendation_reason="clean",
+            findings=[],
+            metadata=metadata,
+            evidence={"head_sha": "payload-sha"},
+        )
+        submit.execute({"body": "clean", "event": "APPROVE"}, _ctx())
+    finally:
+        _stop_loop(loop, t)
+
+    body = captured["body"]["body"]
+    assert "(unknown model)" not in body
+    assert "anthropic/claude-opus-4-8" in body
 
 
 

@@ -1627,7 +1627,13 @@ class Database:
                 if not body:
                     body = str(finding)
                 body_hash = _body_hash(body) or ""
-                suggestion_replacement = finding.get("suggestion_replacement") or finding.get("suggestion")
+                suggestion_replacement = finding.get("suggestion_replacement")
+                if suggestion_replacement is None:
+                    suggestion = finding.get("suggestion")
+                    if isinstance(suggestion, Mapping) and suggestion.get("kind") == "github_suggestion":
+                        suggestion_replacement = suggestion.get("replacement")
+                    elif isinstance(suggestion, str):
+                        suggestion_replacement = suggestion
                 suggestion_hash = finding.get("suggestion_hash")
                 if suggestion_hash is None and suggestion_replacement is not None:
                     suggestion_hash = _body_hash(str(suggestion_replacement))
