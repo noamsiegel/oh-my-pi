@@ -27,6 +27,8 @@ def test_comment_review_retryable_includes_uv_environment_failures() -> None:
     assert tasks._comment_review_retryable("Verification note: `uv` is not installed in this workspace.")
     assert tasks._comment_review_retryable("error: command not found: uv")
     assert tasks._comment_review_retryable("local backend command could not run because uv is unavailable")
+    assert tasks._comment_review_retryable("`manage.py`/`yarn` unavailable at expected paths")
+    assert tasks._comment_review_retryable("error: command not found: yarn")
     assert not tasks._comment_review_retryable("review:clean — no blocking findings.")
 
 

@@ -547,25 +547,56 @@ class PrWorktreeResult:
     hydrated_paths: tuple[str, ...]
 
 
+def _pr_sparse_support_paths(path: str) -> tuple[str, ...]:
+    if not path.startswith("apps/hoa/"):
+        return ()
+    support = [
+        "apps/hoa/manage.py",
+        "apps/hoa/pyproject.toml",
+        "apps/hoa/uv.lock",
+    ]
+    if path.startswith("apps/hoa/hoa-web/"):
+        support.extend(
+            [
+                "apps/hoa/hoa-web/package.json",
+                "apps/hoa/hoa-web/yarn.lock",
+                "apps/hoa/hoa-web/turbo.jsonc",
+                "apps/hoa/hoa-web/apps/admin/package.json",
+                "apps/hoa/hoa-web/apps/admin/vite.config.ts",
+                "apps/hoa/hoa-web/apps/admin/vitest.config.ts",
+                "apps/hoa/hoa-web/apps/admin/tsconfig.json",
+                "apps/hoa/hoa-web/apps/admin/tsconfig.node.json",
+            ]
+        )
+    return tuple(support)
+
+
+def _append_safe_sparse_path(normalized: list[str], seen: set[str], raw: str) -> None:
+    path = raw.strip().replace("\\", "/")
+    parts = path.split("/")
+    if (
+        not path
+        or "\0" in path
+        or path.startswith("/")
+        or path.endswith("/")
+        or ".." in parts
+        or ".git" in parts
+    ):
+        raise ValueError(f"unsafe PR sparse checkout path: {raw!r}")
+    if path in seen:
+        return
+    seen.add(path)
+    normalized.append(path)
+
+
 def normalize_pr_sparse_paths(paths: Iterable[str]) -> tuple[str, ...]:
     normalized: list[str] = []
     seen: set[str] = set()
     for raw in paths:
         path = raw.strip().replace("\\", "/")
-        parts = path.split("/")
-        if (
-            not path
-            or "\0" in path
-            or path.startswith("/")
-            or path.endswith("/")
-            or ".." in parts
-            or ".git" in parts
-        ):
-            raise ValueError(f"unsafe PR sparse checkout path: {raw!r}")
-        if path in seen:
-            continue
-        seen.add(path)
-        normalized.append(path)
+        _append_safe_sparse_path(normalized, seen, raw)
+        for support_path in _pr_sparse_support_paths(path):
+            _append_safe_sparse_path(normalized, seen, support_path)
     if not normalized:
         raise ValueError("PR sparse checkout requires at least one changed path")
     return tuple(normalized)

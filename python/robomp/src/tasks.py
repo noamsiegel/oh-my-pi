@@ -413,6 +413,10 @@ def _comment_review_retryable(review_body: str) -> bool:
         "`uv` is unavailable",
         "uv is not installed",
         "uv is unavailable",
+        "manage.py`/`yarn` unavailable",
+        "manage.py/yarn unavailable",
+        "yarn unavailable",
+        "command not found: yarn",
     )
     return any(marker in body for marker in retryable_markers)
 

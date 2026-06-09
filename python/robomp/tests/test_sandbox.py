@@ -22,6 +22,9 @@ from robomp.git_ops import (
 from robomp.git_ops import (
     fetch_ref as git_fetch_ref,
 )
+from robomp.git_ops import (
+    normalize_pr_sparse_paths,
+)
 from robomp.sandbox import (
     SandboxManager,
     Workspace,
@@ -1541,6 +1544,24 @@ def test_fetch_pr_head_backfills_missing_blobs_into_partial_clone(tmp_path: Path
         env=os.environ | {"GIT_TERMINAL_PROMPT": "0"},
     )
     assert (ws_dir / "pr.txt").read_text(encoding="utf-8") == "pr blob payload\n"
+
+
+def test_normalize_pr_sparse_paths_adds_hoa_tooling_support() -> None:
+    paths = normalize_pr_sparse_paths(
+        (
+            "apps/hoa/api/admin_api/viewsets/charges.py",
+            "apps/hoa/hoa-web/apps/admin/src/routes/specific/charge/list.tsx",
+        )
+    )
+
+    assert "apps/hoa/api/admin_api/viewsets/charges.py" in paths
+    assert "apps/hoa/hoa-web/apps/admin/src/routes/specific/charge/list.tsx" in paths
+    assert "apps/hoa/manage.py" in paths
+    assert "apps/hoa/pyproject.toml" in paths
+    assert "apps/hoa/uv.lock" in paths
+    assert "apps/hoa/hoa-web/package.json" in paths
+    assert "apps/hoa/hoa-web/yarn.lock" in paths
+    assert "apps/hoa/hoa-web/apps/admin/package.json" in paths
 
 
 def test_prepare_pr_worktree_sparse_hydrates_changed_paths_only(tmp_path: Path) -> None:
