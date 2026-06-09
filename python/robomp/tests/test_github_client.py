@@ -277,6 +277,71 @@ def test_list_pr_commits_parses_message_and_authors() -> None:
     ]
 
 
+def test_get_commit_ci_status_passed_from_check_runs_and_statuses() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/repos/octo/widget/commits/abc123/check-runs":
+            assert request.url.params.get("per_page") == "100"
+            assert request.url.params.get("page") == "1"
+            return httpx.Response(
+                200,
+                json={
+                    "total_count": 1,
+                    "check_runs": [
+                        {
+                            "name": "build",
+                            "status": "completed",
+                            "conclusion": "success",
+                            "details_url": "https://ci/build",
+                        }
+                    ],
+                },
+            )
+        if request.url.path == "/repos/octo/widget/commits/abc123/status":
+            return httpx.Response(
+                200,
+                json={"state": "success", "statuses": [{"context": "lint", "state": "success", "target_url": "https://ci/lint"}]},
+            )
+        raise AssertionError(request.url.path)
+
+    client = GitHubClient("tok", transport=httpx.MockTransport(handler))
+    ci = _run_async(client.get_commit_ci_status("octo/widget", "abc123"))
+    assert ci.state == "passed"
+    assert ci.total_count == 2
+    assert tuple(check.name for check in ci.checks) == ("build", "lint")
+
+
+def test_get_commit_ci_status_failed_beats_pending() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/check-runs"):
+            return httpx.Response(
+                200,
+                json={"check_runs": [{"name": "build", "status": "completed", "conclusion": "failure"}]},
+            )
+        if request.url.path.endswith("/status"):
+            return httpx.Response(200, json={"statuses": [{"context": "lint", "state": "pending"}]})
+        raise AssertionError(request.url.path)
+
+    client = GitHubClient("tok", transport=httpx.MockTransport(handler))
+    ci = _run_async(client.get_commit_ci_status("octo/widget", "abc123"))
+    assert ci.state == "failed"
+    assert ci.failed_count == 1
+    assert ci.pending_count == 1
+
+
+def test_get_commit_ci_status_empty_is_pending() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/check-runs"):
+            return httpx.Response(200, json={"check_runs": []})
+        if request.url.path.endswith("/status"):
+            return httpx.Response(200, json={"statuses": []})
+        raise AssertionError(request.url.path)
+
+    client = GitHubClient("tok", transport=httpx.MockTransport(handler))
+    ci = _run_async(client.get_commit_ci_status("octo/widget", "abc123"))
+    assert ci.state == "pending"
+    assert ci.total_count == 0
+
+
 def test_list_pr_reviews_preserves_commit_id() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/repos/octo/widget/pulls/9/reviews"

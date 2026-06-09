@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import UTC, datetime
 from collections.abc import Mapping
 from dataclasses import replace
 from typing import Any
@@ -17,12 +18,13 @@ from robomp.github_types import (
     CommentInfo,
     GitHubError,
     IssueInfo,
+    PullRequestCiStatusInfo,
     PullRequestInfo,
     RepoInfo,
 )
 from robomp.pr_review_policy import matching_review_labels, normalize_label_names
 from robomp.sandbox import GitTransport, SandboxManager
-from robomp.task_outcome import TaskOutcome, TransientTaskError
+from robomp.task_outcome import DeferredTask, TaskOutcome, TransientTaskError
 from robomp.worker import DirectiveInfo, TaskInputs, ThreadMessage, run_task
 
 log = logging.getLogger(__name__)
@@ -33,6 +35,44 @@ def _skipped(reason: str) -> TaskOutcome:
 
 def _github_fetch_failed(exc: GitHubError) -> TransientTaskError:
     return TransientTaskError(f"GitHub fetch failed: {exc}", retry_delay_seconds=exc.retry_after)
+
+
+def _elapsed_since_iso(ts: str | None) -> float | None:
+    if not ts:
+        return None
+    try:
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return max(0.0, (datetime.now(UTC) - dt).total_seconds())
+
+
+def _ci_gate_summary(ci: PullRequestCiStatusInfo) -> str:
+    return f"state={ci.state} total={ci.total_count} pending={ci.pending_count} failed={ci.failed_count}"
+
+
+def _pr_review_ci_gate_outcome(
+    settings: Settings,
+    ci: PullRequestCiStatusInfo,
+    *,
+    received_at: str | None,
+) -> TaskOutcome | None:
+    if not settings.pr_review_ci_gate_enabled:
+        return None
+    if ci.state == "passed":
+        return None
+    summary = _ci_gate_summary(ci)
+    if ci.state == "failed":
+        return _skipped(f"skip: PR CI checks failed ({summary})")
+    elapsed = _elapsed_since_iso(received_at)
+    if elapsed is not None and elapsed >= settings.pr_review_ci_gate_timeout_seconds:
+        return _skipped(f"skip: PR CI checks did not complete before timeout ({summary})")
+    return DeferredTask(
+        f"waiting for PR CI checks ({summary})",
+        retry_delay_seconds=settings.pr_review_ci_gate_retry_seconds,
+    ).outcome
 
 
 def _direct_pr_skip_reason(*, settings: Settings, repo_full: str, pr: PullRequestInfo) -> str | None:
@@ -379,6 +419,7 @@ async def review_pr(
     payload: Mapping[str, Any],
     delivery_id: str,
     attempts: int = 0,
+    received_at: str | None = None,
     slot_uid: int | None = None,
 ) -> TaskOutcome | None:
     pr_node = payload.get("pull_request") or {}
@@ -412,6 +453,26 @@ async def review_pr(
         log.info("skip: PR authored by bot", extra={"repo": repo_full, "pr": pr_number, "author": pr.author})
         return _skipped("skip: PR authored by bot")
     key = issue_key(repo.full_name, pr_number)
+    if settings.pr_review_ci_gate_enabled:
+        try:
+            ci_status = await github.get_commit_ci_status(repo.full_name, pr.head_sha)
+        except GitHubError as exc:
+            log.warning("PR CI status fetch failed", extra={"repo": repo.full_name, "pr": pr_number, "err": str(exc)})
+            raise _github_fetch_failed(exc) from exc
+        ci_outcome = _pr_review_ci_gate_outcome(settings, ci_status, received_at=received_at)
+        if ci_outcome is not None:
+            log.info(
+                "PR CI gate blocked review",
+                extra={
+                    "repo": repo.full_name,
+                    "pr": pr_number,
+                    "state": ci_status.state,
+                    "total": ci_status.total_count,
+                    "pending": ci_status.pending_count,
+                    "failed": ci_status.failed_count,
+                },
+            )
+            return ci_outcome
     review_labeled = "triaged" in labels or any(label.startswith("review:") for label in labels)
     try:
         reviews = await github.list_pr_reviews(repo_full, pr_number)

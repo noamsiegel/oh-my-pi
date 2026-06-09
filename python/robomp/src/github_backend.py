@@ -15,6 +15,7 @@ from robomp.github_types import (
     CommentInfo,
     IssueInfo,
     IssueSummary,
+    PullRequestCiStatusInfo,
     PullRequestCommitInfo,
     PullRequestFileInfo,
     PullRequestInfo,
@@ -40,6 +41,8 @@ class GitHubBackend(Protocol):
     async def list_pr_files(self, repo: str, pr_number: int) -> list[PullRequestFileInfo]: ...
 
     async def list_pr_commits(self, repo: str, pr_number: int) -> list[PullRequestCommitInfo]: ...
+
+    async def get_commit_ci_status(self, repo: str, head_sha: str) -> PullRequestCiStatusInfo: ...
 
     async def list_issues(
         self,

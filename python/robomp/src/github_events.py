@@ -136,6 +136,17 @@ def is_implementation_authorizer(
     return False
 
 
+def _check_payload_pr_number(payload: Mapping[str, Any]) -> int | None:
+    obj = payload.get("check_run") or payload.get("check_suite") or {}
+    prs = obj.get("pull_requests") if isinstance(obj, Mapping) else None
+    if not isinstance(prs, list):
+        return None
+    for pr in prs:
+        if isinstance(pr, Mapping) and isinstance(pr.get("number"), int):
+            return int(pr["number"])
+    return None
+
+
 def route(
     event_type: str,
     payload: Mapping[str, Any],
@@ -370,6 +381,15 @@ def route(
         reason = "pull_request.merged" if bool(pr.get("merged")) else "pull_request.closed"
         return RouteDecision("queue", "cleanup_workspace", repo, _resolve_pr_key(number), reason)
 
+
+    if event_type in {"check_run", "check_suite"} and action == "completed":
+        number = _check_payload_pr_number(payload)
+        if number is None:
+            return RouteDecision("skip", None, repo, None, f"{event_type}.completed missing PR number")
+        return RouteDecision("queue", "review_pr", repo, issue_key(repo, number), f"{event_type}.completed")
+
+    if event_type == "status":
+        return RouteDecision("skip", None, repo, None, "status webhook ignored; PR number unavailable")
     return RouteDecision("skip", None, repo, None, f"{event_type}.{action} not handled")
 
 

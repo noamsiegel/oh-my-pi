@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Literal
 
 
 class GitHubError(RuntimeError):
@@ -82,6 +83,28 @@ class PullRequestCommitInfo:
     message_body: str
     authors: tuple[PullRequestCommitAuthorInfo, ...] = ()
 
+CiCheckState = Literal["pending", "passed", "failed"]
+
+
+@dataclass(slots=True, frozen=True)
+class PullRequestCiCheckInfo:
+    name: str
+    state: CiCheckState
+    source: str  # "check_run" or "status"
+    status: str = ""
+    conclusion: str = ""
+    details_url: str = ""
+
+
+@dataclass(slots=True, frozen=True)
+class PullRequestCiStatusInfo:
+    head_sha: str
+    state: CiCheckState
+    total_count: int
+    pending_count: int
+    failed_count: int
+    checks: tuple[PullRequestCiCheckInfo, ...] = ()
+
 
 @dataclass(slots=True, frozen=True)
 class ReviewCommentInfo:
@@ -145,10 +168,13 @@ class ReactionInfo:
 
 
 __all__ = [
+    "CiCheckState",
     "CommentInfo",
     "GitHubError",
     "IssueInfo",
     "IssueSummary",
+    "PullRequestCiCheckInfo",
+    "PullRequestCiStatusInfo",
     "PullRequestCommitAuthorInfo",
     "PullRequestCommitInfo",
     "PullRequestFileInfo",

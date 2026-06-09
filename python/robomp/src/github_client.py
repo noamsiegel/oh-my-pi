@@ -16,6 +16,8 @@ from robomp.github_types import (
     GitHubError,
     IssueInfo,
     IssueSummary,
+    PullRequestCiCheckInfo,
+    PullRequestCiStatusInfo,
     PullRequestCommitAuthorInfo,
     PullRequestCommitInfo,
     PullRequestFileInfo,
@@ -31,6 +33,12 @@ log = logging.getLogger(__name__)
 GITHUB_API = "https://api.github.com"
 ACCEPT = "application/vnd.github+json"
 API_VERSION = "2022-11-28"
+
+_CHECK_RUN_SUCCESS_CONCLUSIONS = {"success", "neutral", "skipped"}
+_CHECK_RUN_FAILURE_CONCLUSIONS = {"failure", "cancelled", "timed_out", "action_required", "startup_failure", "stale"}
+_STATUS_SUCCESS_STATES = {"success"}
+_STATUS_FAILURE_STATES = {"failure", "error"}
+
 
 
 
@@ -203,6 +211,32 @@ class GitHubClient:
     async def list_pr_commits(self, repo: str, pr_number: int) -> list[PullRequestCommitInfo]:
         data = await self._paginate(f"/repos/{repo}/pulls/{pr_number}/commits")
         return [_pr_commit_from_payload(item) for item in data]
+
+    async def get_commit_ci_status(self, repo: str, head_sha: str) -> PullRequestCiStatusInfo:
+        checks: list[PullRequestCiCheckInfo] = []
+        page = 1
+        while True:
+            data = await self.request(
+                "GET",
+                f"/repos/{repo}/commits/{head_sha}/check-runs",
+                params={"per_page": 100, "page": page},
+            )
+            raw_runs = data.get("check_runs") if isinstance(data, Mapping) else None
+            batch = raw_runs if isinstance(raw_runs, list) else []
+            for item in batch:
+                if isinstance(item, Mapping):
+                    checks.append(_check_run_ci_check(item))
+            if len(batch) < 100:
+                break
+            page += 1
+
+        combined_status = await self.request("GET", f"/repos/{repo}/commits/{head_sha}/status")
+        raw_statuses = combined_status.get("statuses") if isinstance(combined_status, Mapping) else None
+        if isinstance(raw_statuses, list):
+            for item in raw_statuses:
+                if isinstance(item, Mapping):
+                    checks.append(_status_ci_check(item))
+        return _aggregate_ci_status(head_sha, checks)
 
     async def list_issues(
         self,
@@ -493,6 +527,65 @@ def _pr_commit_from_payload(data: Mapping[str, Any]) -> PullRequestCommitInfo:
         authors=tuple(authors),
     )
 
+
+
+def _check_run_ci_check(data: Mapping[str, Any]) -> PullRequestCiCheckInfo:
+    status = str(data.get("status") or "").lower()
+    conclusion = str(data.get("conclusion") or "").lower()
+    if conclusion in _CHECK_RUN_FAILURE_CONCLUSIONS:
+        state = "failed"
+    elif status == "completed" and conclusion in _CHECK_RUN_SUCCESS_CONCLUSIONS:
+        state = "passed"
+    else:
+        state = "pending"
+    return PullRequestCiCheckInfo(
+        name=str(data.get("name") or ""),
+        state=state,
+        source="check_run",
+        status=status,
+        conclusion=conclusion,
+        details_url=str(data.get("details_url") or data.get("html_url") or ""),
+    )
+
+
+def _status_ci_check(data: Mapping[str, Any]) -> PullRequestCiCheckInfo:
+    status = str(data.get("state") or "").lower()
+    if status in _STATUS_FAILURE_STATES:
+        state = "failed"
+    elif status in _STATUS_SUCCESS_STATES:
+        state = "passed"
+    else:
+        state = "pending"
+    return PullRequestCiCheckInfo(
+        name=str(data.get("context") or ""),
+        state=state,
+        source="status",
+        status=status,
+        conclusion=status,
+        details_url=str(data.get("target_url") or ""),
+    )
+
+
+def _aggregate_ci_status(head_sha: str, checks: list[PullRequestCiCheckInfo]) -> PullRequestCiStatusInfo:
+    total_count = len(checks)
+    failed_count = sum(1 for check in checks if check.state == "failed")
+    pending_count = sum(1 for check in checks if check.state == "pending")
+    if not checks:
+        state = "pending"
+    elif failed_count:
+        state = "failed"
+    elif pending_count:
+        state = "pending"
+    else:
+        state = "passed"
+    return PullRequestCiStatusInfo(
+        head_sha=head_sha,
+        state=state,
+        total_count=total_count,
+        pending_count=pending_count,
+        failed_count=failed_count,
+        checks=tuple(checks),
+    )
 
 def _pr_from_payload(repo: str, data: Mapping[str, Any]) -> PullRequestInfo:
     head = data.get("head") or {}

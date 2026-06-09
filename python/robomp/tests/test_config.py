@@ -45,6 +45,9 @@ def test_orchestrator_mode_loads_proxy_config(env: dict[str, str]) -> None:
     assert cfg.labels_comments_only is False
     assert cfg.pr_review_label_allowlist == frozenset()
     assert cfg.pr_review_terminal_events is False
+    assert cfg.pr_review_ci_gate_enabled is False
+    assert cfg.pr_review_ci_gate_retry_seconds == 300.0
+    assert cfg.pr_review_ci_gate_timeout_seconds == 7200.0
 
     assert cfg.pr_review_delegate_models == ()
 
@@ -87,6 +90,17 @@ def test_pr_review_label_allowlist_parses(monkeypatch: pytest.MonkeyPatch, env: 
     reset_settings_cache()
     cfg = Settings()  # type: ignore[call-arg]
     assert cfg.pr_review_label_allowlist == frozenset({"robo-review"})
+
+
+def test_pr_review_ci_gate_env_parses(monkeypatch: pytest.MonkeyPatch, env: dict[str, str]) -> None:
+    monkeypatch.setenv("ROBOMP_PR_REVIEW_CI_GATE_ENABLED", "true")
+    monkeypatch.setenv("ROBOMP_PR_REVIEW_CI_GATE_RETRY_SECONDS", "42")
+    monkeypatch.setenv("ROBOMP_PR_REVIEW_CI_GATE_TIMEOUT_SECONDS", "99")
+    reset_settings_cache()
+    cfg = Settings()  # type: ignore[call-arg]
+    assert cfg.pr_review_ci_gate_enabled is True
+    assert cfg.pr_review_ci_gate_retry_seconds == 42.0
+    assert cfg.pr_review_ci_gate_timeout_seconds == 99.0
 
 
 def test_pr_review_delegate_models_parse(monkeypatch: pytest.MonkeyPatch, env: dict[str, str]) -> None:

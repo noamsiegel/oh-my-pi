@@ -22,6 +22,7 @@ from robomp.github_types import (
     GitHubError,
     IssueInfo,
     IssueSummary,
+    PullRequestCiStatusInfo,
     PullRequestFileInfo,
     PullRequestInfo,
     PullRequestReviewInfo,
@@ -550,6 +551,44 @@ async def test_close_issue_round_trip(proxy_settings: ProxySettings) -> None:
     assert await client.close_issue("octo/widget", 7) is None
     assert captured["body"] == {"state": "closed", "state_reason": "completed"}
 
+
+
+async def test_get_commit_ci_status_parses_proxy_payload() -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        assert req.url.path == "/gh/v1/commit_ci_status"
+        assert req.url.params.get("repo") == "octo/widget"
+        assert req.url.params.get("head_sha") == "abc123"
+        return httpx.Response(
+            200,
+            json={
+                "head_sha": "abc123",
+                "state": "passed",
+                "total_count": 1,
+                "pending_count": 0,
+                "failed_count": 0,
+                "checks": [
+                    {
+                        "name": "build",
+                        "state": "passed",
+                        "source": "check_run",
+                        "status": "completed",
+                        "conclusion": "success",
+                        "details_url": "https://ci/build",
+                    }
+                ],
+            },
+        )
+
+    client = GitHubProxyClient(
+        base_url="http://proxy.test",
+        hmac_key=_HMAC,
+        transport=httpx.MockTransport(handler),
+    )
+    ci = await client.get_commit_ci_status("octo/widget", "abc123")
+    assert isinstance(ci, PullRequestCiStatusInfo)
+    assert ci.head_sha == "abc123"
+    assert ci.checks[0].name == "build"
+    assert ci.checks[0].source == "check_run"
 
 # ============================================================================
 # 3. Error decode

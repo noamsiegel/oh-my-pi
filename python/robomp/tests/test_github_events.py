@@ -584,6 +584,52 @@ def test_route_pr_merged_carries_no_submitter() -> None:
     assert decision.submitter is None
 
 
+def test_route_check_run_completed_queues_review_pr_from_pull_requests() -> None:
+    decision = route(
+        "check_run",
+        {"action": "completed", "check_run": {"pull_requests": [{"number": 9}]}, "repository": {"full_name": "octo/widget"}},
+        allowlist=ALLOWLIST,
+        bot_login=BOT,
+    )
+    assert decision.task == "review_pr"
+    assert decision.issue_key == "octo/widget#9"
+    assert decision.reason == "check_run.completed"
+
+
+def test_route_check_suite_completed_queues_review_pr_from_pull_requests() -> None:
+    decision = route(
+        "check_suite",
+        {"action": "completed", "check_suite": {"pull_requests": [{"number": 9}]}, "repository": {"full_name": "octo/widget"}},
+        allowlist=ALLOWLIST,
+        bot_login=BOT,
+    )
+    assert decision.task == "review_pr"
+    assert decision.issue_key == "octo/widget#9"
+    assert decision.reason == "check_suite.completed"
+
+
+def test_route_check_completed_missing_pr_number_skips() -> None:
+    decision = route(
+        "check_run",
+        {"action": "completed", "check_run": {"pull_requests": []}, "repository": {"full_name": "octo/widget"}},
+        allowlist=ALLOWLIST,
+        bot_login=BOT,
+    )
+    assert not decision.should_queue
+    assert decision.reason == "check_run.completed missing PR number"
+
+
+def test_route_status_webhook_skips_without_pr_number() -> None:
+    decision = route(
+        "status",
+        {"repository": {"full_name": "octo/widget"}},
+        allowlist=ALLOWLIST,
+        bot_login=BOT,
+    )
+    assert not decision.should_queue
+    assert decision.reason == "status webhook ignored; PR number unavailable"
+
+
 def test_rate_limit_cap_unlimited_allowlist_beats_association() -> None:
     # Even a NONE association is unlimited when login is in the explicit list.
     assert (

@@ -542,6 +542,41 @@ async def test_list_pr_commits(proxy_settings: ProxySettings) -> None:
     assert item["authors"][0]["login"] == "alice"
 
 
+async def test_get_commit_ci_status(proxy_settings: ProxySettings) -> None:
+    def gh(req: httpx.Request) -> httpx.Response:
+        if req.url.path == "/repos/octo/widget/commits/abc123/check-runs":
+            return httpx.Response(
+                200,
+                json={
+                    "check_runs": [
+                        {
+                            "name": "build",
+                            "status": "completed",
+                            "conclusion": "success",
+                            "details_url": "https://ci/build",
+                        }
+                    ]
+                },
+            )
+        if req.url.path == "/repos/octo/widget/commits/abc123/status":
+            return httpx.Response(200, json={"statuses": []})
+        return httpx.Response(404, json={"message": req.url.path})
+
+    params = {"repo": "octo/widget", "head_sha": "abc123"}
+    app = _build_app(proxy_settings, gh)
+    async with await _async_client(app) as client:
+        resp = await client.get(
+            "/gh/v1/commit_ci_status",
+            params=params,
+            headers=_signed("GET", "/gh/v1/commit_ci_status", params=params),
+        )
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert payload["head_sha"] == "abc123"
+    assert payload["state"] == "passed"
+    assert payload["checks"][0]["name"] == "build"
+
+
 async def test_authenticated_login(proxy_settings: ProxySettings) -> None:
     def gh(req: httpx.Request) -> httpx.Response:
         assert req.url.path == "/user"

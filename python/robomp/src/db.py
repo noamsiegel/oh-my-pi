@@ -45,6 +45,7 @@ CREATE TABLE IF NOT EXISTS events (
   last_error    TEXT,
   started_at    TEXT,
   finished_at   TEXT,
+  available_at  TEXT,
   model         TEXT,
   task          TEXT,
   route_reason  TEXT,
@@ -54,6 +55,7 @@ CREATE TABLE IF NOT EXISTS events (
 
 CREATE INDEX IF NOT EXISTS events_state_received
   ON events(state, received_at);
+
 
 CREATE INDEX IF NOT EXISTS events_issue_state
   ON events(issue_key, state);
@@ -285,6 +287,11 @@ def iso_seconds_ago(seconds: float) -> str:
     return (datetime.now(UTC) - timedelta(seconds=seconds)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
+def iso_seconds_from_now(seconds: float) -> str:
+    """ISO-UTC timestamp for `seconds` from now, matching the format `_utcnow` writes."""
+    return (datetime.now(UTC) + timedelta(seconds=seconds)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
 @dataclass(slots=True, frozen=True)
 class EventRow:
     delivery_id: str
@@ -300,6 +307,7 @@ class EventRow:
     route_reason: str | None = None
     route_version: int = 1
     outcome: str | None = None
+    available_at: str | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -343,6 +351,7 @@ def _event_row_from_db_row(row: sqlite3.Row) -> EventRow:
         route_reason=row["route_reason"],
         route_version=int(row["route_version"]),
         outcome=row["outcome"],
+        available_at=row["available_at"],
     )
 
 
@@ -565,6 +574,11 @@ class Database:
             self._conn.execute("ALTER TABLE events ADD COLUMN route_version INTEGER NOT NULL DEFAULT 1")
         if "outcome" not in event_cols:
             self._conn.execute("ALTER TABLE events ADD COLUMN outcome TEXT")
+        if "available_at" not in event_cols:
+            self._conn.execute("ALTER TABLE events ADD COLUMN available_at TEXT")
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS events_state_available ON events(state, available_at, received_at)"
+        )
 
     def close(self) -> None:
         with self._lock:
@@ -637,9 +651,10 @@ class Database:
                 SELECT queued.delivery_id, queued.event_type, queued.repo, queued.issue_key,
                        queued.payload_json, queued.received_at, queued.state, queued.attempts,
                        queued.last_error, queued.task, queued.route_reason, queued.route_version,
-                       queued.outcome
+                       queued.outcome, queued.available_at
                 FROM events AS queued
                 WHERE queued.state = 'queued'
+                  AND (queued.available_at IS NULL OR queued.available_at <= ?)
                   AND (
                     queued.issue_key IS NULL
                     OR NOT EXISTS (
@@ -649,15 +664,16 @@ class Database:
                         AND running.issue_key = queued.issue_key
                     )
                   )
-                ORDER BY queued.received_at
+                ORDER BY COALESCE(queued.available_at, queued.received_at), queued.received_at
                 LIMIT 1
-                """
+                """,
+                (_utcnow(),),
             ).fetchone()
             if row is None:
                 return None
             now = _utcnow()
             conn.execute(
-                "UPDATE events SET state='running', attempts=attempts+1, started_at=? WHERE delivery_id=?",
+                "UPDATE events SET state='running', attempts=attempts+1, started_at=?, available_at=NULL WHERE delivery_id=?",
                 (now, row["delivery_id"]),
             )
             return EventRow(
@@ -674,6 +690,7 @@ class Database:
                 route_reason=row["route_reason"],
                 route_version=int(row["route_version"]),
                 outcome=row["outcome"],
+                available_at=None,
             )
 
     def mark_event(self, delivery_id: str, state: EventState, *, error: str | None = None) -> None:
@@ -714,31 +731,14 @@ class Database:
             rows = self._conn.execute(
                 """
                 SELECT delivery_id, event_type, repo, issue_key, payload_json, received_at,
-                       state, attempts, last_error, task, route_reason, route_version, outcome
+                       state, attempts, last_error, task, route_reason, route_version, outcome, available_at
                 FROM events
                 ORDER BY received_at DESC
                 LIMIT ?
                 """,
                 (limit,),
             ).fetchall()
-        return [
-            EventRow(
-                delivery_id=row["delivery_id"],
-                event_type=row["event_type"],
-                repo=row["repo"],
-                issue_key=row["issue_key"],
-                payload=json.loads(row["payload_json"]),
-                received_at=row["received_at"],
-                state=row["state"],
-                attempts=int(row["attempts"]),
-                last_error=row["last_error"],
-                task=row["task"],
-                route_reason=row["route_reason"],
-                route_version=int(row["route_version"]),
-                outcome=row["outcome"],
-            )
-            for row in rows
-        ]
+        return [_event_row_from_db_row(row) for row in rows]
 
     def remove_event(self, delivery_id: str) -> None:
         """Hard-delete an event row. Used to clear stale state before a manual re-trigger."""
@@ -807,7 +807,7 @@ class Database:
             row = self._conn.execute(
                 f"""
                 SELECT delivery_id, event_type, repo, issue_key, payload_json, received_at,
-                       state, attempts, last_error, task, route_reason, route_version, outcome
+                       state, attempts, last_error, task, route_reason, route_version, outcome, available_at
                 FROM events
                 WHERE issue_key = ?
                   {state_filter}
@@ -839,7 +839,7 @@ class Database:
                 rows = self._conn.execute(
                     f"""
                     SELECT delivery_id, event_type, repo, issue_key, payload_json, received_at,
-                           state, attempts, last_error, task, route_reason, route_version, outcome
+                           state, attempts, last_error, task, route_reason, route_version, outcome, available_at
                     FROM events
                     WHERE issue_key IN ({placeholders})
                       {state_filter}
@@ -972,7 +972,7 @@ class Database:
             row = self._conn.execute(
                 """
                 SELECT delivery_id, event_type, repo, issue_key, payload_json, received_at,
-                       state, attempts, last_error, task, route_reason, route_version, outcome
+                       state, attempts, last_error, task, route_reason, route_version, outcome, available_at
                 FROM events WHERE delivery_id = ?
                 """,
                 (delivery_id,),
@@ -987,11 +987,16 @@ class Database:
         *,
         from_states: tuple[EventState, ...] | None = None,
         error: str | None = None,
+        available_at: str | None = None,
     ) -> bool:
-        """Move an event back to queued, optionally updating last_error."""
+        """Move an event back to queued, optionally updating last_error and availability."""
         with self._lock:
-            set_clause = "state='queued', outcome='queued', last_error=?" if error is not None else "state='queued', outcome='queued'"
-            values: tuple[Any, ...] = (error, delivery_id) if error is not None else (delivery_id,)
+            if error is not None:
+                set_clause = "state='queued', outcome='queued', last_error=?, available_at=?"
+                values: tuple[Any, ...] = (error, available_at, delivery_id)
+            else:
+                set_clause = "state='queued', outcome='queued', available_at=?"
+                values = (available_at, delivery_id)
             if from_states is None:
                 cur = self._conn.execute(
                     f"UPDATE events SET {set_clause} WHERE delivery_id=?",

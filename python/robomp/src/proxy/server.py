@@ -437,6 +437,16 @@ def create_proxy_app(settings: ProxySettings) -> FastAPI:
             return _gh_error_response(exc)
         return JSONResponse({"items": [_serialize(item) for item in items]})
 
+    @app.get("/gh/v1/commit_ci_status")
+    async def get_commit_ci_status(request: Request, repo: str, head_sha: str) -> JSONResponse:
+        await _authenticate(request)
+        github: GitHubClient = request.app.state.github
+        try:
+            info = await github.get_commit_ci_status(repo, head_sha)
+        except GitHubError as exc:
+            return _gh_error_response(exc)
+        return JSONResponse(_serialize(info))
+
     @app.get("/gh/v1/issues")
     async def list_issues(request: Request, repo: str, state: str = "open", limit: int = 30) -> JSONResponse:
         await _authenticate(request)

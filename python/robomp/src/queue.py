@@ -12,13 +12,11 @@ from contextlib import suppress
 from robomp import tasks
 from robomp.cancellation import clear_current_event, set_current_event
 from robomp.config import Settings
-from robomp.db import Database, EventRow
+from robomp.db import Database, EventRow, iso_seconds_from_now
 from robomp.github_backend import GitHubBackend
 from robomp.sandbox import GitTransport, SandboxManager, _reap_slot
 from robomp.slot_pool import SlotPool
 from robomp.task_outcome import (
-    DEFAULT_TASK_RETRY_DELAY_SECONDS,
-    MAX_TRANSIENT_TASK_ATTEMPTS,
     TaskControl,
     TaskOutcome,
 )
@@ -413,7 +411,12 @@ class WorkerPool:
                 self.db.mark_event(row.delivery_id, "failed", error="cancelled by operator")
             elif _is_retryable_pr_workspace_error(row, str(exc)):
                 message = f"retrying workspace preparation after transient git failure: {exc}"
-                self.db.requeue_event(row.delivery_id, from_states=("running",), error=message)
+                self.db.requeue_event(
+                    row.delivery_id,
+                    from_states=("running",),
+                    error=message,
+                    available_at=iso_seconds_from_now(PR_WORKSPACE_RETRY_DELAY_SECONDS),
+                )
                 self._requeue_later(row.delivery_id, PR_WORKSPACE_RETRY_DELAY_SECONDS)
                 log.warning(
                     "event handler retry scheduled",
@@ -462,15 +465,15 @@ class WorkerPool:
             await self._post_failure_comment(row, error)
         elif outcome.state == "queued":
             error = outcome.reason or "task retry queued"
-            if row.attempts >= MAX_TRANSIENT_TASK_ATTEMPTS:
+            if outcome.retry_limit is not None and row.attempts >= outcome.retry_limit:
                 self.db.mark_event(row.delivery_id, "failed", error=error)
                 await self._post_failure_comment(row, error)
                 return
-            self.db.requeue_event(row.delivery_id, from_states=("running",), error=error)
             delay = outcome.retry_delay_seconds
-            if delay is None:
-                delay = DEFAULT_TASK_RETRY_DELAY_SECONDS
-            self._requeue_later(row.delivery_id, delay)
+            available_at = iso_seconds_from_now(delay) if delay is not None and delay > 0 else None
+            self.db.requeue_event(row.delivery_id, from_states=("running",), error=error, available_at=available_at)
+            if delay is not None and delay > 0:
+                self._requeue_later(row.delivery_id, delay)
             log.warning(
                 "event handler retry scheduled",
                 extra={
@@ -512,6 +515,7 @@ class WorkerPool:
             payload=row.payload,
             delivery_id=row.delivery_id,
             attempts=row.attempts,
+            received_at=row.received_at,
             slot_uid=slot_uid,
         )
 

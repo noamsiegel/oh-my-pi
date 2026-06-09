@@ -25,6 +25,8 @@ from robomp.github_types import (
     GitHubError,
     IssueInfo,
     IssueSummary,
+    PullRequestCiCheckInfo,
+    PullRequestCiStatusInfo,
     PullRequestCommitAuthorInfo,
     PullRequestCommitInfo,
     PullRequestFileInfo,
@@ -187,6 +189,14 @@ class GitHubProxyClient:
             params={"repo": repo, "pr_number": pr_number},
         )
         return [_pr_commit_from(item) for item in (data.get("items") if isinstance(data, dict) else None) or []]
+
+    async def get_commit_ci_status(self, repo: str, head_sha: str) -> PullRequestCiStatusInfo:
+        data = await self._request(
+            "GET",
+            "/gh/v1/commit_ci_status",
+            params={"repo": repo, "head_sha": head_sha},
+        )
+        return _ci_status_from(data)
 
     async def list_issues(
         self,
@@ -600,6 +610,33 @@ def _pr_commit_from(data: Any) -> PullRequestCommitInfo:
         message_headline=str(data.get("message_headline") or ""),
         message_body=str(data.get("message_body") or ""),
         authors=tuple(_pr_commit_author_from(item) for item in authors or ()),
+    )
+
+
+def _ci_check_from(data: Any) -> PullRequestCiCheckInfo:
+    if not isinstance(data, dict):
+        raise GitHubError(500, "proxy returned malformed ci_check payload")
+    return PullRequestCiCheckInfo(
+        name=str(data.get("name") or ""),
+        state=data.get("state") if data.get("state") in ("pending", "passed", "failed") else "pending",
+        source=str(data.get("source") or ""),
+        status=str(data.get("status") or ""),
+        conclusion=str(data.get("conclusion") or ""),
+        details_url=str(data.get("details_url") or ""),
+    )
+
+
+def _ci_status_from(data: Any) -> PullRequestCiStatusInfo:
+    if not isinstance(data, dict):
+        raise GitHubError(500, "proxy returned malformed ci_status payload")
+    checks = data.get("checks")
+    return PullRequestCiStatusInfo(
+        head_sha=str(data.get("head_sha") or ""),
+        state=data.get("state") if data.get("state") in ("pending", "passed", "failed") else "pending",
+        total_count=int(data.get("total_count") or 0),
+        pending_count=int(data.get("pending_count") or 0),
+        failed_count=int(data.get("failed_count") or 0),
+        checks=tuple(_ci_check_from(item) for item in checks or ()),
     )
 
 

@@ -15,6 +15,7 @@ class TaskOutcome:
     state: TaskState
     reason: str | None = None
     retry_delay_seconds: float | None = None
+    retry_limit: int | None = MAX_TRANSIENT_TASK_ATTEMPTS
 
 
 class TaskControl(RuntimeError):
@@ -43,11 +44,19 @@ class TransientTaskError(TaskControl):
     """Retryable task failure: requeue until retry budget is exhausted."""
 
     def __init__(self, reason: str, *, retry_delay_seconds: float | None = None) -> None:
-        super().__init__(TaskOutcome("queued", reason, retry_delay_seconds))
+        super().__init__(TaskOutcome("queued", reason, retry_delay_seconds, MAX_TRANSIENT_TASK_ATTEMPTS))
+
+
+class DeferredTask(TaskControl):
+    """Policy wait: requeue without consuming the transient failure budget."""
+
+    def __init__(self, reason: str, *, retry_delay_seconds: float) -> None:
+        super().__init__(TaskOutcome("queued", reason, retry_delay_seconds, retry_limit=None))
 
 
 __all__ = [
     "DEFAULT_TASK_RETRY_DELAY_SECONDS",
+    "DeferredTask",
     "MAX_TRANSIENT_TASK_ATTEMPTS",
     "PermanentTaskError",
     "SkipWork",

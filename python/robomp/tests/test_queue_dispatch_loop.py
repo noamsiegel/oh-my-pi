@@ -9,6 +9,7 @@ import pytest
 from robomp.config import Settings
 from robomp.db import Database, issue_key
 from robomp.queue import WorkerPool
+from robomp.task_outcome import TaskOutcome, TransientTaskError
 
 
 class _StubSandbox:
@@ -111,6 +112,65 @@ async def test_dispatcher_marks_unsupported_event_task_skipped(settings: Setting
     assert final_event.state == "skipped"
     assert final_event.last_error == "unsupported event/task"
     assert final_event.outcome == "skipped"
+
+
+@pytest.mark.asyncio
+async def test_queued_outcome_sets_available_at_and_blocks_claim(settings: Settings, db: Database, monkeypatch: pytest.MonkeyPatch) -> None:
+    from robomp import tasks
+
+    async def _wait(**kwargs):
+        return TaskOutcome("queued", "waiting", retry_delay_seconds=60, retry_limit=None)
+
+    monkeypatch.setattr(tasks, "triage_issue", _wait)
+    db.record_event(
+        delivery_id="defer-test",
+        event_type="manual",
+        repo="octo/widget",
+        issue_key=issue_key("octo/widget", 44),
+        payload={"action": "opened", "issue": {"number": 44}, "repository": {"full_name": "octo/widget"}},
+        task="triage_issue",
+    )
+    row = db.claim_next_event()
+    assert row is not None
+    pool = _make_pool(settings, db)
+    await pool._dispatch_and_mark(row)
+
+    event = db.get_event("defer-test")
+    assert event is not None
+    assert event.state == "queued"
+    assert event.available_at is not None
+    assert db.claim_next_event() is None
+
+
+@pytest.mark.asyncio
+async def test_transient_task_error_fails_after_retry_limit(settings: Settings, db: Database, monkeypatch: pytest.MonkeyPatch) -> None:
+    from robomp import tasks
+
+    async def _transient(**kwargs):
+        raise TransientTaskError("still broken", retry_delay_seconds=60)
+
+    monkeypatch.setattr(tasks, "triage_issue", _transient)
+    db.record_event(
+        delivery_id="retry-limit-test",
+        event_type="manual",
+        repo="octo/widget",
+        issue_key=issue_key("octo/widget", 45),
+        payload={"action": "opened", "issue": {"number": 45}, "repository": {"full_name": "octo/widget"}},
+        task="triage_issue",
+    )
+    first = db.claim_next_event()
+    assert first is not None
+    assert db.requeue_event(first.delivery_id, from_states=("running",))
+    second = db.claim_next_event()
+    assert second is not None and second.attempts == 2
+
+    pool = _make_pool(settings, db)
+    await pool._dispatch_and_mark(second)
+
+    event = db.get_event("retry-limit-test")
+    assert event is not None
+    assert event.state == "failed"
+    assert event.last_error == "still broken"
 
 
 @pytest.mark.asyncio
