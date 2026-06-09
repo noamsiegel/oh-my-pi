@@ -924,14 +924,41 @@ def test_pr_review_comment_stages_and_submit_flushes_one_comment_review(db: Data
     assert len(db.list_staged_review_comments(bindings.issue_key)) == 1
 
 
-def _seed_pr_review_payload_state(bindings: ToolBindings, helper: Path) -> None:
+def _seed_pr_review_payload_state(
+    bindings: ToolBindings,
+    helper: Path,
+    *,
+    recommendation_event: str = "REQUEST_CHANGES",
+    blocking_count: int = 1,
+    optional_count: int = 0,
+    recommendation_reason: str = "blocking finding",
+    findings: list[dict[str, Any]] | None = None,
+    metadata: dict[str, Any] | None = None,
+    evidence: dict[str, Any] | None = None,
+) -> None:
     _write_pr_review_helper(helper)
     paths = pr_review_paths(bindings.workspace)
-    save_json_checked(paths.evidence, {"head_sha": "payload-sha"})
+    payload_findings = findings if findings is not None else [{"path": "src/generated.py", "line": 7, "body": "payload finding"}]
+    default_evidence = {"head_sha": "payload-sha"}
+    if evidence:
+        default_evidence.update(evidence)
+    save_json_checked(paths.evidence, default_evidence)
     save_json_checked(paths.classification, {})
-    save_json_checked(paths.findings, {"findings": [{"path": "src/generated.py", "line": 7, "body": "payload finding"}]})
-    save_json_checked(paths.validated, {"findings": []})
-
+    save_json_checked(paths.findings, {"findings": payload_findings})
+    save_json_checked(
+        paths.validated,
+        {
+            "recommendation": {
+                "event": recommendation_event,
+                "blocking_count": blocking_count,
+                "optional_count": optional_count,
+                "reason": recommendation_reason,
+            },
+            "findings": payload_findings,
+        },
+    )
+    if metadata is not None:
+        save_json_checked(paths.metadata, metadata)
 
 def test_pr_review_paths_returns_dataclass(db: Database, tmp_path: Path) -> None:
     bindings, loop, t = _review_bindings(db, tmp_path, httpx.MockTransport(lambda _r: httpx.Response(500)))
@@ -1048,7 +1075,13 @@ def test_submit_pr_review_terminal_events_enabled_passes_event_and_clears(
 
     bindings, loop, t = _review_bindings(db, tmp_path, httpx.MockTransport(handler))
     helper = tmp_path / "pr-review-helper.js"
-    _seed_pr_review_payload_state(bindings, helper)
+    _seed_pr_review_payload_state(
+        bindings,
+        helper,
+        recommendation_event=event,
+        blocking_count=0 if event == "APPROVE" else 1,
+        recommendation_reason="clean" if event == "APPROVE" else "blocking finding",
+    )
     bindings = replace(bindings, settings=Settings.model_construct(pr_review_terminal_events=True, pr_review_helper=helper))
     try:
         stage_tool = next(x for x in build(bindings) if x.name == "pr_review_comment")
@@ -1067,6 +1100,202 @@ def test_submit_pr_review_terminal_events_enabled_passes_event_and_clears(
     assert posted[0].review_id == 46
     assert posted[0].comment_id == 9101
     assert posted[0].severity == "required"
+
+
+def test_submit_pr_review_uses_clean_recommendation_to_approve_even_if_agent_requests_comment(
+    db: Database, tmp_path: Path
+) -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path.endswith("/reviews"):
+            captured["body"] = json.loads(request.content)
+            return httpx.Response(
+                200,
+                json={"id": 48, "user": {"login": "robomp-bot"}, "body": captured["body"]["body"], "state": "APPROVED", "submitted_at": "t"},
+            )
+        if request.method == "GET" and request.url.path.endswith("/reviews/48/comments"):
+            return httpx.Response(200, json=[])
+        return httpx.Response(404, json={"message": "unrouted"})
+
+    bindings, loop, t = _review_bindings(db, tmp_path, httpx.MockTransport(handler))
+    helper = tmp_path / "pr-review-helper.js"
+    _seed_pr_review_payload_state(
+        bindings,
+        helper,
+        recommendation_event="APPROVE",
+        blocking_count=0,
+        optional_count=0,
+        recommendation_reason="No critical/required findings remain; optional/nit feedback is non-blocking.",
+        findings=[],
+    )
+    bindings = replace(
+        bindings,
+        settings=Settings.model_construct(
+            pr_review_terminal_events=True,
+            pr_review_helper=helper,
+            model="openai-codex/gpt-5.5",
+            thinking_level="low",
+        ),
+    )
+    try:
+        tool = next(x for x in build(bindings) if x.name == "submit_pr_review")
+        result = tool.execute({"body": "Would approve: clean.", "event": "COMMENT"}, _ctx())
+    finally:
+        _stop_loop(loop, t)
+
+    assert captured["body"]["event"] == "APPROVE"
+    assert "event=APPROVE" in result
+    assert "requested_event=COMMENT" in result
+    assert "<summary>Review process</summary>" in captured["body"]["body"]
+    assert "Primary reviewer: `robomp`" in captured["body"]["body"]
+    assert "openai-codex/gpt-5.5" in captured["body"]["body"]
+    assert "GitHub event: `APPROVE`" in captured["body"]["body"]
+    assert (
+        "Checklist: correctness, regressions, security/safety, breaking changes, tests, conventions, silent contract violations"
+        in captured["body"]["body"]
+    )
+
+
+def test_submit_pr_review_uses_blocking_recommendation_to_request_changes_even_if_agent_requests_approve(
+    db: Database, tmp_path: Path
+) -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path.endswith("/reviews"):
+            captured["body"] = json.loads(request.content)
+            return httpx.Response(
+                200,
+                json={"id": 49, "user": {"login": "robomp-bot"}, "body": captured["body"]["body"], "state": "CHANGES_REQUESTED", "submitted_at": "t"},
+            )
+        if request.method == "GET" and request.url.path.endswith("/reviews/49/comments"):
+            return httpx.Response(200, json=[])
+        return httpx.Response(404, json={"message": "unrouted"})
+
+    bindings, loop, t = _review_bindings(db, tmp_path, httpx.MockTransport(handler))
+    helper = tmp_path / "pr-review-helper.js"
+    _seed_pr_review_payload_state(bindings, helper, recommendation_event="REQUEST_CHANGES", blocking_count=1, optional_count=0)
+    bindings = replace(bindings, settings=Settings.model_construct(pr_review_terminal_events=True, pr_review_helper=helper))
+    try:
+        tool = next(x for x in build(bindings) if x.name == "submit_pr_review")
+        result = tool.execute({"body": "Would approve.", "event": "APPROVE"}, _ctx())
+    finally:
+        _stop_loop(loop, t)
+
+    assert captured["body"]["event"] == "REQUEST_CHANGES"
+    assert "event=REQUEST_CHANGES" in result
+    assert "requested_event=APPROVE" in result
+
+
+def test_submit_pr_review_keeps_comment_for_advisory_recommendation(db: Database, tmp_path: Path) -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path.endswith("/reviews"):
+            captured["body"] = json.loads(request.content)
+            return httpx.Response(
+                200,
+                json={"id": 50, "user": {"login": "robomp-bot"}, "body": captured["body"]["body"], "state": "COMMENTED", "submitted_at": "t"},
+            )
+        if request.method == "GET" and request.url.path.endswith("/reviews/50/comments"):
+            return httpx.Response(200, json=[])
+        return httpx.Response(404, json={"message": "unrouted"})
+
+    bindings, loop, t = _review_bindings(db, tmp_path, httpx.MockTransport(handler))
+    helper = tmp_path / "pr-review-helper.js"
+    _seed_pr_review_payload_state(
+        bindings,
+        helper,
+        recommendation_event="COMMENT",
+        blocking_count=0,
+        optional_count=2,
+        recommendation_reason="Optional findings only; no review request to clear.",
+        findings=[],
+    )
+    bindings = replace(bindings, settings=Settings.model_construct(pr_review_terminal_events=True, pr_review_helper=helper))
+    try:
+        tool = next(x for x in build(bindings) if x.name == "submit_pr_review")
+        result = tool.execute({"body": "Advisory only.", "event": "APPROVE"}, _ctx())
+    finally:
+        _stop_loop(loop, t)
+
+    assert captured["body"]["event"] == "COMMENT"
+    assert "event=COMMENT" in result
+    assert "requested_event=APPROVE" in result
+    assert "<summary>Review process</summary>" in captured["body"]["body"]
+
+
+def test_submit_pr_review_process_report_lists_delegated_models_and_diff_evidence(
+    db: Database, tmp_path: Path
+) -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path.endswith("/reviews"):
+            captured["body"] = json.loads(request.content)
+            return httpx.Response(
+                200,
+                json={"id": 51, "user": {"login": "robomp-bot"}, "body": captured["body"]["body"], "state": "APPROVED", "submitted_at": "t"},
+            )
+        if request.method == "GET" and request.url.path.endswith("/reviews/51/comments"):
+            return httpx.Response(200, json=[])
+        return httpx.Response(404, json={"message": "unrouted"})
+
+    bindings, loop, t = _review_bindings(db, tmp_path, httpx.MockTransport(handler))
+    helper = tmp_path / "pr-review-helper.js"
+    _seed_pr_review_payload_state(
+        bindings,
+        helper,
+        recommendation_event="APPROVE",
+        blocking_count=0,
+        optional_count=0,
+        recommendation_reason="clean",
+        findings=[],
+        metadata={
+            "delegated_reviewers": [
+                {
+                    "id": "SecurityReviewer",
+                    "domains_covered": ["security"],
+                    "completed": True,
+                    "model": "anthropic/claude-opus-4-8",
+                    "model_family": "anthropic",
+                }
+            ]
+        },
+        evidence={
+            "view": {"files": [{"path": "apps/hoa/api/actions/fundingrequest.py"}]},
+            "changed_files": 1,
+            "additions": 12,
+            "deletions": 3,
+            "head_sha": "abcdef1234567890",
+        },
+    )
+    paths = pr_review_paths(bindings.workspace)
+    save_json_checked(
+        paths.classification,
+        {
+            "risk_level": "medium",
+            "reviewability": {"status": "reviewable"},
+            "delegation_required": True,
+            "domains_required": ["correctness", "security"],
+            "model_diversity": {"cross_family_review_recommended": True},
+        },
+    )
+    bindings = replace(bindings, settings=Settings.model_construct(pr_review_terminal_events=True, pr_review_helper=helper))
+    try:
+        tool = next(x for x in build(bindings) if x.name == "submit_pr_review")
+        tool.execute({"body": "Would approve: clean.", "event": "APPROVE"}, _ctx())
+    finally:
+        _stop_loop(loop, t)
+
+    body = captured["body"]["body"]
+    assert "SecurityReviewer" in body
+    assert "anthropic/claude-opus-4-8" in body
+    assert "domains=`security`" in body
+    assert "apps/hoa/api/actions/fundingrequest.py" in body
+    assert "+12/-3" in body
+    assert "Dependency/callsite review" in body
 
 
 def test_submit_pr_review_posted_comment_fetch_failure_is_advisory(db: Database, tmp_path: Path) -> None:
@@ -1118,7 +1347,7 @@ def test_submit_pr_review_self_authored_terminal_event_downgrades_to_comment(db:
 
     bindings, loop, t = _review_bindings(db, tmp_path, httpx.MockTransport(handler))
     helper = tmp_path / "pr-review-helper.js"
-    _seed_pr_review_payload_state(bindings, helper)
+    _seed_pr_review_payload_state(bindings, helper, recommendation_event="APPROVE", blocking_count=0)
     bindings = replace(
         bindings,
         issue=replace(bindings.issue, author="noamsiegel"),
@@ -1133,6 +1362,7 @@ def test_submit_pr_review_self_authored_terminal_event_downgrades_to_comment(db:
     assert "event=COMMENT" in result
     assert "requested_event=APPROVE" in result
     assert captured["body"]["event"] == "COMMENT"
+    assert "Self-authored terminal downgrade: `true`" in captured["body"]["body"]
 
 
 def test_submit_pr_review_terminal_event_requires_pr_review_payload_state(db: Database, tmp_path: Path) -> None:

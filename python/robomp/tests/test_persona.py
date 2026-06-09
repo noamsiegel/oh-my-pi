@@ -171,6 +171,7 @@ def test_kickoff_pr_review_formats_head_repo_and_origin_base() -> None:
     )
     assert "`fix-crash` from `alice/widget`" in out
     assert "git diff origin/main...HEAD" in out
+    assert "automatically appended Review process details" in out
 
 
 def test_review_completion_reminder_mentions_submit_only() -> None:
@@ -182,6 +183,7 @@ def test_review_completion_reminder_mentions_submit_only() -> None:
     assert "submit_pr_review" in out
     assert 'event="APPROVE"' in out
     assert 'event="REQUEST_CHANGES"' in out
+    assert "submit_pr_review" in out
     assert "gh_open_pr" not in out
 
 
@@ -216,3 +218,5 @@ def test_seeded_review_pr_todos_include_validate_and_exclude_pr_review_comment_p
             break
     
     assert not pr_review_comment_primary, "pr_review_comment should not be a primary seeded task"
+    assert any("validate_pr_review's recommended event" in task for task in tasks)
+    assert not any(task == "Stage inline findings with pr_review_comment" for task in tasks)

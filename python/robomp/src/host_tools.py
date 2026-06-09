@@ -34,6 +34,7 @@ from robomp.github_types import (
     RepoInfo,
 )
 from robomp.pr_review_tools import (
+    PrReviewPaths,
     load_json_checked,
     pr_review_delegate_models,
     pr_review_helper_path,
@@ -2036,6 +2037,209 @@ def _pr_review_payload_available(bindings: ToolBindings) -> bool:
     return all(getattr(paths, name).is_file() for name in ("evidence", "classification", "findings", "validated"))
 
 
+_PR_REVIEW_EVENTS = {"COMMENT", "APPROVE", "REQUEST_CHANGES"}
+
+
+def _pr_review_recommendation(paths: PrReviewPaths) -> dict[str, Any]:
+    validated = load_json_checked(paths.validated)
+    if not isinstance(validated, Mapping):
+        _raise_command("PR review validation recommendation missing; rerun validate_pr_review.")
+    recommendation = validated.get("recommendation")
+    if not isinstance(recommendation, Mapping):
+        _raise_command("PR review validation recommendation missing; rerun validate_pr_review.")
+    return dict(recommendation)
+
+
+def _recommended_pr_review_event(paths: PrReviewPaths) -> str:
+    recommendation = _pr_review_recommendation(paths)
+    event = str(recommendation.get("event") or "").upper()
+    if event not in _PR_REVIEW_EVENTS:
+        _raise_command(f"PR review validation recommended unsupported event {event!r}; rerun validate_pr_review.")
+    return event
+
+
+def _pr_review_load_mapping(path: Path) -> Mapping[str, Any]:
+    if not path.is_file():
+        return {}
+    try:
+        data = load_json_checked(path)
+    except RpcCommandError:
+        return {}
+    return data if isinstance(data, Mapping) else {}
+
+
+def _pr_review_bool(value: Any) -> str:
+    return "true" if bool(value) else "false"
+
+
+def _pr_review_join_values(value: Any) -> str:
+    if isinstance(value, (list, tuple)):
+        return ", ".join(str(item) for item in value) if value else "none"
+    if value is None:
+        return "unknown"
+    return str(value)
+
+
+def _pr_review_file_paths(evidence: Mapping[str, Any]) -> list[str]:
+    view = evidence.get("view")
+    files = view.get("files") if isinstance(view, Mapping) else None
+    if not isinstance(files, list):
+        return []
+    out: list[str] = []
+    for item in files:
+        if not isinstance(item, Mapping):
+            continue
+        path = item.get("path") or item.get("filename")
+        if isinstance(path, str) and path:
+            out.append(path)
+    return out
+
+
+def _pr_review_process_report(
+    bindings: ToolBindings,
+    *,
+    paths: PrReviewPaths,
+    final_event: str,
+    requested_event: str,
+    recommended_event: str,
+    recommendation: Mapping[str, Any],
+    self_authored: bool,
+    staged_count: int,
+) -> str:
+    evidence = _pr_review_load_mapping(paths.evidence)
+    classification = _pr_review_load_mapping(paths.classification)
+    metadata = _pr_review_load_mapping(paths.metadata)
+    validated = _pr_review_load_mapping(paths.validated)
+    validated_recommendation = validated.get("recommendation") if isinstance(validated.get("recommendation"), Mapping) else {}
+    recommendation_source = recommendation or validated_recommendation
+
+    file_paths = _pr_review_file_paths(evidence)
+    changed_files = evidence.get("changed_files")
+    changed_count = changed_files if isinstance(changed_files, int) else len(file_paths)
+    additions = evidence.get("additions")
+    deletions = evidence.get("deletions")
+    head_sha = evidence.get("head_sha")
+    head_short = head_sha[:12] if isinstance(head_sha, str) and head_sha else "unknown"
+    sampled_paths = file_paths[:12]
+    files_sampled = ", ".join(f"`{path}`" for path in sampled_paths) if sampled_paths else "none recorded"
+    if len(file_paths) > 12:
+        files_sampled = f"{files_sampled}, ..."
+
+    reviewability = classification.get("reviewability")
+    reviewability_status = reviewability.get("status") if isinstance(reviewability, Mapping) else None
+    domains_required = classification.get("domains_required")
+    cross_family = classification.get("model_diversity")
+    if isinstance(cross_family, Mapping):
+        cross_family_recommended = cross_family.get("cross_family_review_recommended")
+    else:
+        cross_family_recommended = None
+
+    settings = bindings.settings
+    primary_model = getattr(settings, "model", None) or "unknown"
+    thinking_level = getattr(settings, "thinking_level", None) or "unknown"
+
+    agent_lines = [f"- Primary reviewer: `robomp` — `{primary_model}` (`thinking={thinking_level}`)"]
+    reviewers = metadata.get("delegated_reviewers")
+    if isinstance(reviewers, list) and reviewers:
+        for reviewer in reviewers:
+            if not isinstance(reviewer, Mapping):
+                continue
+            reviewer_id = reviewer.get("id") or reviewer.get("role") or "unknown"
+            model = reviewer.get("model") or "(unknown model)"
+            model_family = reviewer.get("model_family") or "unknown"
+            domains = reviewer.get("domains_covered") or reviewer.get("domains") or []
+            completed = _pr_review_bool(reviewer.get("completed"))
+            agent_lines.append(
+                f"- Delegated reviewer: `{reviewer_id}` — `{model}` "
+                f"(`family={model_family}`, domains=`{_pr_review_join_values(domains)}`, completed=`{completed}`)"
+            )
+    else:
+        agent_lines.append("- Delegated reviewer: none recorded")
+
+    tool_counts_by_issue = bindings.db.pr_review_tool_call_counts([bindings.issue_key])
+    tool_counts = tool_counts_by_issue.get(bindings.issue_key, {})
+    tool_names = (
+        "fetch_pr",
+        "prepare_pr_review",
+        "delegate_pr_review",
+        "validate_pr_review",
+        "submit_pr_review",
+        "read",
+        "search",
+        "bash",
+    )
+    tool_evidence = ", ".join(f"{name}={tool_counts[name]}" for name in tool_names if tool_counts.get(name))
+    if not tool_evidence:
+        tool_evidence = "none recorded"
+
+    reason = recommendation_source.get("reason") or "(no reason recorded)"
+    blocking_count = recommendation_source.get("blocking_count", 0)
+    optional_count = recommendation_source.get("optional_count", 0)
+    risk_level = classification.get("risk_level") or "unknown"
+    reviewability_text = reviewability_status if isinstance(reviewability_status, str) else "unknown"
+    delegation_required = classification.get("delegation_required")
+    additions_text = additions if isinstance(additions, int) else "unknown"
+    deletions_text = deletions if isinstance(deletions, int) else "unknown"
+
+    return "\n".join(
+        [
+            "<details>",
+            "<summary>Review process</summary>",
+            "",
+            "**Verdict**",
+            f"- GitHub event: `{final_event}`",
+            f"- Validated recommendation: `{recommended_event}` — {reason}",
+            f"- Requested event: `{requested_event}`",
+            f"- Self-authored terminal downgrade: `{_pr_review_bool(self_authored)}`",
+            f"- Blocking findings: `{blocking_count}`; advisory findings: `{optional_count}`",
+            "",
+            "**Agents**",
+            *agent_lines,
+            "",
+            "**Coverage**",
+            f"- Diff reviewed: `{changed_count}` changed file(s), `+{additions_text}/-{deletions_text}`, head `{head_short}`",
+            f"- Files sampled: {files_sampled}",
+            (
+                f"- Classification gate: risk=`{risk_level}`, reviewability=`{reviewability_text}`, "
+                f"delegation_required=`{_pr_review_bool(delegation_required)}`, "
+                f"domains=`{_pr_review_join_values(domains_required)}`"
+            ),
+            f"- Tool evidence: `{tool_evidence}`",
+            "- Checklist: correctness, regressions, security/safety, breaking changes, tests, conventions, silent contract violations",
+            "- Dependency/callsite review: diff plus surrounding code and targeted read/search evidence were required before verdict.",
+            "",
+            "</details>",
+        ]
+    )
+
+
+def _with_pr_review_process_report(
+    bindings: ToolBindings,
+    *,
+    body: str,
+    paths: PrReviewPaths,
+    final_event: str,
+    requested_event: str,
+    recommended_event: str,
+    recommendation: Mapping[str, Any],
+    self_authored: bool,
+    staged_count: int,
+) -> str:
+    stripped = body.strip()
+    if "<summary>Review process</summary>" in stripped:
+        return stripped
+    return stripped + "\n\n" + _pr_review_process_report(
+        bindings,
+        paths=paths,
+        final_event=final_event,
+        requested_event=requested_event,
+        recommended_event=recommended_event,
+        recommendation=recommendation,
+        self_authored=self_authored,
+        staged_count=staged_count,
+    )
+
+
 def _pr_review_build_payload(bindings: ToolBindings, *, event: str, body: str, args: Mapping[str, Any]) -> dict[str, Any]:
     helper = _pr_review_helper_path(bindings)
     if helper is None:
@@ -2080,22 +2284,36 @@ def _build_submit_pr_review(bindings: ToolBindings) -> HostTool[Any, Any]:
             msg = "submit_pr_review requires a non-empty 'body'."
             _audit(bindings, "submit_pr_review", args, error=msg)
             _raise_command(msg)
-        raw_event = str(args.get("event") or "COMMENT").upper()
+        requested_event = str(args.get("event") or "COMMENT").upper()
         terminal_enabled = bool(bindings.settings and bindings.settings.pr_review_terminal_events)
-        allowed_events = {"COMMENT", "APPROVE", "REQUEST_CHANGES"} if terminal_enabled else {"COMMENT"}
-        if raw_event not in allowed_events:
-            if terminal_enabled:
-                msg = (
-                    "submit_pr_review event must be COMMENT, APPROVE, or REQUEST_CHANGES when "
-                    "ROBOMP_PR_REVIEW_TERMINAL_EVENTS is enabled."
-                )
-            else:
-                msg = "submit_pr_review event must be COMMENT; terminal review events are disabled."
+        if requested_event not in _PR_REVIEW_EVENTS:
+            msg = (
+                "submit_pr_review event must be COMMENT, APPROVE, or REQUEST_CHANGES when "
+                "ROBOMP_PR_REVIEW_TERMINAL_EVENTS is enabled."
+            )
             _audit(bindings, "submit_pr_review", args, error=msg)
             _raise_command(msg)
-        requested_event = raw_event
+
         pr_review_payload_available = _pr_review_payload_available(bindings)
-        if requested_event in {"APPROVE", "REQUEST_CHANGES"} and not pr_review_payload_available:
+        paths = pr_review_paths(bindings.workspace)
+        recommendation: dict[str, Any] = {}
+        recommended_event = requested_event
+        if pr_review_payload_available:
+            try:
+                recommendation = _pr_review_recommendation(paths)
+                recommended_event = _recommended_pr_review_event(paths)
+            except RpcCommandError as exc:
+                _audit(bindings, "submit_pr_review", args, error=str(exc))
+                raise
+            raw_event = recommended_event
+        else:
+            raw_event = requested_event
+
+        if raw_event in {"APPROVE", "REQUEST_CHANGES"} and not terminal_enabled:
+            msg = "submit_pr_review event must be COMMENT; terminal review events are disabled."
+            _audit(bindings, "submit_pr_review", args, error=msg)
+            _raise_command(msg)
+        if raw_event in {"APPROVE", "REQUEST_CHANGES"} and not pr_review_payload_available:
             msg = "PR review payload state required before terminal PR review; run prepare_pr_review and validate_pr_review."
             _audit(bindings, "submit_pr_review", args, error=msg)
             _raise_command(msg)
@@ -2104,24 +2322,35 @@ def _build_submit_pr_review(bindings: ToolBindings) -> HostTool[Any, Any]:
         self_authored = bool(
             bot_login
             and bindings.issue.author.lower() == bot_login.lower()
-            and requested_event in {"APPROVE", "REQUEST_CHANGES"}
+            and raw_event in {"APPROVE", "REQUEST_CHANGES"}
         )
+        if self_authored:
+            raw_event = "COMMENT"
+
         staged_count = 0
         if pr_review_payload_available:
             staged_count = len(bindings.db.list_staged_review_comments(bindings.issue_key))
-            payload = _pr_review_build_payload(bindings, event=requested_event, body=body, args=args)
+            body = _with_pr_review_process_report(
+                bindings,
+                body=body,
+                paths=paths,
+                final_event=raw_event,
+                requested_event=requested_event,
+                recommended_event=recommended_event,
+                recommendation=recommendation,
+                self_authored=self_authored,
+                staged_count=staged_count,
+            )
+            payload = _pr_review_build_payload(bindings, event=raw_event, body=body, args=args)
             submit_body = str(payload.get("body") or body).strip()
             payload_comments = payload.get("comments")
             comments = list(payload_comments) if isinstance(payload_comments, list) else []
-            raw_event = str(payload.get("event") or requested_event).upper()
+            raw_event = str(payload.get("event") or raw_event).upper()
         else:
             staged = bindings.db.list_staged_review_comments(bindings.issue_key)
             staged_count = len(staged)
             comments = [_review_comment_to_payload(comment) for comment in staged]
             submit_body = body.strip()
-
-        if self_authored:
-            raw_event = "COMMENT"
         operation_suffix = _side_effect_payload_suffix({"body": submit_body, "comments": comments, "event": raw_event})
         operation_key = f"submit_pr_review:{bindings.issue_key}:{raw_event}:{operation_suffix}"
         if not bindings.db.reserve_side_effect(operation_key):
@@ -2200,6 +2429,8 @@ def _build_submit_pr_review(bindings: ToolBindings) -> HostTool[Any, Any]:
         if pr_review_payload_available:
             result["ignored_staged_comments"] = staged_count
             result["posted_findings"] = posted_findings_count
+            result["recommended_event"] = recommended_event
+            result["recommendation_reason"] = recommendation.get("reason")
             if posted_findings_warning is not None:
                 result["posted_findings_warning"] = posted_findings_warning
         bindings.db.mark_side_effect_succeeded(operation_key)

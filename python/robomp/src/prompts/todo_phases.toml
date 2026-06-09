@@ -29,7 +29,7 @@ tasks = [
 name = "Review"
 tasks = [
   "Call validate_pr_review and resolve all validation errors",
-  "Call submit_pr_review once with the final event and summary",
+  "Call submit_pr_review once using validate_pr_review's recommended event and a terse verdict summary",
 ]
 
 [[handle_comment]]

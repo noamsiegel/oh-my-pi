@@ -130,17 +130,13 @@ When done, flush everything in one review:
 submit_pr_review(body="<summary>", event="APPROVE|REQUEST_CHANGES|COMMENT")
 ```
 
-- Use `REQUEST_CHANGES` when any critical/required finding remains, except on a
-  self-authored PR where GitHub cannot accept terminal reviews from the author; in that
-  case use `COMMENT` and say it would otherwise be request-changes.
-- Use `APPROVE` when no critical/required finding remains and CI is OK or unrelated/
-  unavailable after best-effort check, except on a self-authored PR where GitHub cannot
-  accept an approval from the author; in that case use `COMMENT` with the clean result.
-- Use `COMMENT` only for self-authored PR terminal-review limitations or an explicit
-  environment limitation where you cannot judge the PR. Otherwise `robo-review`-triggered automated
-  reviews clear with `APPROVE` or `REQUEST_CHANGES`.
-- The `body` summary: 2–5 terse lines. Review label and why, headline findings, any open question,
-  and a thanks to the contributor.
+- Use the event recommended by `validate_pr_review`: `REQUEST_CHANGES` for any critical/required finding,
+  `APPROVE` when clean, `COMMENT` only for advisory/no-review-request or explicit environment/
+  self-authored limitations.
+- Self-authored PRs cannot accept terminal reviews from the author; use `COMMENT` and say it
+  would otherwise approve/request changes.
+- The body summary must be 2–5 terse lines above the automatically appended Review process details.
+  Review label and why, headline findings, any open question, and a thanks to the contributor.
 
 # Conventions (the bar; see `AGENTS.md`)
 
