@@ -1,5 +1,6 @@
 import { getAntigravityUserAgent } from "../providers/google-gemini-headers";
 import type {
+	CredentialRankingStrategy,
 	UsageAmount,
 	UsageFetchContext,
 	UsageFetchParams,
@@ -298,4 +299,28 @@ export const antigravityUsageProvider: UsageProvider = {
 	id: "google-antigravity",
 	fetchUsage: fetchAntigravityUsage,
 	supports: params => params.provider === "google-antigravity",
+};
+
+const ONE_DAY_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Antigravity quotas reset daily and are returned per backend counter
+ * (Anthropic / Google / OpenAI) without a fixed "primary vs secondary"
+ * split. `fetchAntigravityUsage` already sorts `limits` ascending by
+ * `remainingFraction`, so the most-pressured counter is index 0 and the
+ * next-most-pressured (if any) is index 1. Treat those as the windows
+ * AuthStorage compares across credentials — that surfaces an exhausted
+ * Gemini counter on one credential even when a sibling Claude counter is
+ * healthy, which is what was masking quota-exhausted accounts before.
+ */
+export const antigravityRankingStrategy: CredentialRankingStrategy = {
+	findWindowLimits(report) {
+		const primary = report.limits[0];
+		const secondary = report.limits.find((limit, index) => index > 0 && limit !== primary);
+		return { primary, secondary };
+	},
+	// Antigravity windows omit `durationMs`; the endpoint is
+	// `daily-cloudcode-pa.googleapis.com`, so fall back to 24h when computing
+	// drain rate.
+	windowDefaults: { primaryMs: ONE_DAY_MS, secondaryMs: ONE_DAY_MS },
 };
