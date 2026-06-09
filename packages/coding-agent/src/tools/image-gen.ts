@@ -1058,6 +1058,7 @@ export const imageGenTool: CustomTool<typeof imageGenSchema, ImageGenToolDetails
 				const hostedKey: ApiKey = ctx.modelRegistry.resolver(hostedModel.provider, {
 					sessionId,
 					baseUrl: hostedModel.baseUrl,
+					modelId: hostedModel.id,
 				});
 
 				const parsed = await withAuth(

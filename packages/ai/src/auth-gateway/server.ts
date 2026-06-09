@@ -318,6 +318,7 @@ async function refreshGatewayApiKeyAfterAuthError(
 		const switched = await storage.markUsageLimitReached(provider, sessionId, {
 			retryAfterMs,
 			baseUrl: model.baseUrl,
+			modelId: model.id,
 			signal,
 		});
 		logger.debug("auth-gateway retrying provider request after usage-limit block", {
