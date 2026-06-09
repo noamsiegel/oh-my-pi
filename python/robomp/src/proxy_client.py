@@ -13,18 +13,20 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
 import httpx
 
-from robomp.git_ops import GitCommandError, HeadDriftError, PushResult
-from robomp.github_client import (
+from robomp.git_ops import GitCommandError, HeadDriftError, PrWorktreeResult, PushResult
+from robomp.github_types import (
     CommentInfo,
     GitHubError,
     IssueInfo,
     IssueSummary,
+    PullRequestCommitAuthorInfo,
+    PullRequestCommitInfo,
     PullRequestFileInfo,
     PullRequestInfo,
     PullRequestReviewInfo,
@@ -178,6 +180,14 @@ class GitHubProxyClient:
         )
         return [_pr_file_from(item) for item in (data.get("items") if isinstance(data, dict) else None) or []]
 
+    async def list_pr_commits(self, repo: str, pr_number: int) -> list[PullRequestCommitInfo]:
+        data = await self._request(
+            "GET",
+            "/gh/v1/pr_commits",
+            params={"repo": repo, "pr_number": pr_number},
+        )
+        return [_pr_commit_from(item) for item in (data.get("items") if isinstance(data, dict) else None) or []]
+
     async def list_issues(
         self,
         repo: str,
@@ -201,6 +211,19 @@ class GitHubProxyClient:
             "GET",
             "/gh/v1/review_comments",
             params={"repo": repo, "pr_number": pr_number},
+        )
+        return [_review_comment_from(item) for item in (data.get("items") if isinstance(data, dict) else None) or []]
+
+    async def list_review_comments_for_review(
+        self,
+        repo: str,
+        pr_number: int,
+        review_id: int,
+    ) -> list[ReviewCommentInfo]:
+        data = await self._request(
+            "GET",
+            "/gh/v1/review_comments_for_review",
+            params={"repo": repo, "pr_number": pr_number, "review_id": review_id},
         )
         return [_review_comment_from(item) for item in (data.get("items") if isinstance(data, dict) else None) or []]
 
@@ -395,6 +418,32 @@ class ProxyGitTransport:
         del pool_dir
         self._post("/gh/v1/git/fetch_pr_head", {"repo": repo, "pr_number": pr_number})
 
+    def prepare_pr_worktree(
+        self,
+        *,
+        repo: str,
+        pool_dir: Path,
+        repo_dir: Path,
+        pr_number: int,
+        base_ref: str,
+        changed_paths: Iterable[str],
+    ) -> PrWorktreeResult:
+        del pool_dir
+        data = self._post(
+            "/gh/v1/git/prepare_pr_worktree",
+            {
+                "repo": repo,
+                "workspace_key": repo_dir.parent.name,
+                "pr_number": pr_number,
+                "base_ref": base_ref,
+                "changed_paths": list(changed_paths),
+            },
+        )
+        return PrWorktreeResult(
+            head=str(data.get("head") or ""),
+            hydrated_paths=tuple(data.get("hydrated_paths") or ()),
+        )
+
     def push_branch(
         self,
         *,
@@ -490,6 +539,10 @@ def _review_comment_from(data: Any) -> ReviewCommentInfo:
     if not isinstance(data, dict):
         raise GitHubError(500, "proxy returned malformed review_comment payload")
     line = data.get("line")
+    start_line = data.get("start_line")
+    original_line = data.get("original_line")
+    review_id = data.get("review_id")
+    in_reply_to_id = data.get("in_reply_to_id")
     return ReviewCommentInfo(
         id=int(data.get("id") or 0),
         author=str(data.get("author") or ""),
@@ -497,6 +550,13 @@ def _review_comment_from(data: Any) -> ReviewCommentInfo:
         path=str(data.get("path") or ""),
         line=line if isinstance(line, int) else None,
         created_at=str(data.get("created_at") or ""),
+        start_line=start_line if isinstance(start_line, int) else None,
+        original_line=original_line if isinstance(original_line, int) else None,
+        html_url=str(data.get("html_url") or ""),
+        review_id=review_id if isinstance(review_id, int) else None,
+        commit_id=str(data.get("commit_id") or ""),
+        diff_hunk=str(data.get("diff_hunk") or ""),
+        in_reply_to_id=in_reply_to_id if isinstance(in_reply_to_id, int) else None,
     )
 
 
@@ -509,6 +569,7 @@ def _pr_review_from(data: Any) -> PullRequestReviewInfo:
         body=str(data.get("body") or ""),
         state=str(data.get("state") or ""),
         submitted_at=str(data.get("submitted_at") or ""),
+        commit_id=str(data.get("commit_id") or ""),
     )
 
 
@@ -520,6 +581,25 @@ def _pr_file_from(data: Any) -> PullRequestFileInfo:
         status=str(data.get("status") or ""),
         additions=int(data.get("additions") or 0),
         deletions=int(data.get("deletions") or 0),
+        previous_filename=str(data.get("previous_filename") or ""),
+    )
+
+
+def _pr_commit_author_from(data: Any) -> PullRequestCommitAuthorInfo:
+    if not isinstance(data, dict):
+        raise GitHubError(500, "proxy returned malformed pr_commit_author payload")
+    return PullRequestCommitAuthorInfo(login=str(data.get("login") or ""), name=str(data.get("name") or ""))
+
+
+def _pr_commit_from(data: Any) -> PullRequestCommitInfo:
+    if not isinstance(data, dict):
+        raise GitHubError(500, "proxy returned malformed pr_commit payload")
+    authors = data.get("authors")
+    return PullRequestCommitInfo(
+        sha=str(data.get("sha") or ""),
+        message_headline=str(data.get("message_headline") or ""),
+        message_body=str(data.get("message_body") or ""),
+        authors=tuple(_pr_commit_author_from(item) for item in authors or ()),
     )
 
 
@@ -533,7 +613,10 @@ def _pr_from(data: Any) -> PullRequestInfo:
         head_ref=str(data.get("head_ref") or ""),
         base_ref=str(data.get("base_ref") or ""),
         state=str(data.get("state") or "open"),
+        draft=bool(data.get("draft")),
+        head_sha=str(data.get("head_sha") or ""),
         author=str(data.get("author") or ""),
+        author_type=str(data.get("author_type") or ""),
         head_repo=str(data.get("head_repo") or ""),
         title=str(data.get("title") or ""),
         body=str(data.get("body") or ""),

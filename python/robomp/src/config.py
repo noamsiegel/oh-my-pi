@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import random
+from collections.abc import Mapping
 from functools import cache
 from pathlib import Path
 from typing import Literal
@@ -26,24 +27,34 @@ class Settings(BaseSettings):
         case_sensitive=False,
     )
 
-    # GitHub
-    # `github_token` is REQUIRED on the gh-proxy side (it holds the PAT) and
-    # OPTIONAL on the orchestrator side when `gh_proxy_url` is configured —
-    # the orchestrator then talks to gh-proxy over HMAC RPC and never sees
-    # the PAT. Validated end-to-end in `_validate_proxy_or_pat` below.
-    github_token: SecretStr | None = Field(None, alias="GITHUB_TOKEN")
+    # GitHub webhook/orchestrator identity
     github_webhook_secret: SecretStr = Field(..., alias="GITHUB_WEBHOOK_SECRET")
     bot_login: str = Field(..., alias="ROBOMP_BOT_LOGIN")
     git_author_name: str | None = Field(None, alias="ROBOMP_GIT_AUTHOR_NAME")
     git_author_email: str = Field(..., alias="ROBOMP_GIT_AUTHOR_EMAIL")
     repo_allowlist_raw: str = Field("", alias="ROBOMP_REPO_ALLOWLIST")
     pr_review_enabled: bool = Field(True, alias="ROBOMP_PR_REVIEW_ENABLED")
+    pr_review_label_allowlist_raw: str = Field("", alias="ROBOMP_PR_REVIEW_LABEL_ALLOWLIST")
+    pr_review_terminal_events: bool = Field(False, alias="ROBOMP_PR_REVIEW_TERMINAL_EVENTS")
+    pr_review_helper: Path | None = Field(None, alias="ROBOMP_PR_REVIEW_HELPER")
+    pr_review_delegate_models_raw: str = Field("", alias="ROBOMP_PR_REVIEW_DELEGATE_MODELS")
+    pr_review_delegate_model_map_raw: str = Field("", alias="ROBOMP_PR_REVIEW_DELEGATE_MODEL_MAP")
 
-    # gh-proxy. Set BOTH to route GitHub through the proxy; leave both empty
-    # to keep PAT-on-orchestrator behavior. Mixing the two (PAT + proxy) is
-    # rejected to prevent silent fallback to direct GitHub access.
-    gh_proxy_url: str | None = Field(None, alias="ROBOMP_GH_PROXY_URL")
-    gh_proxy_hmac_key: SecretStr | None = Field(None, alias="ROBOMP_GH_PROXY_HMAC_KEY")
+    pr_review_learning_db: Path | None = Field(None, alias="ROBOMP_PR_REVIEW_LEARNING_DB")
+    pr_review_self_improve_enabled: bool = Field(True, alias="ROBOMP_PR_REVIEW_SELF_IMPROVE_ENABLED")
+    pr_review_self_improve_batch_size: int = Field(10, alias="ROBOMP_PR_REVIEW_SELF_IMPROVE_BATCH_SIZE")
+    pr_review_self_improve_lookback_days: int = Field(30, alias="ROBOMP_PR_REVIEW_SELF_IMPROVE_LOOKBACK_DAYS")
+    pr_review_self_improve_max_sessions: int = Field(50, alias="ROBOMP_PR_REVIEW_SELF_IMPROVE_MAX_SESSIONS")
+    pr_review_self_improve_report_dir: Path = Field(Path("/data/pr-review/self-improvements"), alias="ROBOMP_PR_REVIEW_SELF_IMPROVE_REPORT_DIR")
+    pr_review_self_improve_model: str = Field("", alias="ROBOMP_PR_REVIEW_SELF_IMPROVE_MODEL")
+    pr_review_self_improve_repo_root: Path = Field(Path("/source/robo-ms"), alias="ROBOMP_PR_REVIEW_SELF_IMPROVE_REPO_ROOT")
+    pr_review_self_improve_push_token: SecretStr | None = Field(None, alias="ROBOMP_PR_REVIEW_SELF_IMPROVE_PUSH_TOKEN")
+    pr_review_self_improve_quality_gate_timeout_seconds: float = Field(
+        3600.0,
+        alias="ROBOMP_PR_REVIEW_SELF_IMPROVE_QUALITY_GATE_TIMEOUT_SECONDS",
+    )
+    # gh-proxy process knobs. Orchestrator/proxy credentials live in
+    # OrchestratorSettings and ProxySettings respectively.
     # Bind address for `python -m robomp.proxy serve`. Internal-only by
     # default; gh-proxy never exposes a host port.
     gh_proxy_bind_host: str = Field("0.0.0.0", alias="ROBOMP_GH_PROXY_BIND_HOST")
@@ -61,6 +72,7 @@ class Settings(BaseSettings):
     model: str = Field("anthropic/claude-sonnet-4-6", alias="ROBOMP_MODEL")
     provider: str | None = Field(None, alias="ROBOMP_PROVIDER")
     thinking_level: ThinkingLevel = Field("high", alias="ROBOMP_THINKING")
+    labels_comments_only: bool = Field(False, alias="ROBOMP_LABELS_COMMENTS_ONLY")
 
     # Runtime
     max_concurrency: int = Field(8, alias="ROBOMP_MAX_CONCURRENCY")
@@ -92,7 +104,7 @@ class Settings(BaseSettings):
     # Server
     bind_host: str = Field("0.0.0.0", alias="ROBOMP_BIND_HOST")
     bind_port: int = Field(8080, alias="ROBOMP_BIND_PORT")
-
+    webhook_max_body_bytes: int = Field(1 << 20, alias="ROBOMP_WEBHOOK_MAX_BODY_BYTES")
     # Dev-only replay header value; if empty, /replay is disabled
     replay_token: SecretStr | None = Field(None, alias="ROBOMP_REPLAY_TOKEN")
 
@@ -159,11 +171,9 @@ class Settings(BaseSettings):
                 return None
         return value
 
-    @field_validator("github_token", mode="before")
+    @field_validator("pr_review_self_improve_push_token", mode="before")
     @classmethod
     def _blank_token_disables(cls, value: object) -> object:
-        """Treat empty/whitespace `GITHUB_TOKEN` as 'unset' so proxy-only
-        deployments don't have to remove the env var."""
         if isinstance(value, str) and not value.strip():
             return None
         if hasattr(value, "get_secret_value"):
@@ -171,53 +181,6 @@ class Settings(BaseSettings):
             if isinstance(inner, str) and not inner.strip():
                 return None
         return value
-
-    @field_validator("gh_proxy_url", mode="before")
-    @classmethod
-    def _blank_proxy_url_disables(cls, value: object) -> object:
-        if isinstance(value, str) and not value.strip():
-            return None
-        return value
-
-    @field_validator("gh_proxy_hmac_key", mode="before")
-    @classmethod
-    def _blank_proxy_key_disables(cls, value: object) -> object:
-        if isinstance(value, str) and not value.strip():
-            return None
-        if hasattr(value, "get_secret_value"):
-            inner = value.get_secret_value()  # type: ignore[attr-defined]
-            if isinstance(inner, str) and not inner.strip():
-                return None
-        return value
-
-    @model_validator(mode="after")
-    def _validate_proxy_or_pat(self) -> Settings:
-        """Enforce mutual exclusion between PAT and proxy mode.
-
-        - Both set → reject (silent fallback to direct GitHub would defeat
-          the isolation goal).
-        - Proxy URL set but no HMAC key (or vice versa) → reject (gh-proxy
-          would either be unauthenticated or unreachable).
-        - Neither set → also reject; SOMETHING needs to talk to GitHub.
-        """
-        has_token = self.github_token is not None
-        has_url = bool(self.gh_proxy_url)
-        has_key = self.gh_proxy_hmac_key is not None
-        if has_token and has_url:
-            raise ValueError(
-                "GITHUB_TOKEN and ROBOMP_GH_PROXY_URL are mutually exclusive — "
-                "set ONE to choose between direct-PAT and gh-proxy modes."
-            )
-        if has_url != has_key:
-            raise ValueError(
-                "ROBOMP_GH_PROXY_URL and ROBOMP_GH_PROXY_HMAC_KEY must both be set together (or both empty)."
-            )
-        if not has_token and not has_url:
-            raise ValueError(
-                "no GitHub access configured: set GITHUB_TOKEN, or set "
-                "ROBOMP_GH_PROXY_URL + ROBOMP_GH_PROXY_HMAC_KEY to use gh-proxy."
-            )
-        return self
 
     @field_validator("repo_allowlist_raw", mode="before")
     @classmethod
@@ -229,6 +192,82 @@ class Settings(BaseSettings):
         if isinstance(v, (list, tuple)):
             return ",".join(str(item) for item in v)
         return str(v)
+
+    @field_validator("pr_review_label_allowlist_raw", mode="before")
+    @classmethod
+    def _coerce_pr_review_label_allowlist(cls, v: object) -> str:
+        if v is None:
+            return ""
+        if isinstance(v, str):
+            return v
+        if isinstance(v, (list, tuple)):
+            return ",".join(str(item) for item in v)
+        return str(v)
+
+    @field_validator("pr_review_delegate_models_raw", mode="before")
+    @classmethod
+    def _coerce_pr_review_delegate_models(cls, v: object) -> str:
+        if v is None:
+            return ""
+        if isinstance(v, str):
+            return v
+        if isinstance(v, (list, tuple)):
+            return ",".join(str(item) for item in v)
+        return str(v)
+
+    @field_validator("pr_review_delegate_model_map_raw", mode="before")
+    @classmethod
+    def _coerce_pr_review_delegate_model_map(cls, v: object) -> str:
+        if v is None:
+            return ""
+        if isinstance(v, str):
+            return v
+        if isinstance(v, Mapping):
+            return ",".join(f"{key}={value}" for key, value in v.items())
+        if isinstance(v, (list, tuple)):
+            return ",".join(str(item) for item in v)
+        return str(v)
+
+    @field_validator("pr_review_helper", mode="before")
+    @classmethod
+    def _blank_pr_review_helper_disables(cls, value: object) -> object:
+        if value is None:
+            return None
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
+
+    @field_validator("pr_review_learning_db", mode="before")
+    @classmethod
+    def _blank_pr_review_learning_db_disables(cls, value: object) -> object:
+        if value is None:
+            return None
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
+
+    @property
+    def pr_review_label_allowlist(self) -> frozenset[str]:
+        items = [piece.strip().lower() for piece in self.pr_review_label_allowlist_raw.split(",")]
+        return frozenset(item for item in items if item)
+
+    @property
+    def pr_review_delegate_models(self) -> tuple[str, ...]:
+        items = [piece.strip() for piece in self.pr_review_delegate_models_raw.split(",")]
+        return tuple(item for item in items if item)
+
+    @property
+    def pr_review_delegate_model_map(self) -> dict[str, str]:
+        mapping: dict[str, str] = {}
+        for piece in self.pr_review_delegate_model_map_raw.split(","):
+            if "=" not in piece:
+                continue
+            key, value = piece.split("=", 1)
+            normalized_key = key.strip().lower()
+            normalized_value = value.strip()
+            if normalized_key and normalized_value:
+                mapping[normalized_key] = normalized_value
+        return mapping
 
     @property
     def repo_allowlist(self) -> frozenset[str]:
@@ -303,13 +342,68 @@ class Settings(BaseSettings):
         return (self.git_author_name or self.bot_login).strip()
 
     def ensure_paths(self) -> None:
-        for path in (self.workspace_root, self.sqlite_path.parent, self.log_dir):
+        paths = [self.workspace_root, self.sqlite_path.parent, self.log_dir]
+        if self.pr_review_learning_db is not None:
+            paths.append(self.pr_review_learning_db.parent)
+        if self.pr_review_self_improve_enabled:
+            paths.append(self.pr_review_self_improve_report_dir)
+        for path in paths:
             path.mkdir(parents=True, exist_ok=True)
 
 
+class OrchestratorSettings(Settings):
+    """Settings for the webhook/worker process.
+
+    Orchestrator is proxy-only: it must not hold the GitHub PAT, and it must
+    route all GitHub REST/git traffic through gh-proxy over HMAC.
+    """
+
+    github_token: SecretStr | None = Field(None, alias="GITHUB_TOKEN")
+    gh_proxy_url: str = Field(..., alias="ROBOMP_GH_PROXY_URL")
+    gh_proxy_hmac_key: SecretStr = Field(..., alias="ROBOMP_GH_PROXY_HMAC_KEY")
+
+    @field_validator("github_token", mode="before")
+    @classmethod
+    def _blank_github_token_disables(cls, value: object) -> object:
+        if isinstance(value, str) and not value.strip():
+            return None
+        if hasattr(value, "get_secret_value"):
+            inner = value.get_secret_value()  # type: ignore[attr-defined]
+            if isinstance(inner, str) and not inner.strip():
+                return None
+        return value
+
+    @field_validator("gh_proxy_url", mode="before")
+    @classmethod
+    def _require_proxy_url(cls, value: object) -> object:
+        if isinstance(value, str) and not value.strip():
+            raise ValueError("ROBOMP_GH_PROXY_URL must be set for orchestrator mode")
+        return value
+
+    @field_validator("gh_proxy_hmac_key", mode="before")
+    @classmethod
+    def _require_proxy_key(cls, value: object) -> object:
+        if isinstance(value, str) and not value.strip():
+            raise ValueError("ROBOMP_GH_PROXY_HMAC_KEY must be set for orchestrator mode")
+        if hasattr(value, "get_secret_value"):
+            inner = value.get_secret_value()  # type: ignore[attr-defined]
+            if isinstance(inner, str) and not inner.strip():
+                raise ValueError("ROBOMP_GH_PROXY_HMAC_KEY must be set for orchestrator mode")
+        return value
+
+    @model_validator(mode="after")
+    def _validate_proxy_only(self) -> OrchestratorSettings:
+        if self.github_token is not None:
+            raise ValueError(
+                "robomp orchestrator refuses to start with GITHUB_TOKEN set in env. "
+                "The PAT must live only in the gh-proxy container."
+            )
+        return self
+
+
 @cache
-def get_settings() -> Settings:
-    return Settings()  # type: ignore[call-arg]
+def get_settings() -> OrchestratorSettings:
+    return OrchestratorSettings()  # type: ignore[call-arg]
 
 
 def reset_settings_cache() -> None:
@@ -317,16 +411,8 @@ def reset_settings_cache() -> None:
     get_settings.cache_clear()
 
 
-class _ProxyEnvLoader(BaseSettings):
-    """Minimal env loader for `python -m robomp.proxy serve`.
-
-    Validates only the fields the gh-proxy container actually needs
-    (PAT, HMAC key, bind address, paths). Keeping this separate from the
-    orchestrator-mode `Settings()` ctor avoids dragging in
-    `_validate_proxy_or_pat` and friends, which would reject a perfectly
-    valid proxy deployment (no webhook secret, no bot_login, no proxy URL)
-    before `serve()` can give a specific error.
-    """
+class ProxySettings(BaseSettings):
+    """Settings for the gh-proxy process only."""
 
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -355,28 +441,11 @@ class _ProxyEnvLoader(BaseSettings):
                 raise ValueError("must be a non-empty string")
         return value
 
+    def ensure_paths(self) -> None:
+        for path in (self.workspace_root, self.log_dir):
+            path.mkdir(parents=True, exist_ok=True)
 
-def load_proxy_settings() -> Settings:
-    """Build a `Settings` instance suitable for the gh-proxy process.
 
-    Only the env vars the proxy actually consumes are required; the
-    orchestrator-only fields (webhook secret, bot_login, …) are set to
-    inert placeholders since `proxy.server` never reads them. Skips the
-    `Settings()` cross-field validator (which presumes orchestrator
-    semantics) by routing through `model_construct`.
-    """
-    loader = _ProxyEnvLoader()  # type: ignore[call-arg]
-    return Settings.model_construct(
-        github_token=loader.github_token,
-        github_webhook_secret=SecretStr(""),
-        bot_login="gh-proxy",
-        git_author_email="gh-proxy@invalid",
-        gh_proxy_url=None,
-        gh_proxy_hmac_key=loader.gh_proxy_hmac_key,
-        gh_proxy_bind_host=loader.gh_proxy_bind_host,
-        gh_proxy_bind_port=loader.gh_proxy_bind_port,
-        workspace_root=loader.workspace_root,
-        log_dir=loader.log_dir,
-        gh_proxy_max_body_bytes=loader.gh_proxy_max_body_bytes,
-        gh_proxy_git_timeout_seconds=loader.gh_proxy_git_timeout_seconds,
-    )
+def load_proxy_settings() -> ProxySettings:
+    """Build settings for the gh-proxy process."""
+    return ProxySettings()  # type: ignore[call-arg]

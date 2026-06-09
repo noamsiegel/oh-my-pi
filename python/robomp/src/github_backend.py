@@ -3,7 +3,7 @@
 Callers (worker, host tools, tasks, server, CLI) reference `GitHubBackend`
 so they accept either the direct PAT-bearing REST client or the HMAC-RPC
 proxy client without changing signatures. Both impls return the same typed
-dataclasses (`IssueInfo`, `RepoInfo`, …) defined in `github_client`.
+dataclasses (`IssueInfo`, `RepoInfo`, …) defined in `github_types`.
 """
 
 from __future__ import annotations
@@ -11,10 +11,11 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any, Protocol
 
-from robomp.github_client import (
+from robomp.github_types import (
     CommentInfo,
     IssueInfo,
     IssueSummary,
+    PullRequestCommitInfo,
     PullRequestFileInfo,
     PullRequestInfo,
     PullRequestReviewInfo,
@@ -38,6 +39,8 @@ class GitHubBackend(Protocol):
 
     async def list_pr_files(self, repo: str, pr_number: int) -> list[PullRequestFileInfo]: ...
 
+    async def list_pr_commits(self, repo: str, pr_number: int) -> list[PullRequestCommitInfo]: ...
+
     async def list_issues(
         self,
         repo: str,
@@ -49,6 +52,8 @@ class GitHubBackend(Protocol):
     async def list_comments(self, repo: str, number: int) -> list[CommentInfo]: ...
 
     async def list_review_comments(self, repo: str, pr_number: int) -> list[ReviewCommentInfo]: ...
+
+    async def list_review_comments_for_review(self, repo: str, pr_number: int, review_id: int) -> list[ReviewCommentInfo]: ...
 
     async def list_pr_reviews(self, repo: str, pr_number: int) -> list[PullRequestReviewInfo]: ...
 

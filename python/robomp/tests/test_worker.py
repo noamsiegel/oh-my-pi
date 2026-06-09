@@ -328,7 +328,7 @@ async def test_run_rpc_uses_workspace_xdg_dirs_without_slot(tmp_path: Path, sett
     assert env["GIT_COMMITTER_NAME"] == settings.resolved_author_name
     assert env["GIT_COMMITTER_EMAIL"] == settings.git_author_email
     assert tmpdir.is_dir()
-    assert stat.S_IMODE(tmpdir.stat().st_mode) == 0o700
+    assert stat.S_IMODE(tmpdir.stat().st_mode) == 0o755
 
 
 @pytest.mark.asyncio
@@ -339,6 +339,7 @@ async def test_run_rpc_uses_workspace_xdg_dirs_for_slot_without_chown(
     monkeypatch.setattr("robomp.sandbox.platform.system", lambda: "Linux")
     monkeypatch.setattr("robomp.sandbox.os.geteuid", lambda: 0)
     monkeypatch.setattr("robomp.sandbox.os.chown", lambda path, uid, gid: chown_calls.append((Path(path), uid, gid)))
+    monkeypatch.setattr("robomp.sandbox.os.fchown", lambda _fd, _uid, _gid: None)
 
     inputs, bindings = _make_inputs(tmp_path, settings, session_has_jsonl=False, slot_uid=2001)
     loop = asyncio.new_event_loop()

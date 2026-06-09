@@ -90,6 +90,7 @@ def _populate_built_artifacts(repo_dir: Path, *, body: bytes = b"\x7fELF...nativ
 # ---- compute_key ----
 
 
+@pytest.mark.local_git
 def test_compute_key_deterministic_across_clones(tmp_path: Path) -> None:
     a = _seed_repo(tmp_path / "a")
     b_root = tmp_path / "b"
@@ -99,6 +100,7 @@ def test_compute_key_deterministic_across_clones(tmp_path: Path) -> None:
     assert key_a == key_b
 
 
+@pytest.mark.local_git
 def test_compute_key_changes_when_each_input_changes(tmp_path: Path) -> None:
     base = _seed_repo(tmp_path / "base")
     base_key = compute_key(base, target="linux-arm64")
@@ -128,6 +130,7 @@ def test_compute_key_changes_when_each_input_changes(tmp_path: Path) -> None:
         assert new_key != base_key, f"key did not change after mutating {label}"
 
 
+@pytest.mark.local_git
 def test_compute_key_target_triple_changes_key(tmp_path: Path) -> None:
     repo = _seed_repo(tmp_path / "repo")
     arm = compute_key(repo, target="linux-arm64")
@@ -135,6 +138,7 @@ def test_compute_key_target_triple_changes_key(tmp_path: Path) -> None:
     assert arm != x64
 
 
+@pytest.mark.local_git
 def test_compute_key_handles_missing_inputs(tmp_path: Path) -> None:
     """Missing key paths fold to a fixed null hash → key still deterministic."""
     repo = _seed_repo(tmp_path / "repo", with_all_inputs=False)
@@ -161,6 +165,7 @@ def test_compute_key_uses_all_documented_paths() -> None:
     )
 
 
+@pytest.mark.local_git
 def test_compute_key_raises_on_non_repo(tmp_path: Path) -> None:
     with pytest.raises(subprocess.CalledProcessError):
         compute_key(tmp_path, target="linux-arm64")
@@ -173,6 +178,7 @@ def _cache(tmp_path: Path, **kwargs: object) -> NativesCache:
     return NativesCache(tmp_path / "natives-cache", **kwargs)  # type: ignore[arg-type]
 
 
+@pytest.mark.local_git
 def test_populate_workspace_miss_is_noop(tmp_path: Path) -> None:
     cache = _cache(tmp_path)
     repo_dir = _seed_repo(tmp_path / "ws" / "repo")
@@ -184,6 +190,8 @@ def test_populate_workspace_miss_is_noop(tmp_path: Path) -> None:
     assert before == after
 
 
+@pytest.mark.local_git
+@pytest.mark.slow
 def test_capture_then_populate_shares_node_inode_but_copies_companions(tmp_path: Path) -> None:
     cache = _cache(tmp_path)
     src_repo = _seed_repo(tmp_path / "src" / "repo")
@@ -226,6 +234,7 @@ def test_capture_then_populate_shares_node_inode_but_copies_companions(tmp_path:
         assert cached_companion.read_text() == original, name
 
 
+@pytest.mark.local_git
 def test_capture_skips_when_artifacts_incomplete(tmp_path: Path) -> None:
     cache = _cache(tmp_path)
     repo = _seed_repo(tmp_path / "ws" / "repo")
@@ -237,6 +246,8 @@ def test_capture_skips_when_artifacts_incomplete(tmp_path: Path) -> None:
     assert not cache.entry_dir(REPO, "k").exists()
 
 
+@pytest.mark.local_git
+@pytest.mark.slow
 def test_capture_is_idempotent_under_lock(tmp_path: Path) -> None:
     """Two concurrent captures of the same key end with one final entry."""
     cache = _cache(tmp_path)
@@ -266,6 +277,7 @@ def test_capture_is_idempotent_under_lock(tmp_path: Path) -> None:
     assert final_dirs[0].name == key
 
 
+@pytest.mark.local_git
 def test_populate_cross_device_falls_back_to_copy(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     cache = _cache(tmp_path)
     src_repo = _seed_repo(tmp_path / "src" / "repo")
@@ -295,6 +307,7 @@ def test_populate_cross_device_falls_back_to_copy(tmp_path: Path, monkeypatch: p
     assert cached_node.stat().st_ino != copied_node.stat().st_ino
 
 
+@pytest.mark.local_git
 def test_populate_replaces_existing_file_atomically(tmp_path: Path) -> None:
     cache = _cache(tmp_path)
     src_repo = _seed_repo(tmp_path / "src" / "repo")

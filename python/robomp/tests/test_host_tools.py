@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -12,10 +13,22 @@ import httpx
 import pytest
 from omp_rpc import HostToolContext, RpcCommandError
 
-from robomp import host_tools
+from robomp import host_tools, pr_review_tools
+from robomp.config import Settings, reset_settings_cache
 from robomp.db import Database
-from robomp.github_client import GitHubClient, IssueInfo, RepoInfo
+from robomp.github_client import GitHubClient
+from robomp.github_types import (
+    IssueInfo,
+    PullRequestCommitAuthorInfo,
+    PullRequestCommitInfo,
+    PullRequestFileInfo,
+    PullRequestInfo,
+    PullRequestReviewInfo,
+    RepoInfo,
+    ReviewCommentInfo,
+)
 from robomp.host_tools import AbortController, ToolBindings, build
+from robomp.pr_review_tools import PrReviewPaths, pr_review_paths, run_pr_review_helper, save_json_checked
 from robomp.sandbox import LocalGitTransport, Workspace
 
 
@@ -106,23 +119,52 @@ def _ctx() -> HostToolContext[Any]:
     return HostToolContext(tool_call_id="tc-1", _cancel_event=threading.Event(), _send_update=lambda _payload: None)
 
 
-def test_repo_command_env_scrubs_secrets_and_uses_workspace_cache(
+def test_repo_command_env_excludes_parent_secrets(
     db: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setenv("PATH", "/usr/bin")
+    monkeypatch.setenv("LANG", "C.UTF-8")
+    monkeypatch.setenv("LC_CTYPE", "UTF-8")
     monkeypatch.setenv("GITHUB_TOKEN", "secret-token")
     monkeypatch.setenv("GITHUB_WEBHOOK_SECRET", "secret-webhook")
     monkeypatch.setenv("ROBOMP_GH_PROXY_HMAC_KEY", "secret-proxy")
+    monkeypatch.setenv("OPENAI_API_KEY", "secret-openai")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "secret-aws")
+    monkeypatch.setenv("SSH_AUTH_SOCK", "/tmp/agent.sock")
+    monkeypatch.setenv("GIT_TRACE", "1")
+    monkeypatch.setenv("GIT_ASKPASS", "/tmp/askpass")
+    monkeypatch.setenv("PI_ROOT", "/pi")
+    monkeypatch.setenv("BUN_INSTALL", "/bun")
+    monkeypatch.setenv("NODE_OPTIONS", "--require=/tmp/hook.js")
+    monkeypatch.setenv("OMP_AUTH_BROKER_TOKEN", "broker-secret")
     monkeypatch.setenv("BUN_INSTALL_CACHE_DIR", "/data/cache/bun-cache")
 
     bindings, loop, thread = _bindings(db, tmp_path, httpx.MockTransport(lambda _r: httpx.Response(500)), slot_uid=2001)
     try:
         env = host_tools._repo_command_env(bindings)
+        rpc_env = host_tools._repo_command_env(bindings, include_auth_broker=True)
     finally:
         _stop_loop(loop, thread)
 
-    assert env["GITHUB_TOKEN"] == ""
-    assert env["GITHUB_WEBHOOK_SECRET"] == ""
-    assert env["ROBOMP_GH_PROXY_HMAC_KEY"] == ""
+    assert env["PATH"] == "/usr/bin"
+    assert env["LANG"] == "C.UTF-8"
+    assert env["LC_CTYPE"] == "UTF-8"
+    for key in (
+        "GITHUB_TOKEN",
+        "GITHUB_WEBHOOK_SECRET",
+        "ROBOMP_GH_PROXY_HMAC_KEY",
+        "OPENAI_API_KEY",
+        "AWS_SECRET_ACCESS_KEY",
+        "SSH_AUTH_SOCK",
+        "GIT_TRACE",
+        "GIT_ASKPASS",
+        "PI_ROOT",
+        "BUN_INSTALL",
+        "NODE_OPTIONS",
+        "OMP_AUTH_BROKER_TOKEN",
+    ):
+        assert key not in env
+    assert rpc_env["OMP_AUTH_BROKER_TOKEN"] == "broker-secret"
     assert env["BUN_INSTALL_CACHE_DIR"] == str(bindings.workspace.root / ".omp-xdg" / "cache" / "bun-install")
     assert env["XDG_CACHE_HOME"] == str(bindings.workspace.root / ".omp-xdg" / "cache")
     assert env["TMPDIR"] == str(bindings.workspace.root / ".omp-tmp")
@@ -385,7 +427,10 @@ def test_repro_record_writes_transcript(db: Database, tmp_path: Path) -> None:
 def test_repro_record_chowns_to_slot_when_root(db: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     chowns: list[tuple[Path, int, int]] = []
     monkeypatch.setattr(host_tools, "_slot_permissions_active", lambda slot_uid: slot_uid is not None)
-    monkeypatch.setattr("robomp.host_tools.os.chown", lambda path, uid, gid: chowns.append((Path(path), uid, gid)))
+    monkeypatch.setattr(
+        "robomp.host_tools.os.chown",
+        lambda path, uid, gid, *, follow_symlinks=False: chowns.append((Path(path), uid, gid)),
+    )
 
     bindings, loop, t = _bindings(db, tmp_path, httpx.MockTransport(lambda r: httpx.Response(500)), slot_uid=2001)
     try:
@@ -405,6 +450,31 @@ def test_repro_record_chowns_to_slot_when_root(db: Database, tmp_path: Path, mon
         assert chowns == [(files[0], 2001, 2001)]
     finally:
         _stop_loop(loop, t)
+
+def test_repro_record_refuses_symlink_target(db: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    bindings, loop, t = _bindings(db, tmp_path, httpx.MockTransport(lambda r: httpx.Response(500)))
+    target = tmp_path / "outside.md"
+    target.write_text("outside\n", encoding="utf-8")
+    symlink = bindings.workspace.repro_dir / "123-panic-on-empty-input.md"
+    symlink.symlink_to(target)
+    monkeypatch.setattr(host_tools.time, "time", lambda: 123)
+    try:
+        tool = next(x for x in build(bindings) if x.name == "repro_record")
+        with pytest.raises(RpcCommandError) as exc:
+            tool.execute(
+                {
+                    "title": "panic on empty input",
+                    "command": "bun test foo.test.ts",
+                    "output": "Error: boom",
+                    "exit_code": 1,
+                },
+                _ctx(),
+            )
+        assert "refusing to write outside workspace control dirs" in str(exc.value)
+        assert target.read_text(encoding="utf-8") == "outside\n"
+    finally:
+        _stop_loop(loop, t)
+
 
 
 def test_repro_record_rejects_bad_args(db: Database, tmp_path: Path) -> None:
@@ -763,7 +833,7 @@ def test_fetch_pr_returns_premise_and_changed_files(db: Database, tmp_path: Path
     assert "`src/app.py` (modified, +5/-2)" in result
 
 
-def test_classify_pr_applies_review_labels_and_persists_rank(db: Database, tmp_path: Path) -> None:
+def test_classify_pr_applies_review_labels_and_persists_label(db: Database, tmp_path: Path) -> None:
     captured: dict[str, Any] = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -776,7 +846,7 @@ def test_classify_pr_applies_review_labels_and_persists_rank(db: Database, tmp_p
         tool = next(x for x in build(bindings) if x.name == "classify_pr")
         result = tool.execute(
             {
-                "rank": "review:p1",
+                "review_label": "review:minor",
                 "type": "fix",
                 "area": ["tool", "unknown"],
                 "provider": "provider:openai",
@@ -787,19 +857,19 @@ def test_classify_pr_applies_review_labels_and_persists_rank(db: Database, tmp_p
     finally:
         _stop_loop(loop, t)
 
-    assert "review:p1" in result
+    assert "review:minor" in result
     assert captured["path"].endswith("/issues/99/labels")
-    assert captured["body"]["labels"] == ["triaged", "review:p1", "fix", "tool", "providers", "provider:openai"]
+    assert captured["body"]["labels"] == ["triaged", "review:minor", "fix", "tool", "providers", "provider:openai"]
     row = db.get_issue(bindings.issue_key)
-    assert row is not None and row.classification == "review:p1"
+    assert row is not None and row.classification == "review:minor"
 
 
-def test_classify_pr_rejects_bad_rank(db: Database, tmp_path: Path) -> None:
+def test_classify_pr_rejects_bad_review_label(db: Database, tmp_path: Path) -> None:
     bindings, loop, t = _review_bindings(db, tmp_path, httpx.MockTransport(lambda _r: httpx.Response(500)))
     try:
         tool = next(x for x in build(bindings) if x.name == "classify_pr")
         with pytest.raises(RpcCommandError):
-            tool.execute({"rank": "prio:p1", "type": "fix", "rationale": "wrong namespace"}, _ctx())
+            tool.execute({"review_label": "prio:p1", "type": "fix", "rationale": "wrong namespace"}, _ctx())
     finally:
         _stop_loop(loop, t)
 
@@ -843,27 +913,657 @@ def test_pr_review_comment_stages_and_submit_flushes_one_comment_review(db: Data
         assert len(rows) == 1
         assert rows[0].path == "src/app.py"
 
-        result = submit_tool.execute({"body": "review:p1 — one blocking issue", "event": "APPROVE"}, _ctx())
+        with pytest.raises(RpcCommandError, match="terminal review events are disabled"):
+            submit_tool.execute({"body": "review:minor — one blocking issue", "event": "APPROVE"}, _ctx())
+        result = "rejected"
     finally:
         _stop_loop(loop, t)
 
-    assert "submitted PR review" in result
-    assert captured["path"].endswith("/pulls/99/reviews")
-    assert captured["body"] == {
-        "body": "review:p1 — one blocking issue",
-        "event": "COMMENT",
-        "comments": [
-            {
-                "path": "src/app.py",
-                "line": 12,
-                "side": "RIGHT",
-                "body": "blocking: this dereferences cfg before the guard.",
-                "start_line": 10,
-                "start_side": "RIGHT",
-            }
-        ],
-    }
+    assert result == "rejected"
+    assert "body" not in captured
+    assert len(db.list_staged_review_comments(bindings.issue_key)) == 1
+
+
+def _seed_pr_review_payload_state(bindings: ToolBindings, helper: Path) -> None:
+    _write_pr_review_helper(helper)
+    paths = pr_review_paths(bindings.workspace)
+    save_json_checked(paths.evidence, {"head_sha": "payload-sha"})
+    save_json_checked(paths.classification, {})
+    save_json_checked(paths.findings, {"findings": [{"path": "src/generated.py", "line": 7, "body": "payload finding"}]})
+    save_json_checked(paths.validated, {"findings": []})
+
+
+def test_pr_review_paths_returns_dataclass(db: Database, tmp_path: Path) -> None:
+    bindings, loop, t = _review_bindings(db, tmp_path, httpx.MockTransport(lambda _r: httpx.Response(500)))
+    try:
+        paths = pr_review_paths(bindings.workspace)
+    finally:
+        _stop_loop(loop, t)
+
+    assert isinstance(paths, PrReviewPaths)
+    assert paths.evidence == bindings.workspace.session_dir / "pr-review-evidence.json"
+    assert paths.verify_status == bindings.workspace.session_dir / "pr-review-verify-status.json"
+
+
+def test_run_pr_review_helper_invokes_bun_with_pr_paths_and_allowlisted_env(
+    db: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import subprocess as _sp
+
+    monkeypatch.setenv("PATH", "/bin")
+    monkeypatch.setenv("GITHUB_TOKEN", "secret")
+    captured: dict[str, Any] = {}
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _sp.CompletedProcess[str]:
+        captured["cmd"] = cmd
+        captured["kwargs"] = kwargs
+        return _sp.CompletedProcess(cmd, 0, stdout="ok", stderr="")
+
+    bindings, loop, t = _review_bindings(db, tmp_path, httpx.MockTransport(lambda _r: httpx.Response(500)))
+    helper = tmp_path / "pr-review-helper.js"
+    helper.write_text("", encoding="utf-8")
+    paths = pr_review_paths(bindings.workspace)
+    monkeypatch.setattr(pr_review_tools.subprocess, "run", fake_run)
+    try:
+        proc = run_pr_review_helper(
+            bindings,
+            helper,
+            ["classify", "--evidence", paths.evidence, "--out", paths.classification],
+            30.0,
+            "PR review evidence classify failed",
+        )
+    finally:
+        _stop_loop(loop, t)
+
+    assert proc.returncode == 0
+    assert captured["cmd"] == [
+        "bun",
+        str(helper),
+        "classify",
+        "--evidence",
+        str(paths.evidence),
+        "--out",
+        str(paths.classification),
+    ]
+    assert captured["kwargs"]["cwd"] == str(bindings.workspace.repo_dir)
+    assert captured["kwargs"]["env"]["PATH"] == "/bin"
+    assert "GITHUB_TOKEN" not in captured["kwargs"]["env"]
+
+
+def test_run_pr_review_helper_preserves_error_prefix(
+    db: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import subprocess as _sp
+
+    def fake_run(cmd: list[str], **_kwargs: Any) -> _sp.CompletedProcess[str]:
+        return _sp.CompletedProcess(cmd, 2, stdout="bad finding", stderr="")
+
+    bindings, loop, t = _review_bindings(db, tmp_path, httpx.MockTransport(lambda _r: httpx.Response(500)))
+    helper = tmp_path / "pr-review-helper.js"
+    helper.write_text("", encoding="utf-8")
+    monkeypatch.setattr(pr_review_tools.subprocess, "run", fake_run)
+    try:
+        with pytest.raises(RpcCommandError, match="PR review validation failed: bad finding"):
+            run_pr_review_helper(bindings, helper, ["validate"], 30.0, "PR review validation failed")
+    finally:
+        _stop_loop(loop, t)
+
+
+@pytest.mark.parametrize("event", ["APPROVE", "REQUEST_CHANGES"])
+def test_submit_pr_review_terminal_events_enabled_passes_event_and_clears(
+    db: Database, tmp_path: Path, event: str
+) -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path.endswith("/reviews"):
+            captured["body"] = json.loads(request.content)
+            return httpx.Response(
+                200,
+                json={
+                    "id": 46,
+                    "user": {"login": "robomp-bot"},
+                    "body": captured["body"]["body"],
+                    "state": "APPROVED" if event == "APPROVE" else "CHANGES_REQUESTED",
+                    "submitted_at": "t",
+                },
+            )
+        if request.method == "GET" and request.url.path.endswith("/reviews/46/comments"):
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "id": 9101,
+                        "pull_request_review_id": 46,
+                        "user": {"login": "robomp-bot"},
+                        "body": "payload finding",
+                        "path": "src/generated.py",
+                        "line": 7,
+                        "created_at": "t",
+                        "commit_id": "payload-sha",
+                    }
+                ],
+            )
+        return httpx.Response(404, json={"message": "unrouted"})
+
+    bindings, loop, t = _review_bindings(db, tmp_path, httpx.MockTransport(handler))
+    helper = tmp_path / "pr-review-helper.js"
+    _seed_pr_review_payload_state(bindings, helper)
+    bindings = replace(bindings, settings=Settings.model_construct(pr_review_terminal_events=True, pr_review_helper=helper))
+    try:
+        stage_tool = next(x for x in build(bindings) if x.name == "pr_review_comment")
+        submit_tool = next(x for x in build(bindings) if x.name == "submit_pr_review")
+        stage_tool.execute({"path": "src/app.py", "line": 12, "body": "finding"}, _ctx())
+        result = submit_tool.execute({"body": "summary", "event": event}, _ctx())
+    finally:
+        _stop_loop(loop, t)
+
+    assert f"event={event}" in result
+    assert captured["body"]["event"] == event
+    assert captured["body"]["comments"] == [{"path": "src/generated.py", "line": 7, "side": "RIGHT", "body": "payload finding"}]
     assert db.list_staged_review_comments(bindings.issue_key) == []
+    posted = db.list_pr_review_posted_findings("octo/widget", 99)
+    assert len(posted) == 1
+    assert posted[0].review_id == 46
+    assert posted[0].comment_id == 9101
+    assert posted[0].severity == "required"
+
+
+def test_submit_pr_review_posted_comment_fetch_failure_is_advisory(db: Database, tmp_path: Path) -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path.endswith("/reviews"):
+            captured["body"] = json.loads(request.content)
+            return httpx.Response(
+                200,
+                json={
+                    "id": 46,
+                    "user": {"login": "robomp-bot"},
+                    "body": captured["body"]["body"],
+                    "state": "COMMENTED",
+                    "submitted_at": "t",
+                },
+            )
+        if request.method == "GET" and request.url.path.endswith("/reviews/46/comments"):
+            return httpx.Response(500, json={"message": "boom"})
+        return httpx.Response(404, json={"message": "unrouted"})
+
+    bindings, loop, t = _review_bindings(db, tmp_path, httpx.MockTransport(handler))
+    helper = tmp_path / "pr-review-helper.js"
+    _seed_pr_review_payload_state(bindings, helper)
+    bindings = replace(bindings, settings=Settings.model_construct(pr_review_terminal_events=True, pr_review_helper=helper))
+    try:
+        stage_tool = next(x for x in build(bindings) if x.name == "pr_review_comment")
+        submit_tool = next(x for x in build(bindings) if x.name == "submit_pr_review")
+        stage_tool.execute({"path": "src/app.py", "line": 12, "body": "finding"}, _ctx())
+        result = submit_tool.execute({"body": "summary", "event": "COMMENT"}, _ctx())
+    finally:
+        _stop_loop(loop, t)
+
+    assert "submitted PR review id=46" in result
+    assert db.list_staged_review_comments(bindings.issue_key) == []
+    assert db.list_pr_review_posted_findings("octo/widget", 99) == []
+
+
+def test_submit_pr_review_self_authored_terminal_event_downgrades_to_comment(db: Database, tmp_path: Path) -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={"id": 47, "user": {"login": "noamsiegel"}, "body": "ok", "state": "COMMENTED", "submitted_at": "t"},
+        )
+
+    bindings, loop, t = _review_bindings(db, tmp_path, httpx.MockTransport(handler))
+    helper = tmp_path / "pr-review-helper.js"
+    _seed_pr_review_payload_state(bindings, helper)
+    bindings = replace(
+        bindings,
+        issue=replace(bindings.issue, author="noamsiegel"),
+        settings=Settings.model_construct(pr_review_terminal_events=True, bot_login="noamsiegel", pr_review_helper=helper),
+    )
+    try:
+        tool = next(x for x in build(bindings) if x.name == "submit_pr_review")
+        result = tool.execute({"body": "would approve", "event": "APPROVE"}, _ctx())
+    finally:
+        _stop_loop(loop, t)
+
+    assert "event=COMMENT" in result
+    assert "requested_event=APPROVE" in result
+    assert captured["body"]["event"] == "COMMENT"
+
+
+def test_submit_pr_review_terminal_event_requires_pr_review_payload_state(db: Database, tmp_path: Path) -> None:
+    called = False
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal called
+        called = True
+        return httpx.Response(500)
+
+    bindings, loop, t = _review_bindings(db, tmp_path, httpx.MockTransport(handler))
+    bindings = replace(bindings, settings=Settings.model_construct(pr_review_terminal_events=True))
+    try:
+        tool = next(x for x in build(bindings) if x.name == "submit_pr_review")
+        with pytest.raises(RpcCommandError, match="PR review payload state required before terminal PR review"):
+            tool.execute({"body": "summary", "event": "APPROVE"}, _ctx())
+    finally:
+        _stop_loop(loop, t)
+
+    assert not called
+
+
+
+
+def _write_pr_review_helper(path: Path) -> None:
+    path.write_text(
+        """
+const cmd = process.argv[2];
+function arg(name) {
+  const index = process.argv.indexOf(name);
+  return index === -1 ? null : process.argv[index + 1];
+}
+const out = arg("--out");
+if (cmd === "classify") {
+  await Bun.write(out, JSON.stringify({
+    risk_level: "medium",
+    delegation_required: false,
+    domains_required: ["correctness"],
+    reviewability: {status: "reviewable"},
+    model_diversity: {cross_family_review_recommended: true}
+  }));
+} else if (cmd === "gate") {
+  const classification = JSON.parse(await Bun.file(arg("--classification")).text());
+  const metadataPath = arg("--review-metadata");
+  const metadata = metadataPath === null ? {delegated_reviewers: []} : JSON.parse(await Bun.file(metadataPath).text());
+  const covered = new Set((metadata.delegated_reviewers || []).filter((r) => r.completed).flatMap((r) => r.domains_covered || []));
+  const missing = classification.delegation_required ? (classification.domains_required || []).filter((d) => d !== "correctness" && !covered.has(d)) : [];
+  await Bun.write(out, JSON.stringify({passed: missing.length === 0, reason: missing.length ? "missing domains" : "ok", missing_domains: missing}));
+  if (missing.length) process.exit(2);
+} else if (cmd === "packet") {
+  await Bun.write(out, "Review only the requested domain. Return YAML.");
+} else if (cmd === "reviewer-ingest") {
+  const metadataPath = arg("--metadata");
+  let metadata = {delegated_reviewers: []};
+  try { metadata = JSON.parse(await Bun.file(metadataPath).text()); } catch {}
+  metadata.delegated_reviewers ||= [];
+  const reviewer = arg("--reviewer");
+  const domain = arg("--domains");
+  metadata.delegated_reviewers.push({
+    id: reviewer,
+    domains_covered: [domain],
+    completed: true,
+    result_path: arg("--result-path"),
+    model_family: arg("--model-family")
+  });
+  await Bun.write(metadataPath, JSON.stringify(metadata));
+  await Bun.write(out, JSON.stringify({ok: true}));
+} else if (cmd === "metadata-add") {
+  const metadataPath = arg("--metadata");
+  let metadata = {delegated_reviewers: []};
+  try { metadata = JSON.parse(await Bun.file(metadataPath).text()); } catch {}
+  metadata.delegated_reviewers ||= [];
+  metadata.delegated_reviewers.push({
+    id: arg("--reviewer"),
+    domains_covered: [arg("--domains")],
+    completed: arg("--completed") === "true",
+    result_path: arg("--result-path"),
+    reason: arg("--reason")
+  });
+  await Bun.write(metadataPath, JSON.stringify(metadata));
+  if (out) await Bun.write(out, JSON.stringify({ok: true}));
+} else if (cmd === "verify-status") {
+  await Bun.write(out, JSON.stringify({ok: true, unresolved_prior: []}));
+} else if (cmd === "validate") {
+  await Bun.write(out, JSON.stringify({
+    recommendation: {event: "REQUEST_CHANGES", blocking_count: 1, optional_count: 0, reason: "blocking finding"},
+    findings: [{anchor_valid: true, duplicate_suspected: false}]
+  }));
+} else if (cmd === "payload") {
+  const body = await Bun.file(arg("--body-file")).text();
+  const findings = JSON.parse(await Bun.file(arg("--findings")).text()).findings || [];
+  const render = (f) => {
+    if (f.suggestion && f.suggestion.kind === "github_suggestion" && typeof f.suggestion.replacement === "string") {
+      const replacement = f.suggestion.replacement.endsWith("\\n")
+        ? f.suggestion.replacement.slice(0, -1)
+        : f.suggestion.replacement;
+      return f.body + "\\n\\n```suggestion\\n" + replacement + "\\n```";
+    }
+    return f.body;
+  };
+  await Bun.write(out, JSON.stringify({
+    body,
+    event: arg("--event"),
+    comments: findings.map((f) => ({path: f.path, line: f.line, side: "RIGHT", body: render(f)}))
+  }));
+} else {
+  throw new Error(`unexpected cmd ${cmd}`);
+}
+""",
+        encoding="utf-8",
+    )
+
+
+def test_prepare_pr_review_unavailable_when_helper_unset(db: Database, tmp_path: Path) -> None:
+    bindings, loop, t = _review_bindings(db, tmp_path, httpx.MockTransport(lambda _r: httpx.Response(500)))
+    try:
+        tool = next(x for x in build(bindings) if x.name == "prepare_pr_review")
+        result = tool.execute({}, _ctx())
+    finally:
+        _stop_loop(loop, t)
+    assert "PR review helper unavailable" in result
+
+
+def test_prepare_pr_review_writes_evidence_and_returns_classification(
+    db: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    helper = tmp_path / "pr-review-helper.js"
+    _write_pr_review_helper(helper)
+    bindings, loop, t = _review_bindings(db, tmp_path, httpx.MockTransport(lambda _r: httpx.Response(500)))
+    bindings = replace(
+        bindings,
+        settings=Settings.model_construct(pr_review_helper=helper, request_timeout_seconds=30.0),
+    )
+    pr = PullRequestInfo(
+        repo="octo/widget",
+        number=99,
+        html_url="https://github.com/octo/widget/pull/99",
+        head_ref="alice/fix",
+        base_ref="main",
+        state="open",
+        author="alice",
+        head_repo="alice/widget",
+        title="Fix bug",
+        body="body",
+        head_sha="abc",
+    )
+
+    async def _get_pull_request(repo_full: str, number: int):
+        return pr
+
+    async def _list_pr_files(repo_full: str, number: int):
+        return [PullRequestFileInfo("src/app.py", "modified", 1, 1)]
+
+    async def _list_pr_reviews(repo_full: str, number: int):
+        return [PullRequestReviewInfo(1, "reviewer", "body", "COMMENTED", "t", commit_id="old")]
+
+    async def _list_review_comments(repo_full: str, number: int):
+        return [ReviewCommentInfo(2, "reviewer", "finding", "src/app.py", 12, "t")]
+
+    async def _list_pr_commits(repo_full: str, number: int):
+        return [
+            PullRequestCommitInfo(
+                sha="abc",
+                message_headline="Fix bug",
+                message_body="Details",
+                authors=(PullRequestCommitAuthorInfo(login="alice", name="Alice"),),
+            )
+        ]
+
+    async def _get_authenticated_login():
+        return "robomp-bot"
+
+    async def _list_comments(repo_full: str, number: int):
+        return []
+
+    def _diff(_bindings: ToolBindings, cmd, *, timeout=None):
+        assert cmd == ("git", "diff", "--no-color", "origin/main...HEAD")
+        return host_tools.subprocess.CompletedProcess(list(cmd), 0, stdout="diff --git a/src/app.py b/src/app.py\n--- a/src/app.py\n+++ b/src/app.py\n@@ -10,2 +10,3 @@\n context\n+added\n", stderr="")
+
+    monkeypatch.setattr(bindings.github, "get_pull_request", _get_pull_request)
+    monkeypatch.setattr(bindings.github, "list_pr_files", _list_pr_files)
+    monkeypatch.setattr(bindings.github, "list_pr_reviews", _list_pr_reviews)
+    monkeypatch.setattr(bindings.github, "list_review_comments", _list_review_comments)
+    monkeypatch.setattr(bindings.github, "list_pr_commits", _list_pr_commits)
+    monkeypatch.setattr(bindings.github, "get_authenticated_login", _get_authenticated_login)
+    monkeypatch.setattr(bindings.github, "list_comments", _list_comments)
+    monkeypatch.setattr(host_tools, "_run_repo_command", _diff)
+    try:
+        tool = next(x for x in build(bindings) if x.name == "prepare_pr_review")
+        result = tool.execute({}, _ctx())
+    finally:
+        _stop_loop(loop, t)
+
+    evidence = json.loads((bindings.workspace.session_dir / "pr-review-evidence.json").read_text(encoding="utf-8"))
+    assert evidence["diff"].startswith("diff --git")
+    assert evidence["view"]["files"][0]["path"] == "src/app.py"
+    assert evidence["view"]["headRefOid"] == "abc"
+    assert evidence["view"]["commits"][0]["oid"] == "abc"
+    assert evidence["mode"] == "fresh"
+    assert evidence["anchors"][0]["validRightLines"] == [10, 11]
+    assert "risk_level: medium" in result
+    assert "reviewability.status: reviewable" in result
+
+
+def test_validate_pr_review_returns_anchor_summary(db: Database, tmp_path: Path) -> None:
+    helper = tmp_path / "pr-review-helper.js"
+    _write_pr_review_helper(helper)
+    bindings, loop, t = _review_bindings(db, tmp_path, httpx.MockTransport(lambda _r: httpx.Response(500)))
+    bindings = replace(
+        bindings,
+        settings=Settings.model_construct(pr_review_helper=helper, request_timeout_seconds=30.0),
+    )
+    paths = pr_review_paths(bindings.workspace)
+    save_json_checked(paths.evidence, {})
+    save_json_checked(paths.classification, {"delegation_required": False, "domains_required": ["correctness"]})
+    try:
+        tool = next(x for x in build(bindings) if x.name == "validate_pr_review")
+        result = tool.execute(
+            {
+                "findings": [
+                    {
+                        "path": "src/app.py",
+                        "line": 12,
+                        "body": "finding",
+                        "severity": "required",
+                        "intent": "required_change",
+                    }
+                ]
+            },
+            _ctx(),
+        )
+    finally:
+        _stop_loop(loop, t)
+
+    assert "anchor_valid=true" in result
+    assert "duplicate_suspected=false" in result
+
+
+
+def test_pr_review_suggestion_reaches_submit_payload(db: Database, tmp_path: Path) -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "id": 48,
+                "user": {"login": "robomp-bot"},
+                "body": captured["body"]["body"],
+                "state": "CHANGES_REQUESTED",
+                "submitted_at": "t",
+            },
+        )
+
+    helper = tmp_path / "pr-review-helper.js"
+    _write_pr_review_helper(helper)
+    bindings, loop, t = _review_bindings(db, tmp_path, httpx.MockTransport(handler))
+    bindings = replace(
+        bindings,
+        settings=Settings.model_construct(
+            pr_review_terminal_events=True,
+            pr_review_helper=helper,
+            request_timeout_seconds=30.0,
+        ),
+    )
+    paths = pr_review_paths(bindings.workspace)
+    save_json_checked(paths.evidence, {})
+    save_json_checked(paths.classification, {"delegation_required": False, "domains_required": ["correctness"]})
+    try:
+        validate = next(x for x in build(bindings) if x.name == "validate_pr_review")
+        submit = next(x for x in build(bindings) if x.name == "submit_pr_review")
+        validate.execute(
+            {
+                "findings": [
+                    {
+                        "path": "src/app.py",
+                        "line": 12,
+                        "start_line": 12,
+                        "body": "Use the narrower guard.",
+                        "severity": "required",
+                        "intent": "required_change",
+                        "suggestion": {
+                            "kind": "github_suggestion",
+                            "replacement": "if value is not None:\n    return value",
+                        },
+                    }
+                ]
+            },
+            _ctx(),
+        )
+        submit.execute({"body": "request changes", "event": "REQUEST_CHANGES"}, _ctx())
+    finally:
+        _stop_loop(loop, t)
+
+    assert captured["body"]["comments"] == [
+        {
+            "path": "src/app.py",
+            "line": 12,
+            "side": "RIGHT",
+            "body": "Use the narrower guard.\n\n```suggestion\nif value is not None:\n    return value\n```",
+        }
+    ]
+
+def test_validate_pr_review_requires_delegate_for_required_domains(db: Database, tmp_path: Path) -> None:
+    helper = tmp_path / "pr-review-helper.js"
+    _write_pr_review_helper(helper)
+    bindings, loop, t = _review_bindings(db, tmp_path, httpx.MockTransport(lambda _r: httpx.Response(500)))
+    bindings = replace(
+        bindings,
+        settings=Settings.model_construct(pr_review_helper=helper, request_timeout_seconds=30.0),
+    )
+    paths = pr_review_paths(bindings.workspace)
+    save_json_checked(paths.evidence, {})
+    save_json_checked(paths.classification, {"delegation_required": True, "domains_required": ["security", "correctness"]})
+    try:
+        tool = next(x for x in build(bindings) if x.name == "validate_pr_review")
+        with pytest.raises(RpcCommandError, match="PR review delegation gate failed"):
+            tool.execute({"findings": []}, _ctx())
+    finally:
+        _stop_loop(loop, t)
+
+
+def test_delegate_pr_review_writes_metadata_and_unblocks_validate(
+    db: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    helper = tmp_path / "pr-review-helper.js"
+    _write_pr_review_helper(helper)
+    bindings, loop, t = _review_bindings(db, tmp_path, httpx.MockTransport(lambda _r: httpx.Response(500)))
+    bindings = replace(
+        bindings,
+        settings=Settings.model_construct(
+            pr_review_helper=helper,
+            request_timeout_seconds=30.0,
+            task_timeout_seconds=30.0,
+            model="openai-codex/gpt-5.5",
+            pr_review_delegate_models_raw=(
+                "openai-codex/gpt-5.5,"
+                "google-gemini-cli/gemini-3.1-pro-preview,"
+                "google-gemini-cli/gemini-3.1-flash-lite-preview,"
+                "anthropic/claude-opus-4-8"
+            ),
+            pr_review_delegate_model_map_raw=(
+                "default=openai-codex/gpt-5.5,"
+                "security=anthropic/claude-opus-4-8"
+            ),
+        ),
+    )
+    paths = pr_review_paths(bindings.workspace)
+    save_json_checked(paths.evidence, {})
+    save_json_checked(paths.classification, {"delegation_required": True, "domains_required": ["security", "correctness"]})
+
+    class _Turn:
+        def require_assistant_text(self) -> str:
+            return "overall: clean\nsummary: ok\nmodel_family: anthropic\nfindings: []\n"
+
+    class _Rpc:
+        attempts: list[str] = []
+        kwargs_seen: list[dict[str, Any]] = []
+
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.model = kwargs["model"]
+            self.attempts.append(self.model)
+            self.kwargs_seen.append(kwargs)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+        def prompt_and_wait(self, prompt: str, *, timeout: float):
+            assert "security" in prompt
+            return _Turn()
+
+    monkeypatch.setattr(host_tools, "RpcClient", _Rpc)
+    try:
+        delegate = next(x for x in build(bindings) if x.name == "delegate_pr_review")
+        validate = next(x for x in build(bindings) if x.name == "validate_pr_review")
+        delegated = delegate.execute({}, _ctx())
+        validated = validate.execute({"findings": []}, _ctx())
+    finally:
+        _stop_loop(loop, t)
+
+    metadata = json.loads((bindings.workspace.session_dir / "pr-review-metadata.json").read_text(encoding="utf-8"))
+    assert metadata["delegated_reviewers"][0]["domains_covered"] == ["security"]
+    assert "model=anthropic/claude-opus-4-8" in delegated
+    assert _Rpc.attempts[:1] == ["anthropic/claude-opus-4-8"]
+    assert _Rpc.kwargs_seen[0]["tools"] == ("read", "search")
+    assert metadata["delegated_reviewers"][0]["model_family"] == "anthropic"
+    assert "SecurityReviewer" in delegated
+    assert "PR review delegation gate passed" in validated
+
+
+def test_delegate_pr_review_uses_read_only_tools(
+    db: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    test_delegate_pr_review_writes_metadata_and_unblocks_validate(db, tmp_path, monkeypatch)
+
+
+
+def test_delegate_pr_review_rejects_path_domain(db: Database, tmp_path: Path) -> None:
+    helper = tmp_path / "pr-review-helper.js"
+    _write_pr_review_helper(helper)
+    bindings, loop, t = _review_bindings(db, tmp_path, httpx.MockTransport(lambda _r: httpx.Response(500)))
+    bindings = replace(
+        bindings,
+        settings=Settings.model_construct(
+            pr_review_helper=helper,
+            request_timeout_seconds=30.0,
+            task_timeout_seconds=30.0,
+        ),
+    )
+    (bindings.workspace.session_dir / "pr-review-evidence.json").write_text("{}", encoding="utf-8")
+    (bindings.workspace.session_dir / "pr-review-classification.json").write_text(
+        json.dumps({"delegation_required": True, "domains_required": ["correctness"]}),
+        encoding="utf-8",
+    )
+    try:
+        delegate = next(x for x in build(bindings) if x.name == "delegate_pr_review")
+        with pytest.raises(RpcCommandError, match="delegate_pr_review domain must match"):
+            delegate.execute({"domains": ["security/../secrets"]}, _ctx())
+    finally:
+        _stop_loop(loop, t)
+    row = db._conn.execute(
+        "SELECT error FROM tool_calls WHERE issue_key=? AND tool=?",
+        (bindings.issue_key, "delegate_pr_review"),
+    ).fetchone()
+    assert row is not None
+    assert "delegate_pr_review domain must match" in row["error"]
 
 
 def test_submit_pr_review_posts_summary_only_when_no_staged_comments(db: Database, tmp_path: Path) -> None:
@@ -886,6 +1586,66 @@ def test_submit_pr_review_posts_summary_only_when_no_staged_comments(db: Databas
     assert "comments=0" in result
     assert captured["body"]["event"] == "COMMENT"
     assert captured["body"]["comments"] == []
+
+
+def test_submit_pr_review_is_idempotent(db: Database, tmp_path: Path) -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        if request.method == "POST" and request.url.path.endswith("/reviews"):
+            calls += 1
+            return httpx.Response(
+                200,
+                json={
+                    "id": 45,
+                    "user": {"login": "robomp-bot"},
+                    "body": json.loads(request.content)["body"],
+                    "state": "COMMENTED",
+                    "submitted_at": "t",
+                },
+            )
+        return httpx.Response(404, json={"message": "unrouted"})
+
+    bindings, loop, t = _review_bindings(db, tmp_path, httpx.MockTransport(handler))
+    try:
+        tool = next(x for x in build(bindings) if x.name == "submit_pr_review")
+        first = tool.execute({"body": "lgtm — scoped fix"}, _ctx())
+        second = tool.execute({"body": "lgtm — scoped fix"}, _ctx())
+    finally:
+        _stop_loop(loop, t)
+
+    assert "submitted PR review id=45" in first
+    assert second.startswith("side effect already succeeded: submit_pr_review:octo/widget#99:COMMENT:")
+    assert calls == 1
+    rows = db._conn.execute(  # noqa: SLF001
+        "SELECT state FROM side_effects WHERE operation_key LIKE 'submit_pr_review:octo/widget#99:COMMENT:%'"
+    ).fetchall()
+    assert [row["state"] for row in rows] == ["succeeded"]
+
+
+def test_submit_pr_review_pending_side_effect_skips_github(db: Database, tmp_path: Path) -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(500, json={"message": "should not post"})
+
+    bindings, loop, t = _review_bindings(db, tmp_path, httpx.MockTransport(handler))
+    operation_key = (
+        f"submit_pr_review:{bindings.issue_key}:COMMENT:"
+        f"{host_tools._side_effect_payload_suffix({'body': 'summary', 'comments': [], 'event': 'COMMENT'})}"
+    )
+    assert db.reserve_side_effect(operation_key)
+    try:
+        tool = next(x for x in build(bindings) if x.name == "submit_pr_review")
+        result = tool.execute({"body": "summary"}, _ctx())
+    finally:
+        _stop_loop(loop, t)
+
+    assert result == f"side effect already pending: {operation_key}"
+    assert calls == 0
 
 
 def test_submit_pr_review_failure_keeps_staged_comments(db: Database, tmp_path: Path) -> None:
@@ -914,6 +1674,12 @@ def test_review_tools_reject_outside_review_mode(db: Database, tmp_path: Path) -
         tool = next(x for x in build(bindings) if x.name == "pr_review_comment")
         with pytest.raises(RpcCommandError):
             tool.execute({"path": "x.py", "line": 1, "body": "nit"}, _ctx())
+        prepare = next(x for x in build(bindings) if x.name == "prepare_pr_review")
+        validate = next(x for x in build(bindings) if x.name == "validate_pr_review")
+        with pytest.raises(RpcCommandError):
+            prepare.execute({}, _ctx())
+        with pytest.raises(RpcCommandError):
+            validate.execute({"findings": []}, _ctx())
     finally:
         _stop_loop(loop, t)
 
@@ -978,9 +1744,45 @@ def test_impl_gate_rejects_unauthorized_proposal_before_repo_commands(
     assert all("classified `proposal`" in row["error"] for row in rows)
 
 
-def test_impl_gate_allows_authorized_proposal_to_reach_pr_validation(db: Database, tmp_path: Path) -> None:
-    from dataclasses import replace
+def test_labels_comments_only_blocks_publish_before_repo_commands(
+    db: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, env: dict[str, str]
+) -> None:
+    calls: list[list[str] | tuple[str, ...]] = []
 
+    def record_repo_command(_bindings: ToolBindings, cmd: list[str] | tuple[str, ...], *, timeout: float | None = None):
+        del timeout
+        calls.append(cmd)
+        raise AssertionError("repo command must not run in labels/comments-only mode")
+
+    monkeypatch.setenv("ROBOMP_LABELS_COMMENTS_ONLY", "true")
+    reset_settings_cache()
+    settings = Settings()  # type: ignore[call-arg]
+    bindings, loop, t = _bindings(db, tmp_path, httpx.MockTransport(lambda _r: httpx.Response(500)))
+    bindings = replace(bindings, settings=settings)
+    db.set_issue_classification(bindings.issue_key, "bug")
+    monkeypatch.setattr(host_tools, "_run_repo_command", record_repo_command)
+    try:
+        push = next(x for x in build(bindings) if x.name == "gh_push_branch")
+        open_pr = next(x for x in build(bindings) if x.name == "gh_open_pr")
+        with pytest.raises(RpcCommandError) as push_exc:
+            push.execute({}, _ctx())
+        with pytest.raises(RpcCommandError) as pr_exc:
+            open_pr.execute({"title": "fix: x", "body": "invalid"}, _ctx())
+    finally:
+        _stop_loop(loop, t)
+
+    for msg in (str(push_exc.value), str(pr_exc.value)):
+        assert "ROBOMP_LABELS_COMMENTS_ONLY is enabled" in msg
+        assert "labels and post comments only" in msg
+    assert calls == []
+    rows = db._conn.execute(
+        "SELECT tool, error FROM tool_calls WHERE tool IN ('gh_push_branch', 'gh_open_pr') ORDER BY id"
+    ).fetchall()
+    assert [row["tool"] for row in rows] == ["gh_push_branch", "gh_open_pr"]
+    assert all("ROBOMP_LABELS_COMMENTS_ONLY is enabled" in row["error"] for row in rows)
+
+
+def test_impl_gate_allows_authorized_proposal_to_reach_pr_validation(db: Database, tmp_path: Path) -> None:
     bindings, loop, t = _bindings(db, tmp_path, httpx.MockTransport(lambda _r: httpx.Response(500)))
     db.set_issue_classification(bindings.issue_key, "proposal")
     bindings = replace(bindings, impl_authorized=True)

@@ -49,32 +49,27 @@ import stat
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Iterable, Protocol
 
 from robomp.git_ops import (
     GitCommandError,
+    PrWorktreeResult,
     PushResult,
-    redact_credentials,
-)
-from robomp.git_ops import (
     clone as git_clone,
-)
-from robomp.git_ops import (
     fetch_pr_head as git_fetch_pr_head,
-)
-from robomp.git_ops import (
     fetch_prune as git_fetch_prune,
-)
-from robomp.git_ops import (
     fetch_ref as git_fetch_ref,
-)
-from robomp.git_ops import (
+    prepare_pr_worktree as git_prepare_pr_worktree,
+    redact_credentials,
     push as git_push,
 )
 from robomp.natives_cache import CacheHit, NativesCache
 from robomp.natives_cache import compute_key as natives_compute_key
 
 log = logging.getLogger(__name__)
+_DEFAULT_SUBPROCESS_TIMEOUT_SECONDS = 120.0
+
+
 
 
 @dataclass(slots=True)
@@ -196,6 +191,7 @@ def rename_workspace_branch(
     proc = _safe_run(
         ["git", "branch", "-m", workspace.branch, new_branch],
         cwd=workspace.repo_dir,
+        timeout=_DEFAULT_SUBPROCESS_TIMEOUT_SECONDS,
         env=_git_env_for_repo(workspace.repo_dir),
         **_slot_subprocess_kwargs(slot_uid),
     )
@@ -236,6 +232,19 @@ class GitTransport(Protocol):
 
     def fetch_pr_head(self, *, repo: str, pool_dir: Path, pr_number: int) -> None:
         """Fetch `refs/pull/<n>/head` into FETCH_HEAD for detached PR review checkouts."""
+        ...
+
+    def prepare_pr_worktree(
+        self,
+        *,
+        repo: str,
+        pool_dir: Path,
+        repo_dir: Path,
+        pr_number: int,
+        base_ref: str,
+        changed_paths: Iterable[str],
+    ) -> PrWorktreeResult:
+        """Create a sparse detached PR review worktree through the token-bearing transport."""
         ...
 
     def push_branch(
@@ -281,6 +290,26 @@ class LocalGitTransport:
         del repo
         git_fetch_pr_head(pool_dir, pr_number, token=self._token)
 
+    def prepare_pr_worktree(
+        self,
+        *,
+        repo: str,
+        pool_dir: Path,
+        repo_dir: Path,
+        pr_number: int,
+        base_ref: str,
+        changed_paths: Iterable[str],
+    ) -> PrWorktreeResult:
+        del repo
+        return git_prepare_pr_worktree(
+            pool_dir,
+            repo_dir,
+            pr_number=pr_number,
+            base_ref=base_ref,
+            changed_paths=changed_paths,
+            token=self._token,
+        )
+
     def push_branch(
         self,
         *,
@@ -298,7 +327,13 @@ class LocalGitTransport:
 # ---------- low-level helpers retained for callers expecting old shape ----------
 
 
-def _safe_run(cmd: list[str], *, cwd: Path | None = None, **kwargs: Any) -> subprocess.CompletedProcess[str]:
+def _safe_run(
+    cmd: list[str],
+    *,
+    cwd: Path | None = None,
+    timeout: float | None = _DEFAULT_SUBPROCESS_TIMEOUT_SECONDS,
+    **kwargs: Any,
+) -> subprocess.CompletedProcess[str]:
     """Run without raising; caller decides on returncode. Credentials are redacted from any captured output."""
     proc = subprocess.run(
         cmd,
@@ -306,6 +341,7 @@ def _safe_run(cmd: list[str], *, cwd: Path | None = None, **kwargs: Any) -> subp
         check=False,
         capture_output=True,
         text=True,
+        timeout=timeout,
         **kwargs,
     )
     if proc.stdout:
@@ -315,7 +351,12 @@ def _safe_run(cmd: list[str], *, cwd: Path | None = None, **kwargs: Any) -> subp
     return proc
 
 
-def _run(cmd: list[str], *, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+def _run(
+    cmd: list[str],
+    *,
+    cwd: Path | None = None,
+    timeout: float | None = _DEFAULT_SUBPROCESS_TIMEOUT_SECONDS,
+) -> subprocess.CompletedProcess[str]:
     """Legacy raising helper (still used by a sandbox test). Forwards to subprocess.run."""
     proc = subprocess.run(
         cmd,
@@ -323,6 +364,7 @@ def _run(cmd: list[str], *, cwd: Path | None = None) -> subprocess.CompletedProc
         check=False,
         capture_output=True,
         text=True,
+        timeout=timeout,
     )
     if proc.returncode != 0:
         raise GitCommandError(cmd, proc.returncode, proc.stdout, proc.stderr)
@@ -334,6 +376,77 @@ _SHARED_OMP_GID = 2000
 
 def _slot_permissions_active(slot_uid: int | None) -> bool:
     return slot_uid is not None and platform.system() == "Linux" and os.geteuid() == 0
+
+_ROOT_CONTROL_DIRS = frozenset({".omp-session", "context", "artifacts", ".omp-tmp", ".omp-xdg"})
+
+
+def _safe_workspace_child(root: Path, relative: str) -> Path:
+    """Return ``root / relative`` only when it stays inside ``root``."""
+    if "\0" in relative:
+        raise ValueError("workspace-relative path contains NUL byte")
+    raw = Path(relative)
+    if raw.is_absolute():
+        raise ValueError("workspace-relative path must not be absolute")
+    candidate = root / raw
+    resolved_root = root.resolve(strict=False)
+    resolved_candidate = candidate.resolve(strict=False)
+    if resolved_candidate != resolved_root and resolved_root not in resolved_candidate.parents:
+        raise ValueError("workspace-relative path escapes workspace root")
+    return candidate
+
+
+def _open_dir_no_follow(path: Path) -> int:
+    flags = os.O_RDONLY
+    flags |= getattr(os, "O_DIRECTORY", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    return os.open(path, flags)
+
+
+def _ensure_root_control_dir(path: Path) -> None:
+    """Create a root-owned control directory without following a planted symlink."""
+    try:
+        st = path.lstat()
+    except FileNotFoundError:
+        pass
+    else:
+        if stat.S_ISLNK(st.st_mode):
+            path.unlink()
+    path.mkdir(mode=0o755, parents=True, exist_ok=True)
+    fd = _open_dir_no_follow(path)
+    try:
+        if os.geteuid() == 0:
+            os.fchown(fd, 0, 0)
+        os.fchmod(fd, 0o755)
+    finally:
+        os.close(fd)
+
+
+def _ensure_real_dir(path: Path, *, mode: int = 0o755) -> None:
+    try:
+        st = path.lstat()
+    except FileNotFoundError:
+        pass
+    else:
+        if stat.S_ISLNK(st.st_mode):
+            path.unlink()
+    path.mkdir(mode=mode, parents=True, exist_ok=True)
+
+
+def _ensure_slot_writable_dir(path: Path, slot_uid: int | None, *, mode: int = 0o700) -> None:
+    _ensure_real_dir(path, mode=mode)
+    fd = _open_dir_no_follow(path)
+    try:
+        if _slot_permissions_active(slot_uid):
+            assert slot_uid is not None
+            os.fchown(fd, slot_uid, slot_uid)
+        os.fchmod(fd, mode)
+    finally:
+        os.close(fd)
+
+
+def _slot_tmp_leaf(tmp_root: Path, slot_uid: int | None) -> Path:
+    return tmp_root / f"slot-{slot_uid}" if _slot_permissions_active(slot_uid) else tmp_root
+
 
 
 def _slot_pids(slot_uid: int, proc_root: Path = Path("/proc")) -> tuple[int, ...]:
@@ -397,27 +510,12 @@ def _reap_slot(slot_uid: int | None) -> None:
 
 
 def _prepare_slot_tmpdir(workspace: Workspace, slot_uid: int | None) -> Path:
-    """Return the per-workspace tmpdir path, idempotently provisioning it.
-
-    Ownership/mode is set by ``_chown_workspace`` as part of the workspace's
-    single-ownership invariant; this helper only:
-
-    - replaces any non-directory at ``.omp-tmp`` (symlink-protection: a user
-      who plants a symlink there could redirect later writes outside the
-      workspace regardless of who owns the destination), and
-    - ``mkdir(mode=0o700, exist_ok=True)`` as a safety net for callers that
-      run before ``ensure_workspace`` (e.g. unit tests with ``slot_uid=None``).
-    """
-    del slot_uid  # ownership is _chown_workspace's job; kept for call-site parity
-    tmpdir = workspace.root / ".omp-tmp"
-    try:
-        st = tmpdir.lstat()
-    except FileNotFoundError:
-        pass
-    else:
-        if not stat.S_ISDIR(st.st_mode):
-            tmpdir.unlink()
-    tmpdir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    """Return a symlink-safe temp directory for slot-side subprocesses."""
+    tmp_root = workspace.root / ".omp-tmp"
+    _ensure_root_control_dir(tmp_root)
+    tmpdir = _slot_tmp_leaf(tmp_root, slot_uid)
+    if tmpdir != tmp_root:
+        _ensure_slot_writable_dir(tmpdir, slot_uid)
     return tmpdir
 
 
@@ -436,35 +534,27 @@ def _slot_subprocess_kwargs(slot_uid: int | None) -> dict[str, Any]:
 
 
 def _prepare_slot_runtime_env(workspace: Workspace, slot_uid: int | None) -> dict[str, str]:
-    """Compute the env overlay (TMPDIR + XDG_*) for slot-side subprocesses.
-
-    Pure env helper: ownership of the workspace tree (including these XDG
-    paths and the bun install cache) is the single responsibility of
-    ``ensure_workspace``/``_chown_workspace``. The mkdir calls here exist
-    only as a safety net for callers that bypass ``ensure_workspace`` (unit
-    tests) or for the case where a runtime dir was deleted mid-process.
-
-    Cargo/rustup/target caches live under ``/data/cache/*`` (container ENV)
-    and are group-shared via ``omp``. Bun's install cache is explicitly
-    workspace-private because bun chmod/chowns its cache root, which makes a
-    cross-slot shared cache a permanent source of permission failures.
-    """
+    """Compute symlink-safe TMPDIR + XDG env for slot-side subprocesses."""
     tmpdir = _prepare_slot_tmpdir(workspace, slot_uid)
     xdg_root = workspace.root / ".omp-xdg"
+    _ensure_root_control_dir(xdg_root)
+    xdg_cache = xdg_root / "cache"
+    xdg_config = xdg_root / "config"
     xdg_data = xdg_root / "data"
     xdg_state = xdg_root / "state"
-    xdg_cache = xdg_root / "cache"
+    for base in (xdg_cache, xdg_config, xdg_data, xdg_state):
+        _ensure_slot_writable_dir(base, slot_uid)
     bun_cache = xdg_cache / "bun-install"
-
-    for base in (xdg_data, xdg_state, xdg_cache):
-        base.mkdir(parents=True, exist_ok=True)
-        (base / "omp").mkdir(parents=True, exist_ok=True)
-    bun_cache.mkdir(parents=True, exist_ok=True)
+    _ensure_slot_writable_dir(bun_cache, slot_uid)
+    _ensure_slot_writable_dir(xdg_cache / "omp", slot_uid)
+    _ensure_slot_writable_dir(xdg_data / "omp", slot_uid)
+    _ensure_slot_writable_dir(xdg_state / "omp", slot_uid)
 
     return {
         "TMPDIR": str(tmpdir),
         "TMP": str(tmpdir),
         "TEMP": str(tmpdir),
+        "XDG_CONFIG_HOME": str(xdg_config),
         "XDG_DATA_HOME": str(xdg_data),
         "XDG_STATE_HOME": str(xdg_state),
         "XDG_CACHE_HOME": str(xdg_cache),
@@ -473,32 +563,17 @@ def _prepare_slot_runtime_env(workspace: Workspace, slot_uid: int | None) -> dic
 
 
 def _provision_runtime_dirs(ws_root: Path) -> None:
-    """Create the runtime dirs that ``_chown_workspace`` will hand to the slot.
-
-    Runs immediately before ``_chown_workspace`` so the recursive chown sweep
-    picks up ``.omp-tmp`` and the per-workspace XDG tree. Without this,
-    ``_prepare_slot_runtime_env`` would create them later from the orchestrator
-    process — leaving root-owned cache roots that bun/biome/cargo cannot
-    chmod/utime, the original source of the recurring permission failures.
-
-    Symlink-safe on ``.omp-tmp`` (replaces a planted non-directory in place).
-    """
-    tmpdir = ws_root / ".omp-tmp"
-    try:
-        st = tmpdir.lstat()
-    except FileNotFoundError:
-        pass
-    else:
-        if not stat.S_ISDIR(st.st_mode):
-            tmpdir.unlink()
-    tmpdir.mkdir(mode=0o700, parents=True, exist_ok=True)
-
+    """Create symlink-safe root control dirs and runtime leaves."""
+    for relative in (".omp-session", "context", "artifacts", ".omp-tmp", ".omp-xdg"):
+        _ensure_root_control_dir(ws_root / relative)
     xdg_root = ws_root / ".omp-xdg"
-    for sub in ("data", "state", "cache"):
-        base = xdg_root / sub
-        base.mkdir(parents=True, exist_ok=True)
-        (base / "omp").mkdir(parents=True, exist_ok=True)
-    (xdg_root / "cache" / "bun-install").mkdir(parents=True, exist_ok=True)
+    for sub in ("cache", "config", "data", "state"):
+        _ensure_real_dir(xdg_root / sub, mode=0o700)
+    _ensure_real_dir(xdg_root / "cache" / "omp", mode=0o700)
+    _ensure_real_dir(xdg_root / "cache" / "bun-install", mode=0o700)
+    _ensure_real_dir(xdg_root / "data" / "omp", mode=0o700)
+    _ensure_real_dir(xdg_root / "state" / "omp", mode=0o700)
+    _ensure_real_dir(ws_root / "artifacts" / "agent", mode=0o755)
 
 
 def _grant_group_bits(path: Path, *, gid: int, bits: int) -> None:
@@ -555,60 +630,78 @@ def _resolve_worktree_git_dirs(repo_dir: Path) -> tuple[Path, Path] | None:
 
 
 def _share_git_metadata_with_slots(repo_dir: Path, slot_uid: int | None) -> None:
-    """Keep shared Git metadata writable by whichever slot gets the retry.
+    """Pool Git metadata stays root-owned/read-only; remote writes use GitTransport."""
+    del repo_dir, slot_uid
+    return
 
-    The worktree checkout itself is slot-private, but `.git` in a Git worktree
-    points back into the shared clone pool. A retry may run as a different
-    `omp-N` user, so the pool-side worktree gitdir, refs, reflogs, and object
-    directories must stay writable through the shared `omp` group.
-    """
-    if not _slot_permissions_active(slot_uid):
-        return
-    dirs = _resolve_worktree_git_dirs(repo_dir)
-    if dirs is None:
-        return
-    git_dir, common_dir = dirs
-    gid = _SHARED_OMP_GID
-    _grant_tree(git_dir, gid=gid, files_group_writable=True)
-    _grant_group_bits(common_dir, gid=gid, bits=stat.S_IRWXG | stat.S_ISGID)
-    for rel, files_group_writable in (
-        ("objects", False),
-        ("refs", True),
-        ("logs", True),
-        ("worktrees", True),
-    ):
-        _grant_tree(common_dir / rel, gid=gid, files_group_writable=files_group_writable)
-    for rel in ("config", "packed-refs", "HEAD", "FETCH_HEAD", "ORIG_HEAD"):
-        _grant_tree(common_dir / rel, gid=gid, files_group_writable=True)
 
+
+def _chmod_chown_no_symlink(path: Path, *, uid: int, gid: int, mode: int) -> None:
+    try:
+        st = path.lstat()
+    except FileNotFoundError:
+        return
+    if stat.S_ISLNK(st.st_mode):
+        return
+    os.chown(path, uid, gid, follow_symlinks=False)
+    os.chmod(path, mode, follow_symlinks=False)
+
+
+def _chown_workspace_tree(ws_root: Path, *, uid: int, gid: int) -> None:
+    for current_root, dirs, files in os.walk(ws_root, topdown=True, followlinks=False):
+        current = Path(current_root)
+        if current == ws_root:
+            dirs[:] = [dirname for dirname in dirs if dirname not in _ROOT_CONTROL_DIRS]
+        _chmod_chown_no_symlink(current, uid=uid, gid=gid, mode=0o770)
+        for dirname in dirs:
+            _chmod_chown_no_symlink(current / dirname, uid=uid, gid=gid, mode=0o770)
+        for filename in files:
+            _chmod_chown_no_symlink(current / filename, uid=uid, gid=gid, mode=0o660)
+
+
+
+def _chown_slot_leaf_tree(path: Path, slot_uid: int) -> None:
+    _ensure_slot_writable_dir(path, slot_uid, mode=0o700)
+    for current_root, dirs, files in os.walk(path, topdown=True, followlinks=False):
+        current = Path(current_root)
+        _chmod_chown_no_symlink(current, uid=slot_uid, gid=slot_uid, mode=0o700)
+        for dirname in dirs:
+            _chmod_chown_no_symlink(current / dirname, uid=slot_uid, gid=slot_uid, mode=0o700)
+        for filename in files:
+            _chmod_chown_no_symlink(current / filename, uid=slot_uid, gid=slot_uid, mode=0o600)
+
+def _chown_slot_leaves(ws_root: Path, slot_uid: int | None) -> None:
+    if slot_uid is None:
+        return
+    leaves = [
+        _slot_tmp_leaf(ws_root / ".omp-tmp", slot_uid),
+        ws_root / ".omp-xdg" / "cache",
+        ws_root / ".omp-xdg" / "config",
+        ws_root / ".omp-xdg" / "data",
+        ws_root / ".omp-xdg" / "state",
+        ws_root / ".omp-xdg" / "cache" / "omp",
+        ws_root / ".omp-xdg" / "cache" / "bun-install",
+        ws_root / ".omp-xdg" / "data" / "omp",
+        ws_root / ".omp-xdg" / "state" / "omp",
+        ws_root / "artifacts" / "agent",
+    ]
+    for path in leaves:
+        _chown_slot_leaf_tree(path, slot_uid)
 
 def _chown_workspace(ws_root: Path, slot_uid: int | None) -> None:
-    """Hand the workspace tree to the identity that will run repo-local git.
-
-    With slot isolation enabled, that identity is ``slot_uid:slot_uid``.
-    Without slots, the agent and host-side repo commands run as the
-    orchestrator user itself. Existing workspaces may still be owned by an
-    old slot UID from a prior deploy; normalizing them back to the current
-    euid/egid keeps Git's ownership check satisfied without persistent
-    ``safe.directory`` config.
-
-    Single-ownership invariant: every file under ``ws_root`` ends up owned by
-    the active runner with mode ``u=rwX,g=rwX,o=`` (``0770`` dirs / ``0660``
-    files).
-
-    The orchestrator (root) keeps read/write access via uid-0 bypass; any
-    subprocess that touches paths the agent will revisit MUST either run as
-    the same owner or call this helper before invoking Git/tools that enforce
-    owner-sensitive state.
-    """
+    """Hand repo checkout to slot while keeping control dirs root-owned."""
     if platform.system() != "Linux":
         return
     if os.geteuid() != 0:
         return
     uid = slot_uid if slot_uid is not None else os.geteuid()
     gid = slot_uid if slot_uid is not None else os.getegid()
-    subprocess.run(["chown", "-R", f"{uid}:{gid}", str(ws_root)], check=True)
-    subprocess.run(["chmod", "-R", "u=rwX,g=rwX,o=", str(ws_root)], check=True)
+    _chown_workspace_tree(ws_root, uid=uid, gid=gid)
+    for name in _ROOT_CONTROL_DIRS:
+        control = ws_root / name
+        if control.exists() or control.is_symlink():
+            _ensure_root_control_dir(control)
+    _chown_slot_leaves(ws_root, slot_uid)
 
 
 # ---------- SandboxManager ----------
@@ -670,12 +763,12 @@ class SandboxManager:
         Best-effort: silent no-op on failure (probe `get-url` first so we don't
         spam logs on first-time clones where origin isn't configured yet).
         """
-        probe = _safe_run(["git", "remote", "get-url", "origin"], cwd=repo_dir)
+        probe = _safe_run(["git", "remote", "get-url", "origin"], cwd=repo_dir, timeout=_DEFAULT_SUBPROCESS_TIMEOUT_SECONDS)
         if probe.returncode != 0:
             return
         if probe.stdout.strip() == clone_url:
             return
-        _safe_run(["git", "remote", "set-url", "origin", clone_url], cwd=repo_dir)
+        _safe_run(["git", "remote", "set-url", "origin", clone_url], cwd=repo_dir, timeout=_DEFAULT_SUBPROCESS_TIMEOUT_SECONDS)
 
     # ---- per-issue workspace ----
     def workspace_root(self, repo: str, number: int) -> Path:
@@ -691,6 +784,8 @@ class SandboxManager:
         default_branch: str,
         existing_branch: str | None = None,
         pr_head: int | None = None,
+        pr_base_ref: str | None = None,
+        pr_changed_paths: Iterable[str] | None = None,
         author_name: str,
         author_email: str,
         slot_uid: int | None = None,
@@ -701,11 +796,15 @@ class SandboxManager:
         pool = self.ensure_clone(repo=repo, clone_url=clone_url, default_branch=default_branch)
         ws_root = self.workspace_root(repo, number)
         repo_dir = ws_root / "repo"
-        session_dir = ws_root / ".omp-session"
-        context_dir = ws_root / "context"
-        artifacts_dir = ws_root / "artifacts"
-        for path in (ws_root, session_dir, context_dir, context_dir / "repro", artifacts_dir):
-            path.mkdir(parents=True, exist_ok=True)
+        session_dir = _safe_workspace_child(ws_root, ".omp-session")
+        context_dir = _safe_workspace_child(ws_root, "context")
+        artifacts_root = _safe_workspace_child(ws_root, "artifacts")
+        artifacts_dir = artifacts_root / "agent"
+        ws_root.mkdir(parents=True, exist_ok=True)
+        for path in (session_dir, context_dir, artifacts_root, ws_root / ".omp-tmp", ws_root / ".omp-xdg"):
+            _ensure_root_control_dir(path)
+        _ensure_real_dir(context_dir / "repro", mode=0o755)
+        _ensure_real_dir(artifacts_dir, mode=0o755)
 
         branch = (
             f"review/pr-{pr_head}"
@@ -733,23 +832,36 @@ class SandboxManager:
             workspace_prepared = True
         if not repo_exists:
             if pr_head is not None:
-                self.transport.fetch_pr_head(repo=repo, pool_dir=pool, pr_number=pr_head)
-                _run(["git", "worktree", "add", "--detach", str(repo_dir), "FETCH_HEAD"], cwd=pool)
+                if pr_base_ref is None or pr_changed_paths is None:
+                    raise ValueError("PR review workspace requires pr_base_ref and pr_changed_paths")
+                self.transport.prepare_pr_worktree(
+                    repo=repo,
+                    pool_dir=pool,
+                    repo_dir=repo_dir,
+                    pr_number=pr_head,
+                    base_ref=pr_base_ref,
+                    changed_paths=pr_changed_paths,
+                )
             else:
                 # Make sure the requested start point exists locally (best-effort).
                 # For follow-ups on an existing PR, `existing_branch` is the remote
                 # head branch we need to amend; starting from default would silently
                 # lose the PR's current commits if the local pool branch is absent.
                 self.transport.fetch_base_ref(repo=repo, pool_dir=pool, ref=existing_branch or default_branch)
-                check = _safe_run(["git", "rev-parse", "--verify", f"refs/heads/{branch}"], cwd=pool)
+                check = _safe_run(
+                    ["git", "rev-parse", "--verify", f"refs/heads/{branch}"],
+                    cwd=pool,
+                    timeout=_DEFAULT_SUBPROCESS_TIMEOUT_SECONDS,
+                )
                 if check.returncode == 0:
-                    _run(["git", "worktree", "add", str(repo_dir), branch], cwd=pool)
+                    _run(["git", "worktree", "add", str(repo_dir), branch], cwd=pool, timeout=_DEFAULT_SUBPROCESS_TIMEOUT_SECONDS)
                 else:
                     start_point = f"origin/{default_branch}"
                     if existing_branch:
                         remote = _safe_run(
                             ["git", "rev-parse", "--verify", f"refs/remotes/origin/{existing_branch}"],
                             cwd=pool,
+                            timeout=_DEFAULT_SUBPROCESS_TIMEOUT_SECONDS,
                         )
                         if remote.returncode == 0:
                             start_point = f"origin/{existing_branch}"
@@ -764,12 +876,14 @@ class SandboxManager:
                             start_point,
                         ],
                         cwd=pool,
+                        timeout=_DEFAULT_SUBPROCESS_TIMEOUT_SECONDS,
                     )
         else:
             slot_git_env = _git_env_for_repo(repo_dir)
             current = _safe_run(
                 ["git", "symbolic-ref", "--quiet", "--short", "HEAD"],
                 cwd=repo_dir,
+                timeout=_DEFAULT_SUBPROCESS_TIMEOUT_SECONDS,
                 env=slot_git_env,
                 **slot_git_kwargs,
             )
@@ -790,7 +904,7 @@ class SandboxManager:
         # Identity is set on the worktree's shared config; idempotent. Run as
         # the slot after the chown so git never trips over safe.directory.
         for command in (["git", "config", "user.email", author_email], ["git", "config", "user.name", author_name]):
-            proc = _safe_run(command, cwd=repo_dir, env=slot_git_env, **slot_git_kwargs)
+            proc = _safe_run(command, cwd=repo_dir, timeout=_DEFAULT_SUBPROCESS_TIMEOUT_SECONDS, env=slot_git_env, **slot_git_kwargs)
             if proc.returncode != 0:
                 raise GitCommandError(command, proc.returncode, proc.stdout, proc.stderr)
         _share_git_metadata_with_slots(repo_dir, slot_uid)
@@ -899,7 +1013,7 @@ class SandboxManager:
         repo_dir = ws_root / "repo"
         if repo_dir.exists():
             pool = self.pool_path(repo)
-            _safe_run(["git", "worktree", "remove", "--force", str(repo_dir)], cwd=pool)
+            _safe_run(["git", "worktree", "remove", "--force", str(repo_dir)], cwd=pool, timeout=_DEFAULT_SUBPROCESS_TIMEOUT_SECONDS)
             if repo_dir.exists():
                 shutil.rmtree(repo_dir, ignore_errors=True)
         if ws_root.exists():

@@ -35,7 +35,12 @@ from robomp.config import Settings
 from robomp.db import Database, issue_key
 from robomp.git_ops import DirtyState, inspect_dirty_state
 from robomp.github_backend import GitHubBackend
-from robomp.github_client import CommentInfo, IssueInfo, PullRequestInfo, RepoInfo
+from robomp.github_types import (
+    CommentInfo,
+    IssueInfo,
+    PullRequestInfo,
+    RepoInfo,
+)
 from robomp.host_tools import AbortController, ToolBindings, _git_identity_env
 from robomp.natives_cache import NativesCache
 from robomp.natives_cache import compute_key as natives_compute_key

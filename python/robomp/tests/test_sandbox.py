@@ -14,6 +14,7 @@ from robomp.git_ops import (
 )
 from robomp.git_ops import (
     fetch_pr_head as git_fetch_pr_head,
+    prepare_pr_worktree as git_prepare_pr_worktree,
 )
 from robomp.git_ops import (
     fetch_prune as git_fetch_prune,
@@ -440,6 +441,8 @@ def test_ensure_workspace_pr_head_uses_detached_pr_ref(tmp_path: Path, upstream_
         clone_url=str(upstream_repo),
         default_branch="main",
         pr_head=9,
+        pr_base_ref="main",
+        pr_changed_paths=("README.md",),
         author_name="robomp-bot",
         author_email="robomp-bot@example.invalid",
     )
@@ -502,22 +505,26 @@ def test_chown_workspace_noops_off_linux(tmp_path: Path, monkeypatch: pytest.Mon
 
 
 def test_chown_workspace_runs_chown_and_chmod_as_root_on_linux(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    calls: list[tuple[list[str], bool]] = []
+    chowns: list[tuple[Path, int, int, bool | None]] = []
+    chmods: list[tuple[Path, int, bool | None]] = []
+
+    def fake_chown(path: Path, uid: int, gid: int, *, follow_symlinks: bool | None = None) -> None:
+        chowns.append((Path(path), uid, gid, follow_symlinks))
+
+    def fake_chmod(path: Path, mode: int, *, follow_symlinks: bool | None = None) -> None:
+        chmods.append((Path(path), mode, follow_symlinks))
 
     monkeypatch.setattr("robomp.sandbox.platform.system", lambda: "Linux")
     monkeypatch.setattr("robomp.sandbox.os.geteuid", lambda: 0)
-    monkeypatch.setattr(
-        "robomp.sandbox.subprocess.run",
-        lambda cmd, *, check: calls.append((cmd, check)),
-    )
+    monkeypatch.setattr("robomp.sandbox.os.chown", fake_chown)
+    monkeypatch.setattr("robomp.sandbox.os.chmod", fake_chmod)
+    monkeypatch.setattr("robomp.sandbox._ensure_root_control_dir", lambda _path: None)
+    monkeypatch.setattr("robomp.sandbox._chown_slot_leaves", lambda _root, _slot_uid: None)
 
     _chown_workspace(tmp_path, 2001)
 
-    # 2001 is the slot-private GID matching the slot UID, not the shared omp group.
-    assert calls == [
-        (["chown", "-R", "2001:2001", str(tmp_path)], True),
-        (["chmod", "-R", "u=rwX,g=rwX,o=", str(tmp_path)], True),
-    ]
+    assert (tmp_path, 2001, 2001, False) in chowns
+    assert (tmp_path, 0o770, False) in chmods
 
 
 def test_chown_workspace_makes_workspace_slot_owned(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -525,48 +532,35 @@ def test_chown_workspace_makes_workspace_slot_owned(tmp_path: Path, monkeypatch:
     subdir.mkdir()
     file_path = subdir / "file.txt"
     file_path.write_text("data\n", encoding="utf-8")
-    tmp_path.chmod(0o777)
-    subdir.chmod(0o777)
-    file_path.chmod(0o777)
+    control = tmp_path / ".omp-session"
+    control.mkdir()
+    control_file = control / "turn.jsonl"
+    control_file.write_text("{}\n", encoding="utf-8")
     owned: dict[Path, tuple[int, int]] = {}
+    real_chmod = os.chmod
 
-    def fake_run(cmd: list[str], *, check: bool) -> None:
-        assert check
-        if cmd[:2] == ["chown", "-R"]:
-            uid_text, gid_text = cmd[2].split(":", 1)
-            root = Path(cmd[3])
-            uid = int(uid_text)
-            gid = int(gid_text)
-            owned[root] = (uid, gid)
-            for current_root, dirs, files in os.walk(root):
-                current = Path(current_root)
-                owned[current] = (uid, gid)
-                for dirname in dirs:
-                    owned[current / dirname] = (uid, gid)
-                for filename in files:
-                    owned[current / filename] = (uid, gid)
-        elif cmd[:3] == ["chmod", "-R", "u=rwX,g=rwX,o="]:
-            root = Path(cmd[3])
-            root.chmod(0o770)
-            for current_root, dirs, files in os.walk(root):
-                current = Path(current_root)
-                current.chmod(0o770)
-                for dirname in dirs:
-                    (current / dirname).chmod(0o770)
-                for filename in files:
-                    (current / filename).chmod(0o660)
-        else:
-            raise AssertionError(f"unexpected command: {cmd!r}")
+    def fake_chown(path: Path, uid: int, gid: int, *, follow_symlinks: bool | None = None) -> None:
+        assert follow_symlinks is False
+        owned[Path(path)] = (uid, gid)
+
+    def fake_chmod(path: Path, mode: int, *, follow_symlinks: bool | None = None) -> None:
+        assert follow_symlinks is False
+        real_chmod(path, mode, follow_symlinks=False)
 
     monkeypatch.setattr("robomp.sandbox.platform.system", lambda: "Linux")
     monkeypatch.setattr("robomp.sandbox.os.geteuid", lambda: 0)
-    monkeypatch.setattr("robomp.sandbox.subprocess.run", fake_run)
+    monkeypatch.setattr("robomp.sandbox.os.chown", fake_chown)
+    monkeypatch.setattr("robomp.sandbox.os.chmod", fake_chmod)
+    monkeypatch.setattr("robomp.sandbox._ensure_root_control_dir", lambda _path: None)
+    monkeypatch.setattr("robomp.sandbox._chown_slot_leaves", lambda _root, _slot_uid: None)
 
     _chown_workspace(tmp_path, 2001)
 
     assert owned[tmp_path] == (2001, 2001)
     assert owned[subdir] == (2001, 2001)
     assert owned[file_path] == (2001, 2001)
+    assert control not in owned
+    assert control_file not in owned
     assert stat.S_IMODE(tmp_path.stat().st_mode) == 0o770
     assert stat.S_IMODE(subdir.stat().st_mode) == 0o770
     assert stat.S_IMODE(file_path.stat().st_mode) == 0o660
@@ -625,19 +619,21 @@ def test_reap_slot_kills_slot_uid_on_linux_root(monkeypatch: pytest.MonkeyPatch)
     assert calls == [(111, signal.SIGKILL), (222, signal.SIGKILL)]
 
 
-def test_prepare_slot_tmpdir_mkdirs_without_chown(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    chowns: list[tuple[Path, int, int]] = []
+def test_prepare_slot_tmpdir_mkdirs_symlink_safe_slot_leaf(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    chowns: list[tuple[int, int, int]] = []
 
     monkeypatch.setattr("robomp.sandbox.platform.system", lambda: "Linux")
     monkeypatch.setattr("robomp.sandbox.os.geteuid", lambda: 0)
-    monkeypatch.setattr("robomp.sandbox.os.chown", lambda path, uid, gid: chowns.append((Path(path), uid, gid)))
+    monkeypatch.setattr("robomp.sandbox.os.fchown", lambda fd, uid, gid: chowns.append((fd, uid, gid)))
 
     tmpdir = _prepare_slot_tmpdir(_workspace(tmp_path), 2001)
 
-    assert tmpdir == tmp_path / ".omp-tmp"
+    assert tmpdir == tmp_path / ".omp-tmp" / "slot-2001"
     assert tmpdir.is_dir()
+    assert stat.S_IMODE((tmp_path / ".omp-tmp").stat().st_mode) == 0o755
     assert stat.S_IMODE(tmpdir.stat().st_mode) == 0o700
-    assert chowns == []
+    assert (0, 0) in [(uid, gid) for _fd, uid, gid in chowns]
+    assert (2001, 2001) in [(uid, gid) for _fd, uid, gid in chowns]
 
 
 def test_prepare_slot_tmpdir_replaces_symlink_without_touching_target(tmp_path: Path) -> None:
@@ -665,11 +661,35 @@ def test_provision_runtime_dirs_replaces_tmpdir_symlink_and_creates_xdg_tree(tmp
     assert tmpdir.is_dir()
     assert not tmpdir.is_symlink()
     assert target.is_dir()
-    assert stat.S_IMODE(tmpdir.stat().st_mode) == 0o700
-    for base in (tmp_path / ".omp-xdg" / "data", tmp_path / ".omp-xdg" / "state", tmp_path / ".omp-xdg" / "cache"):
+    assert stat.S_IMODE(tmpdir.stat().st_mode) == 0o755
+    for base in (
+        tmp_path / ".omp-xdg" / "data",
+        tmp_path / ".omp-xdg" / "state",
+        tmp_path / ".omp-xdg" / "cache",
+        tmp_path / ".omp-xdg" / "config",
+    ):
         assert base.is_dir()
-        assert (base / "omp").is_dir()
+    assert (tmp_path / ".omp-xdg" / "data" / "omp").is_dir()
+    assert (tmp_path / ".omp-xdg" / "state" / "omp").is_dir()
+    assert (tmp_path / ".omp-xdg" / "cache" / "omp").is_dir()
     assert (tmp_path / ".omp-xdg" / "cache" / "bun-install").is_dir()
+
+
+def test_workspace_control_dirs_resist_symlink_swap(tmp_path: Path) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    for relative in (".omp-session", "context", "artifacts", ".omp-tmp", ".omp-xdg"):
+        link = tmp_path / relative
+        link.symlink_to(target, target_is_directory=True)
+
+    _provision_runtime_dirs(tmp_path)
+
+    for relative in (".omp-session", "context", "artifacts", ".omp-tmp", ".omp-xdg"):
+        control = tmp_path / relative
+        assert control.is_dir()
+        assert not control.is_symlink()
+        assert stat.S_IMODE(control.stat().st_mode) == 0o755
+    assert target.is_dir()
 
 
 def test_safe_directory_env_scopes_single_repo_path(tmp_path: Path) -> None:
@@ -697,26 +717,24 @@ def test_slot_subprocess_kwargs_run_as_slot_on_linux_root(monkeypatch: pytest.Mo
 def test_chown_workspace_normalizes_to_root_when_slots_disabled(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    calls: list[tuple[list[str], bool | None]] = []
-
-    def fake_run(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
-        calls.append((cmd, kwargs.get("check") if isinstance(kwargs.get("check"), bool) else None))
-        return subprocess.CompletedProcess(cmd, 0, "", "")
+    chowns: list[tuple[Path, int, int]] = []
 
     monkeypatch.setattr("robomp.sandbox.platform.system", lambda: "Linux")
     monkeypatch.setattr("robomp.sandbox.os.geteuid", lambda: 0)
     monkeypatch.setattr("robomp.sandbox.os.getegid", lambda: 0)
-    monkeypatch.setattr("robomp.sandbox.subprocess.run", fake_run)
+    monkeypatch.setattr(
+        "robomp.sandbox.os.chown",
+        lambda path, uid, gid, *, follow_symlinks=False: chowns.append((Path(path), uid, gid)),
+    )
+    monkeypatch.setattr("robomp.sandbox.os.chmod", lambda path, mode, *, follow_symlinks=False: None)
+    monkeypatch.setattr("robomp.sandbox._ensure_root_control_dir", lambda _path: None)
 
     _chown_workspace(tmp_path, None)
 
-    assert calls == [
-        (["chown", "-R", "0:0", str(tmp_path)], True),
-        (["chmod", "-R", "u=rwX,g=rwX,o=", str(tmp_path)], True),
-    ]
+    assert chowns == [(tmp_path, 0, 0)]
 
 
-def test_prepare_slot_runtime_env_returns_workspace_private_paths_without_chown(
+def test_prepare_slot_runtime_env_returns_workspace_private_paths_without_path_chown(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     chowns: list[tuple[Path, int, int]] = []
@@ -725,6 +743,7 @@ def test_prepare_slot_runtime_env_returns_workspace_private_paths_without_chown(
     monkeypatch.setattr("robomp.sandbox.platform.system", lambda: "Linux")
     monkeypatch.setattr("robomp.sandbox.os.geteuid", lambda: 0)
     monkeypatch.setattr("robomp.sandbox.os.chown", lambda path, uid, gid: chowns.append((Path(path), uid, gid)))
+    monkeypatch.setattr("robomp.sandbox.os.fchown", lambda _fd, _uid, _gid: None)
     monkeypatch.setattr("robomp.sandbox.subprocess.run", lambda cmd, **_kwargs: calls.append(cmd))
 
     ws = _workspace(tmp_path)
@@ -732,18 +751,26 @@ def test_prepare_slot_runtime_env_returns_workspace_private_paths_without_chown(
 
     env = _prepare_slot_runtime_env(ws, 2001)
 
-    assert env["TMPDIR"] == str(ws.root / ".omp-tmp")
+    assert env["TMPDIR"] == str(ws.root / ".omp-tmp" / "slot-2001")
+    assert env["XDG_CONFIG_HOME"] == str(ws.root / ".omp-xdg" / "config")
     assert env["XDG_CACHE_HOME"] == str(ws.root / ".omp-xdg" / "cache")
     assert env["BUN_INSTALL_CACHE_DIR"] == str(bun_cache)
-    for base in (ws.root / ".omp-xdg" / "data", ws.root / ".omp-xdg" / "state", ws.root / ".omp-xdg" / "cache"):
+    for base in (
+        ws.root / ".omp-xdg" / "data",
+        ws.root / ".omp-xdg" / "state",
+        ws.root / ".omp-xdg" / "cache",
+        ws.root / ".omp-xdg" / "config",
+    ):
         assert base.is_dir()
-        assert (base / "omp").is_dir()
+    assert (ws.root / ".omp-xdg" / "data" / "omp").is_dir()
+    assert (ws.root / ".omp-xdg" / "state" / "omp").is_dir()
+    assert (ws.root / ".omp-xdg" / "cache" / "omp").is_dir()
     assert bun_cache.is_dir()
     assert chowns == []
     assert calls == []
 
 
-def test_share_git_metadata_keeps_pool_writable_for_retry_slot(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_share_git_metadata_leaves_pool_metadata_root_owned_read_only(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     repo_dir = tmp_path / "workspaces" / "octo__widget__43" / "repo"
     repo_dir.mkdir(parents=True)
     common_dir = tmp_path / "workspaces" / "_pool" / "octo__widget" / ".git"
@@ -751,28 +778,10 @@ def test_share_git_metadata_keeps_pool_writable_for_retry_slot(tmp_path: Path, m
     git_dir.mkdir(parents=True)
     (repo_dir / ".git").write_text(f"gitdir: {git_dir}\n", encoding="utf-8")
     (git_dir / "commondir").write_text("../..\n", encoding="utf-8")
-
-    object_dir = common_dir / "objects" / "ab"
-    object_dir.mkdir(parents=True)
-    object_file = object_dir / "object"
-    object_file.write_text("object\n", encoding="utf-8")
-    object_file.chmod(0o600)
-
-    ref_dir = common_dir / "refs" / "heads"
-    ref_dir.mkdir(parents=True)
-    ref_file = ref_dir / "farm"
+    ref_file = common_dir / "refs" / "heads" / "farm"
+    ref_file.parent.mkdir(parents=True)
     ref_file.write_text("sha\n", encoding="utf-8")
     ref_file.chmod(0o600)
-
-    log_dir = common_dir / "logs" / "refs" / "heads"
-    log_dir.mkdir(parents=True)
-    log_file = log_dir / "farm"
-    log_file.write_text("sha sha bot <bot@example.invalid> commit\n", encoding="utf-8")
-    log_file.chmod(0o600)
-
-    index_file = git_dir / "index"
-    index_file.write_text("index\n", encoding="utf-8")
-    index_file.chmod(0o600)
 
     chowns: list[tuple[Path, int, int]] = []
     monkeypatch.setattr("robomp.sandbox.platform.system", lambda: "Linux")
@@ -781,14 +790,8 @@ def test_share_git_metadata_keeps_pool_writable_for_retry_slot(tmp_path: Path, m
 
     _share_git_metadata_with_slots(repo_dir, 2002)
 
-    assert object_dir.stat().st_mode & stat.S_IWGRP
-    assert object_dir.stat().st_mode & stat.S_ISGID
-    assert object_file.stat().st_mode & stat.S_IRGRP
-    assert not object_file.stat().st_mode & stat.S_IWGRP
-    assert ref_file.stat().st_mode & stat.S_IWGRP
-    assert log_file.stat().st_mode & stat.S_IWGRP
-    assert index_file.stat().st_mode & stat.S_IWGRP
-    assert (git_dir, -1, 2000) in chowns
+    assert stat.S_IMODE(ref_file.stat().st_mode) == 0o600
+    assert chowns == []
 
 
 def test_ensure_workspace_refreshes_permissions_for_retry_slot_and_session(
@@ -913,6 +916,7 @@ def test_ensure_workspace_runs_existing_worktree_git_as_slot_after_chown(
 
     monkeypatch.setattr("robomp.sandbox.platform.system", lambda: "Linux")
     monkeypatch.setattr("robomp.sandbox.os.geteuid", lambda: 0)
+    monkeypatch.setattr("robomp.sandbox.os.fchown", lambda _fd, _uid, _gid: None)
     monkeypatch.setattr("robomp.sandbox.subprocess.run", fake_run)
     monkeypatch.setattr("robomp.sandbox._chown_workspace", record_chown)
     monkeypatch.setattr("robomp.sandbox._share_git_metadata_with_slots", lambda _repo_dir, _slot_uid: None)
@@ -1267,14 +1271,40 @@ def test_run_git_injects_safe_directory_and_subprocess_identity(
 ) -> None:
     from robomp.git_ops import _run_git
 
+    monkeypatch.setenv("GIT_TRACE", "1")
+    monkeypatch.setenv("GIT_ASKPASS", "/tmp/askpass")
+    monkeypatch.setenv("GIT_SSH_COMMAND", "ssh -o ProxyCommand=bad")
+    monkeypatch.setenv("OPENAI_API_KEY", "secret")
     captured: dict[str, object] = {}
 
-    def fake_run(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
-        captured["cmd"] = cmd
-        captured.update(kwargs)
+    def fake_run_process(
+        cmd: list[str],
+        *,
+        cwd: Path | None,
+        env: dict[str, str],
+        timeout: float | None,
+        stdin: str | None = None,
+        user: int | None = None,
+        group: int | None = None,
+        extra_groups: list[int] | tuple[int, ...] | None = None,
+        umask: int | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        captured.update(
+            {
+                "cmd": cmd,
+                "cwd": cwd,
+                "env": env,
+                "timeout": timeout,
+                "stdin": stdin,
+                "user": user,
+                "group": group,
+                "extra_groups": extra_groups,
+                "umask": umask,
+            }
+        )
         return subprocess.CompletedProcess(cmd, 0, "", "")
 
-    monkeypatch.setattr("robomp.git_ops.subprocess.run", fake_run)
+    monkeypatch.setattr("robomp.git_ops._run_process", fake_run_process)
 
     _run_git(
         ["status"],
@@ -1292,6 +1322,11 @@ def test_run_git_injects_safe_directory_and_subprocess_identity(
     assert env["GIT_CONFIG_COUNT"] == "1"
     assert env["GIT_CONFIG_KEY_0"] == "safe.directory"
     assert env["GIT_CONFIG_VALUE_0"] == "/x"
+    assert env["GIT_TERMINAL_PROMPT"] == "0"
+    assert "GIT_TRACE" not in env
+    assert "GIT_ASKPASS" not in env
+    assert "GIT_SSH_COMMAND" not in env
+    assert "OPENAI_API_KEY" not in env
     assert captured["user"] == 2001
     assert captured["group"] == 2001
     assert captured["extra_groups"] == [2000]
@@ -1365,6 +1400,7 @@ def _commit_new_blob_upstream(upstream: Path, tmp_path: Path, *, path: str, cont
     """Add a fresh blob upstream and return the new commit SHA."""
     contrib = tmp_path / f"contrib-{path.replace('/', '_')}"
     _git(["clone", f"file://{upstream}", str(contrib)], cwd=tmp_path)
+    (contrib / path).parent.mkdir(parents=True, exist_ok=True)
     (contrib / path).write_text(content, encoding="utf-8")
     _git(["-C", str(contrib), "add", path], cwd=tmp_path)
     subprocess.run(
@@ -1505,6 +1541,96 @@ def test_fetch_pr_head_backfills_missing_blobs_into_partial_clone(tmp_path: Path
         env=os.environ | {"GIT_TERMINAL_PROMPT": "0"},
     )
     assert (ws_dir / "pr.txt").read_text(encoding="utf-8") == "pr blob payload\n"
+
+
+def test_prepare_pr_worktree_sparse_hydrates_changed_paths_only(tmp_path: Path) -> None:
+    upstream = _partial_clone_upstream(tmp_path)
+    pool = tmp_path / "pool"
+    _git(
+        [
+            "clone",
+            "--filter=blob:none",
+            "--no-tags",
+            "--branch",
+            "main",
+            f"file://{upstream}",
+            str(pool),
+        ],
+        cwd=tmp_path,
+    )
+    pr_seed = tmp_path / "pr-seed"
+    _git(["clone", f"file://{upstream}", str(pr_seed)], cwd=tmp_path)
+    (pr_seed / "src").mkdir()
+    (pr_seed / "docs").mkdir()
+    (pr_seed / "src" / "changed.txt").write_text("changed payload\n", encoding="utf-8")
+    (pr_seed / "docs" / "untouched.txt").write_text("untouched payload\n", encoding="utf-8")
+    _git(["-C", str(pr_seed), "add", "src/changed.txt", "docs/untouched.txt"], cwd=tmp_path)
+    subprocess.run(
+        ["git", "-C", str(pr_seed), "commit", "-m", "add pr files"],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=os.environ
+        | {
+            "GIT_AUTHOR_NAME": "t",
+            "GIT_AUTHOR_EMAIL": "t@t",
+            "GIT_COMMITTER_NAME": "t",
+            "GIT_COMMITTER_EMAIL": "t@t",
+        },
+    )
+    _git(["-C", str(pr_seed), "push", "origin", "HEAD:refs/pull/7/head"], cwd=tmp_path)
+
+    ws_dir = tmp_path / "pr-sparse-ws"
+    result = git_prepare_pr_worktree(
+        pool,
+        ws_dir,
+        pr_number=7,
+        base_ref="main",
+        changed_paths=("src/changed.txt",),
+        token=None,
+    )
+
+    assert result.hydrated_paths == ("src/changed.txt",)
+    assert (ws_dir / "src/changed.txt").read_text(encoding="utf-8") == "changed payload\n"
+    assert not (ws_dir / "docs/untouched.txt").exists()
+
+    _git(["-C", str(pool), "remote", "set-url", "origin", "https://example.invalid/missing.git"], cwd=tmp_path)
+    diff_proc = subprocess.run(
+        ["git", "-C", str(ws_dir), "diff", "--name-only", "origin/main...HEAD", "--"],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=os.environ | {"GIT_TERMINAL_PROMPT": "0"},
+    )
+    assert "src/changed.txt" in diff_proc.stdout.splitlines()
+
+
+@pytest.mark.parametrize("bad_path", ["../x", "/x", ".git/config", "dir/.git/config", "", "a\0b"])
+def test_prepare_pr_worktree_rejects_unsafe_sparse_paths(tmp_path: Path, bad_path: str) -> None:
+    upstream = _partial_clone_upstream(tmp_path)
+    pool = tmp_path / "pool"
+    _git(
+        [
+            "clone",
+            "--filter=blob:none",
+            "--no-tags",
+            "--branch",
+            "main",
+            f"file://{upstream}",
+            str(pool),
+        ],
+        cwd=tmp_path,
+    )
+
+    with pytest.raises(ValueError):
+        git_prepare_pr_worktree(
+            pool,
+            tmp_path / "unsafe-ws",
+            pr_number=7,
+            base_ref="main",
+            changed_paths=(bad_path,),
+            token=None,
+        )
 
 
 # ---------------------------------------------------------------------------

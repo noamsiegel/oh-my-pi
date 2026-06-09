@@ -23,7 +23,7 @@ from datetime import UTC, datetime
 from robomp.config import Settings
 from robomp.db import Database, PendingClosureRow
 from robomp.github_backend import GitHubBackend
-from robomp.github_client import GitHubError
+from robomp.github_types import GitHubError
 
 log = logging.getLogger(__name__)
 

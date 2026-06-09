@@ -1,15 +1,31 @@
 [fetch_pr]
 description = "Fetch the inbound PR premise and changed-file list for review. Review-mode only."
 
+[prepare_pr_review]
+description = "Build PR review evidence from gh-proxy/backing workspace and run the vendored classifier. Review-mode only; nonfatal when helper is unavailable."
+
+[delegate_pr_review]
+description = "Run required delegated reviewer subagents for high-risk domains and write review metadata. Review-mode only; call before validate_pr_review when PR review classification says delegation_required=true."
+
+[delegate_pr_review.parameters]
+domains = "Optional array of domains to delegate. Defaults to required non-correctness domains from PR review classification."
+reviewer = "Optional reviewer id override for a single-domain run."
+
+[validate_pr_review]
+description = "Validate candidate PR findings against PR review evidence and write the submit-ready findings/validation state consumed by submit_pr_review. Review-mode only; invalid/duplicate findings must be revised and validate_pr_review rerun before submit."
+
+[validate_pr_review.parameters]
+findings = "Array of candidate findings with path, line, body, severity, intent, and optional suggestion {kind='github_suggestion', replacement='exact replacement lines'} when the finding has a safe contiguous GitHub suggested change."
+
 [classify_pr]
-description = "Classify and rank an incoming PR, apply triaged/review labels, and persist the rank. Review-mode only."
+description = "Classify an incoming PR, apply triaged/review labels, and persist the review label. Review-mode only."
 
 [classify_pr.parameters]
-rank = "Required review verdict label: one of `review:p0..p3`."
+review_label = "Required review verdict label: one of `review:clean`, `review:minor`, `review:maintainer-call`, or `review:deprioritized`."
 type = "Exactly one PR type: feat, fix, docs, refactor, perf, test, chore, ci, or build."
 area = "Zero or more functional labels. Unknown values are dropped silently; omit when none apply."
 provider = "Only when provider-scoped; format `provider:<name>`. Omit otherwise."
-rationale = "One sentence explaining what the PR changes and why it earns this rank."
+rationale = "One sentence explaining what the PR changes and why it earns this review label."
 
 [pr_review_comment]
 description = "Stage one inline PR review comment in sqlite. Does not call GitHub until submit_pr_review. Review-mode only."
@@ -23,11 +39,11 @@ start_line = "Optional first line for a multi-line comment range."
 start_side = "Optional side for start_line; `RIGHT` or `LEFT`."
 
 [submit_pr_review]
-description = "Submit one GitHub PR review with all staged inline comments. Always posts event=`COMMENT`; never approves or requests changes. Review-mode only."
+description = "Submit one GitHub PR review. Terminal events require prior PR review prepare+validate because this tool generates the final GitHub payload through the vendored PR review helper. COMMENT-only fallback may use staged comments when the helper is unavailable."
 
 [submit_pr_review.parameters]
 body = "Markdown review summary. Required even when there are no inline comments."
-event = "Ignored except for schema compatibility; the orchestrator always sends `COMMENT`."
+event = "COMMENT, APPROVE, or REQUEST_CHANGES. Runtime config rejects terminal events unless enabled."
 
 [gh_post_comment]
 description = "Post a comment on the inbound thread (PR for PR conversations/reviews, originating issue otherwise). Pass `number` ONLY to post elsewhere."

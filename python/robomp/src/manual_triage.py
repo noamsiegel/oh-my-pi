@@ -107,6 +107,9 @@ async def enqueue_manual_triage(*, db: Database, github: GitHubBackend, repo_ful
         issue_key=issue_key(repo_full, number),
         payload=payload,
         state="queued",
+        task="triage_issue",
+        route_reason="manual triage",
+        route_version=1,
         allowed_existing_states=INACTIVE_EVENT_STATES,
     )
     if not replaced:

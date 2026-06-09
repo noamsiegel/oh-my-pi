@@ -22,14 +22,14 @@ tasks = [
 [[review_pr]]
 name = "Classify"
 tasks = [
-  "Call classify_pr with rank, type, and areas",
+  "Call classify_pr with review_label, type, and areas",
 ]
 
 [[review_pr]]
 name = "Review"
 tasks = [
-  "Stage inline findings with pr_review_comment",
-  "Call submit_pr_review once with the summary",
+  "Call validate_pr_review and resolve all validation errors",
+  "Call submit_pr_review once with the final event and summary",
 ]
 
 [[handle_comment]]

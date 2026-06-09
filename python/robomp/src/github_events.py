@@ -11,6 +11,8 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 from robomp.db import issue_key
+from robomp.github_payloads import repo_full_name
+from robomp.pr_review_policy import has_review_label, normalize_label_names, payload_label_name
 from robomp.pragmas import parse_pragmas
 
 log = logging.getLogger(__name__)
@@ -47,25 +49,18 @@ def verify_signature(secret: str, body: bytes, signature_header: str | None) -> 
     return hmac.compare_digest(expected, provided)
 
 
-def _repo_full_name(payload: Mapping[str, Any]) -> str | None:
-    repo = payload.get("repository")
-    if isinstance(repo, dict):
-        full = repo.get("full_name")
-        if isinstance(full, str):
-            return full
-    return None
 
 
 PrIssueResolver = Callable[[str, int], str | None] | None
 
 
-def _is_bot_account(user: Mapping[str, Any] | None, bot_login: str) -> bool:
+def _is_bot_account(user: Mapping[str, Any] | None, bot_login: str, *, match_configured_login: bool = True) -> bool:
     if not isinstance(user, Mapping):
         return False
     login = str(user.get("login") or "")
     if not login:
         return False
-    if login == bot_login:
+    if match_configured_login and login == bot_login:
         return True
     if login.endswith("[bot]"):
         return True
@@ -86,6 +81,7 @@ def _submitter_info(obj: Mapping[str, Any] | None) -> tuple[str | None, str | No
             login = raw
     assoc = obj.get("author_association")
     return login, (str(assoc) if isinstance(assoc, str) and assoc else None)
+
 
 
 def extract_mention(body: str | None, bot_login: str) -> str | None:
@@ -150,6 +146,7 @@ def route(
     reviewer_bots: frozenset[str] = frozenset(),
     resolve_issue_from_pr: PrIssueResolver = None,
     pr_review_enabled: bool = True,
+    pr_review_label_allowlist: frozenset[str] = frozenset(),
 ) -> RouteDecision:
     """Decide whether and how to handle a webhook event.
 
@@ -159,7 +156,7 @@ def route(
     is missing, the event is still actionable and falls back to the PR's own
     issue key (`octo/widget#1080`).
     """
-    repo = _repo_full_name(payload)
+    repo = repo_full_name(payload)
     if repo is None or repo.lower() not in allowlist:
         return RouteDecision("skip", None, repo, None, "repo not on allowlist")
 
@@ -218,12 +215,25 @@ def route(
 
     if event_type == "issues":
         issue = payload.get("issue") or {}
-        if "pull_request" in issue:
-            return RouteDecision("skip", None, repo, None, "issue is a pull request")
         number = issue.get("number")
         if not isinstance(number, int):
             return RouteDecision("skip", None, repo, None, "issue missing number")
         key = issue_key(repo, number)
+        if "pull_request" in issue:
+            if action == "labeled" and pr_review_enabled:
+                label = payload_label_name(payload)
+                if label is not None and label in pr_review_label_allowlist:
+                    login, assoc = _submitter_info(issue)
+                    return RouteDecision(
+                        "queue",
+                        "review_pr",
+                        repo,
+                        key,
+                        "issues.labeled on PR",
+                        submitter=login,
+                        association=assoc,
+                    )
+            return RouteDecision("skip", None, repo, None, "issue is a pull request")
         if action == "opened":
             login, assoc = _submitter_info(issue)
             return RouteDecision(
@@ -263,7 +273,7 @@ def route(
                     association=assoc,
                     **_directive_kwargs(comment, login, assoc),
                 )
-            return RouteDecision("skip", None, repo, issue_key(repo, number), "incoming PR comments ignored")
+            return RouteDecision("skip", None, repo, issue_key(repo, number), "incoming PR comments observed")
         key = issue_key(repo, number)
         login, assoc = _submitter_info(comment)
         return RouteDecision(
@@ -277,18 +287,31 @@ def route(
             **_directive_kwargs(comment, login, assoc),
         )
 
-    if event_type == "pull_request" and action in ("opened", "reopened", "ready_for_review"):
+    if event_type == "pull_request" and action in ("opened", "reopened", "ready_for_review", "labeled", "synchronize"):
         if not pr_review_enabled:
             return RouteDecision("skip", None, repo, None, "PR review disabled")
         pr = payload.get("pull_request") or {}
         if bool(pr.get("draft")):
             return RouteDecision("skip", None, repo, None, "draft PR")
         pr_user = pr.get("user") or {}
-        if _is_bot_account(pr_user, bot_login):
+        if _is_bot_account(pr_user, bot_login, match_configured_login=False):
             return RouteDecision("skip", None, repo, None, "bot-authored PR")
         number = pr.get("number")
         if not isinstance(number, int):
             return RouteDecision("skip", None, repo, None, "PR missing number")
+        labels = normalize_label_names(pr.get("labels"))
+        if action == "labeled":
+            label = payload_label_name(payload)
+            if not (
+                (label is not None and label in pr_review_label_allowlist)
+                or has_review_label(labels, pr_review_label_allowlist)
+            ):
+                return RouteDecision("skip", None, repo, issue_key(repo, number), "pull_request.labeled ignored")
+        elif action == "synchronize":
+            if not has_review_label(labels, pr_review_label_allowlist):
+                return RouteDecision("skip", None, repo, issue_key(repo, number), "pull_request.synchronize ignored")
+        elif pr_review_label_allowlist and not has_review_label(labels, pr_review_label_allowlist):
+            return RouteDecision("skip", None, repo, issue_key(repo, number), "PR lacks review trigger label")
         login, assoc = _submitter_info(pr)
         return RouteDecision(
             "queue",
@@ -325,6 +348,20 @@ def route(
             **_directive_kwargs(comment, login, assoc),
         )
 
+
+    if event_type == "pull_request_review" and action == "submitted":
+        pr = payload.get("pull_request") or {}
+        number = pr.get("number")
+        if not isinstance(number, int):
+            return RouteDecision("skip", None, repo, None, "PR missing number")
+        return RouteDecision("skip", None, repo, _resolve_pr_key(number), "pull_request_review.submitted observed")
+
+    if event_type == "pull_request_review_thread" and action == "resolved":
+        pr = payload.get("pull_request") or {}
+        number = pr.get("number")
+        if not isinstance(number, int):
+            return RouteDecision("skip", None, repo, None, "PR missing number")
+        return RouteDecision("skip", None, repo, _resolve_pr_key(number), "pull_request_review_thread.resolved observed")
     if event_type == "pull_request" and action == "closed":
         pr = payload.get("pull_request") or {}
         number = pr.get("number")

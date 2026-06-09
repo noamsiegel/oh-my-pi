@@ -6,7 +6,7 @@ import asyncio
 import logging
 import os
 import traceback
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable, Mapping
 from contextlib import suppress
 
 from robomp import tasks
@@ -16,8 +16,38 @@ from robomp.db import Database, EventRow
 from robomp.github_backend import GitHubBackend
 from robomp.sandbox import GitTransport, SandboxManager, _reap_slot
 from robomp.slot_pool import SlotPool
+from robomp.task_outcome import (
+    DEFAULT_TASK_RETRY_DELAY_SECONDS,
+    MAX_TRANSIENT_TASK_ATTEMPTS,
+    TaskControl,
+    TaskOutcome,
+)
 
 log = logging.getLogger(__name__)
+
+RETRYABLE_PR_WORKSPACE_ERROR_MARKERS = (
+    "git timed out",
+    "git fetch_pr_head timed out",
+    "git prepare_pr_worktree timed out",
+    "HTTP 502",
+    "HTTP 504",
+    "remote end hung up unexpectedly",
+    "early EOF",
+    "index-pack failed",
+)
+PR_WORKSPACE_RETRY_DELAY_SECONDS = 300.0
+MAX_PR_WORKSPACE_PREP_ATTEMPTS = 2
+
+
+def _is_retryable_pr_workspace_error(row: EventRow, error: str) -> bool:
+    if row.event_type != "pull_request" or row.attempts >= MAX_PR_WORKSPACE_PREP_ATTEMPTS:
+        return False
+    lowered = error.lower()
+    return any(marker.lower() in lowered for marker in RETRYABLE_PR_WORKSPACE_ERROR_MARKERS)
+
+
+_TaskHandler = Callable[[EventRow, int | None], Awaitable[TaskOutcome | None]]
+
 
 
 class WorkerPool:
@@ -74,10 +104,25 @@ class WorkerPool:
         # unrelated dispatch failure during the drain window would be
         # silently masked and requeued as if nothing went wrong.
         self._shutdown_cancelled: set[str] = set()
+        self._retry_tasks: set[asyncio.Task[None]] = set()
 
     def wake(self) -> None:
         """Signal that new work is available."""
         self._wakeup.set()
+
+    def _requeue_later(self, delivery_id: str, delay: float) -> None:
+        async def _delayed_wake() -> None:
+            await asyncio.sleep(delay)
+            self._wakeup.set()
+
+        task = asyncio.create_task(_delayed_wake(), name=f"robomp-retry-{delivery_id}")
+        self._retry_tasks.add(task)
+        task.add_done_callback(self._retry_tasks.discard)
+
+    @property
+    def started(self) -> bool:
+        """Whether dispatcher/background loops are alive."""
+        return not self._stop.is_set() and any(not task.done() for task in self._workers)
 
     async def inflight_snapshot(self) -> list[str]:
         """Return a stable, sorted snapshot of currently in-flight issue keys."""
@@ -119,6 +164,11 @@ class WorkerPool:
             with suppress(asyncio.CancelledError):
                 await worker
         self._workers.clear()
+        if self._retry_tasks:
+            for task in self._retry_tasks:
+                task.cancel()
+            await asyncio.gather(*self._retry_tasks, return_exceptions=True)
+            self._retry_tasks.clear()
         # 2. Give in-flight tasks a chance to drain.
         pending = list(self._inflight_tasks)
         if not pending:
@@ -208,20 +258,12 @@ class WorkerPool:
             log.exception("dispatch loop crashed")
 
     async def _claim_next_unique(self) -> EventRow | None:
-        """Claim the next event whose issue isn't already inflight."""
-        # The DB layer doesn't filter by issue_key; we peek then guard with a set.
+        """Claim the next DB-unblocked event and track it for observability."""
+        row = await asyncio.to_thread(self.db.claim_next_event)
+        if row is None:
+            return None
+        key = row.issue_key or row.delivery_id
         async with self._inflight_lock:
-            # Naive but fine for v1 (small queue).
-            row = await asyncio.to_thread(self.db.claim_next_event)
-            if row is None:
-                return None
-            key = row.issue_key or row.delivery_id
-            if key in self._inflight:
-                # Put it back; another in-flight task is touching the same issue.
-                await asyncio.to_thread(self.db.requeue_event, row.delivery_id, from_states=("running",))
-                # Sleep briefly so we don't spin.
-                await asyncio.sleep(0.5)
-                return None
             self._inflight.add(key)
         return row
 
@@ -247,6 +289,76 @@ class WorkerPool:
     def _disarm_cancel(self, delivery_id: str) -> None:
         """Worker-side: clear the cancel hook (the resource is gone)."""
         self._cancel_hooks.pop(delivery_id, None)
+
+    @staticmethod
+    def _failure_pr_target(row: EventRow) -> tuple[str, int] | None:
+        if row.event_type != "pull_request":
+            return None
+        repo = row.repo or ""
+        payload = row.payload if isinstance(row.payload, Mapping) else {}
+        pr = payload.get("pull_request")
+        number = pr.get("number") if isinstance(pr, Mapping) else None
+        if not isinstance(number, int) and row.issue_key and "#" in row.issue_key:
+            try:
+                number = int(row.issue_key.rsplit("#", 1)[1])
+            except ValueError:
+                return None
+        if not repo or not isinstance(number, int) or number <= 0:
+            return None
+        return repo, number
+
+    @staticmethod
+    def _failure_comment_body(row: EventRow, error: str) -> str:
+        first_line = error.strip().splitlines()[0] if error.strip() else "unknown error"
+        if len(first_line) > 1800:
+            first_line = f"{first_line[:1800]}…"
+        return (
+            "Robo-MS failed before it could finish this PR review.\n\n"
+            f"- Delivery: `{row.delivery_id}`\n"
+            f"- Failure: `{first_line}`\n\n"
+            "No review was submitted. Fix the infrastructure failure, then re-trigger by removing "
+            "and re-adding the review trigger label."
+        )
+
+    async def _post_failure_comment(self, row: EventRow, error: str) -> None:
+        target = self._failure_pr_target(row)
+        if target is None:
+            return
+        repo, number = target
+        operation_key = f"post_pr_review_failed_comment:{row.delivery_id}"
+        key = row.issue_key or f"{repo}#{number}"
+        if not self.db.reserve_side_effect(operation_key):
+            succeeded = self.db.side_effect_succeeded(operation_key)
+            message = "side effect already succeeded: %s" if succeeded else "side effect already pending: %s"
+            log.info(
+                message,
+                operation_key,
+                extra={"delivery": row.delivery_id, "key": key, "operation_key": operation_key, "succeeded": succeeded},
+            )
+            return
+        body = self._failure_comment_body(row, error)
+        try:
+            comment = await self.github.post_comment(repo, number, body)
+        except Exception as exc:
+            self.db.mark_side_effect_failed(operation_key, str(exc))
+            self.db.log_tool_call(
+                issue_key=key,
+                tool=operation_key,
+                args={"repo": repo, "pr": number, "delivery_id": row.delivery_id},
+                error=str(exc),
+            )
+            log.warning(
+                "failure comment failed",
+                extra={"delivery": row.delivery_id, "key": key, "err": str(exc)},
+            )
+            return
+        self.db.mark_side_effect_succeeded(operation_key)
+        self.db.log_tool_call(
+            issue_key=key,
+            tool=operation_key,
+            args={"repo": repo, "pr": number, "delivery_id": row.delivery_id},
+            result={"comment_id": getattr(comment, "id", None)},
+        )
 
     async def cancel_event(self, delivery_id: str) -> bool:
         """Request cancellation of a running event. Returns whether a hook fired.
@@ -299,10 +411,25 @@ class WorkerPool:
             elif row.delivery_id in self._cancelled:
                 log.info("event cancelled", extra={"delivery": row.delivery_id})
                 self.db.mark_event(row.delivery_id, "failed", error="cancelled by operator")
+            elif _is_retryable_pr_workspace_error(row, str(exc)):
+                message = f"retrying workspace preparation after transient git failure: {exc}"
+                self.db.requeue_event(row.delivery_id, from_states=("running",), error=message)
+                self._requeue_later(row.delivery_id, PR_WORKSPACE_RETRY_DELAY_SECONDS)
+                log.warning(
+                    "event handler retry scheduled",
+                    extra={
+                        "delivery": row.delivery_id,
+                        "key": row.issue_key,
+                        "attempts": row.attempts,
+                        "delay": PR_WORKSPACE_RETRY_DELAY_SECONDS,
+                    },
+                )
             else:
                 tb = traceback.format_exc(limit=20)
+                error = f"{exc}\n{tb}"
                 log.exception("event handler failed", extra={"delivery": row.delivery_id})
-                self.db.mark_event(row.delivery_id, "failed", error=f"{exc}\n{tb}")
+                self.db.mark_event(row.delivery_id, "failed", error=error)
+                await self._post_failure_comment(row, str(exc))
         finally:
             self._cancelled.discard(row.delivery_id)
             self._shutdown_cancelled.discard(row.delivery_id)
@@ -316,108 +443,177 @@ class WorkerPool:
             clear_current_event(token)
 
     async def _dispatch_and_mark(self, row: EventRow, *, slot_uid: int | None = None) -> None:
-        await self._dispatch(row, slot_uid=slot_uid)
+        try:
+            outcome = await self._dispatch(row, slot_uid=slot_uid)
+        except TaskControl as control:
+            outcome = control.outcome
+        if outcome is None:
+            outcome = TaskOutcome("done")
         if row.delivery_id in self._cancelled:
             self.db.mark_event(row.delivery_id, "failed", error="cancelled by operator")
-        else:
+            return
+        if outcome.state == "done":
             self.db.mark_event(row.delivery_id, "done")
+        elif outcome.state == "skipped":
+            self.db.mark_event(row.delivery_id, "skipped", error=outcome.reason)
+        elif outcome.state == "failed":
+            error = outcome.reason or "task failed"
+            self.db.mark_event(row.delivery_id, "failed", error=error)
+            await self._post_failure_comment(row, error)
+        elif outcome.state == "queued":
+            error = outcome.reason or "task retry queued"
+            if row.attempts >= MAX_TRANSIENT_TASK_ATTEMPTS:
+                self.db.mark_event(row.delivery_id, "failed", error=error)
+                await self._post_failure_comment(row, error)
+                return
+            self.db.requeue_event(row.delivery_id, from_states=("running",), error=error)
+            delay = outcome.retry_delay_seconds
+            if delay is None:
+                delay = DEFAULT_TASK_RETRY_DELAY_SECONDS
+            self._requeue_later(row.delivery_id, delay)
+            log.warning(
+                "event handler retry scheduled",
+                extra={
+                    "delivery": row.delivery_id,
+                    "key": row.issue_key,
+                    "attempts": row.attempts,
+                    "delay": delay,
+                },
+            )
 
-    async def _dispatch(self, row: EventRow, *, slot_uid: int | None = None) -> None:
+    @staticmethod
+    def _legacy_task_from_event(row: EventRow) -> str | None:
         event = row.event_type
         action = str(row.payload.get("action") or "")
+        if event == "issues" and action == "labeled":
+            issue = row.payload.get("issue")
+            if isinstance(issue, Mapping) and "pull_request" in issue:
+                return "review_pr"
+        if event == "issues" and action == "opened":
+            return "triage_issue"
+        if event == "issue_comment" and action == "created":
+            issue = row.payload.get("issue") or {}
+            return "handle_pr_conversation" if "pull_request" in issue else "handle_comment"
+        if event == "pull_request" and action in ("opened", "reopened", "ready_for_review", "labeled", "synchronize"):
+            return "review_pr"
+        if event == "pull_request_review_comment" and action == "created":
+            return "handle_review"
+        if (event == "issues" or event == "pull_request") and action == "closed":
+            return "cleanup_workspace"
+        return None
+
+    async def _run_review_pr(self, row: EventRow, slot_uid: int | None) -> TaskOutcome | None:
+        return await tasks.review_pr(
+            settings=self.settings,
+            db=self.db,
+            github=self.github,
+            sandbox=self.sandbox,
+            git_transport=self.git_transport,
+            payload=row.payload,
+            delivery_id=row.delivery_id,
+            attempts=row.attempts,
+            slot_uid=slot_uid,
+        )
+
+    async def _run_triage_issue(self, row: EventRow, slot_uid: int | None) -> TaskOutcome | None:
+        return await tasks.triage_issue(
+            settings=self.settings,
+            db=self.db,
+            github=self.github,
+            sandbox=self.sandbox,
+            git_transport=self.git_transport,
+            payload=row.payload,
+            delivery_id=row.delivery_id,
+            attempts=row.attempts,
+            slot_uid=slot_uid,
+        )
+
+    async def _run_handle_pr_conversation(self, row: EventRow, slot_uid: int | None) -> TaskOutcome | None:
+        return await tasks.handle_pr_conversation(
+            settings=self.settings,
+            db=self.db,
+            github=self.github,
+            sandbox=self.sandbox,
+            git_transport=self.git_transport,
+            payload=row.payload,
+            delivery_id=row.delivery_id,
+            attempts=row.attempts,
+            slot_uid=slot_uid,
+        )
+
+    async def _run_handle_comment(self, row: EventRow, slot_uid: int | None) -> TaskOutcome | None:
+        return await tasks.handle_comment(
+            settings=self.settings,
+            db=self.db,
+            github=self.github,
+            sandbox=self.sandbox,
+            git_transport=self.git_transport,
+            payload=row.payload,
+            delivery_id=row.delivery_id,
+            attempts=row.attempts,
+            slot_uid=slot_uid,
+        )
+
+    async def _run_handle_review(self, row: EventRow, slot_uid: int | None) -> TaskOutcome | None:
+        return await tasks.handle_review(
+            settings=self.settings,
+            db=self.db,
+            github=self.github,
+            sandbox=self.sandbox,
+            git_transport=self.git_transport,
+            payload=row.payload,
+            delivery_id=row.delivery_id,
+            attempts=row.attempts,
+            slot_uid=slot_uid,
+        )
+
+    async def _run_cleanup_workspace(self, row: EventRow, slot_uid: int | None) -> TaskOutcome | None:
+        event = row.event_type
+        action = str(row.payload.get("action") or "")
+        if event == "issues" and action == "closed":
+            target_state = "closed"
+        elif event == "pull_request" and action == "closed":
+            pr = row.payload.get("pull_request") or {}
+            target_state = "merged" if bool(pr.get("merged")) else "closed"
+        else:
+            return TaskOutcome("skipped", "unsupported event/task")
+        return await tasks.cleanup_workspace(
+            settings=self.settings,
+            db=self.db,
+            sandbox=self.sandbox,
+            payload=row.payload,
+            target_state=target_state,
+        )
+
+    async def _dispatch(self, row: EventRow, *, slot_uid: int | None = None) -> TaskOutcome | None:
+        event = row.event_type
+        action = str(row.payload.get("action") or "")
+        task_name = row.task or self._legacy_task_from_event(row)
         log.info(
             "dispatch",
             extra={
                 "event": event,
                 "action": action,
+                "task": task_name,
                 "delivery": row.delivery_id,
                 "key": row.issue_key,
                 "attempts": row.attempts,
                 "recovered": row.attempts >= 2,
             },
         )
-        if event == "issues" and action == "opened":
-            await tasks.triage_issue(
-                settings=self.settings,
-                db=self.db,
-                github=self.github,
-                sandbox=self.sandbox,
-                git_transport=self.git_transport,
-                payload=row.payload,
-                delivery_id=row.delivery_id,
-                attempts=row.attempts,
-                slot_uid=slot_uid,
-            )
-        elif event == "issue_comment" and action == "created":
-            issue = row.payload.get("issue") or {}
-            if "pull_request" in issue:
-                await tasks.handle_pr_conversation(
-                    settings=self.settings,
-                    db=self.db,
-                    github=self.github,
-                    sandbox=self.sandbox,
-                    git_transport=self.git_transport,
-                    payload=row.payload,
-                    delivery_id=row.delivery_id,
-                    attempts=row.attempts,
-                    slot_uid=slot_uid,
-                )
-            else:
-                await tasks.handle_comment(
-                    settings=self.settings,
-                    db=self.db,
-                    github=self.github,
-                    sandbox=self.sandbox,
-                    git_transport=self.git_transport,
-                    payload=row.payload,
-                    delivery_id=row.delivery_id,
-                    attempts=row.attempts,
-                    slot_uid=slot_uid,
-                )
-        elif event == "pull_request" and action in ("opened", "reopened", "ready_for_review"):
-            await tasks.review_pr(
-                settings=self.settings,
-                db=self.db,
-                github=self.github,
-                sandbox=self.sandbox,
-                git_transport=self.git_transport,
-                payload=row.payload,
-                delivery_id=row.delivery_id,
-                attempts=row.attempts,
-                slot_uid=slot_uid,
-            )
-        elif event == "pull_request_review_comment" and action == "created":
-            await tasks.handle_review(
-                settings=self.settings,
-                db=self.db,
-                github=self.github,
-                sandbox=self.sandbox,
-                git_transport=self.git_transport,
-                payload=row.payload,
-                delivery_id=row.delivery_id,
-                attempts=row.attempts,
-                slot_uid=slot_uid,
-            )
-        elif event == "issues" and action == "closed":
-            await tasks.cleanup_workspace(
-                settings=self.settings,
-                db=self.db,
-                sandbox=self.sandbox,
-                payload=row.payload,
-                target_state="closed",
-            )
-        elif event == "pull_request" and action == "closed":
-            pr = row.payload.get("pull_request") or {}
-            target_state = "merged" if bool(pr.get("merged")) else "closed"
-            await tasks.cleanup_workspace(
-                settings=self.settings,
-                db=self.db,
-                sandbox=self.sandbox,
-                payload=row.payload,
-                target_state=target_state,
-            )
-        else:
-            log.info("no-op dispatch", extra={"event": event, "action": action})
+        task_registry: Mapping[str, _TaskHandler] = {
+            "review_pr": self._run_review_pr,
+            "triage_issue": self._run_triage_issue,
+            "handle_pr_conversation": self._run_handle_pr_conversation,
+            "handle_comment": self._run_handle_comment,
+            "handle_review": self._run_handle_review,
+            "cleanup_workspace": self._run_cleanup_workspace,
+        }
+        handler = task_registry.get(task_name) if task_name is not None else None
+        if handler is None:
+            log.info("unsupported dispatch", extra={"event": event, "action": action, "task": task_name})
+            return TaskOutcome("skipped", "unsupported event/task")
+        return await handler(row, slot_uid)
 
 
 __all__ = ["WorkerPool"]

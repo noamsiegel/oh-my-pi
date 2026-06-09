@@ -74,6 +74,11 @@ comment out `ROBOMP_GH_PROXY_URL` / `ROBOMP_GH_PROXY_HMAC_KEY` and set
 `GITHUB_TOKEN`. The two modes are mutually exclusive (`config.py`
 rejects a `.env` setting both).
 
+Self-improvement runs are optional. If `ROBOMP_PR_REVIEW_SELF_IMPROVE_ENABLED`
+is true and a run produces a change to push, the orchestrator also needs
+`ROBOMP_PR_REVIEW_SELF_IMPROVE_PUSH_TOKEN`; leave it empty when self-improve
+is disabled.
+
 Build invalidation is bounded: editing roboomp Python touches only the
 runtime layer; editing pi source rebuilds `oh-my-pi/pi:dev`, which
 roboomp's `Dockerfile.robomp` extends via `FROM ${PI_BASE}`.

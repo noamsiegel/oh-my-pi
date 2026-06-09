@@ -9,7 +9,7 @@ import sys
 import click
 import uvicorn
 
-from robomp.config import Settings, get_settings
+from robomp.config import OrchestratorSettings, get_settings
 from robomp.db import INACTIVE_EVENT_STATES, get_database
 from robomp.logging_config import configure_logging
 from robomp.manual_triage import (
@@ -25,7 +25,7 @@ from robomp.sandbox import SandboxManager
 from robomp.server import create_app
 
 
-def _settings_or_die() -> Settings:
+def _settings_or_die() -> OrchestratorSettings:
     try:
         return get_settings()
     except Exception as exc:
@@ -33,26 +33,21 @@ def _settings_or_die() -> Settings:
         sys.exit(2)
 
 
-def _require_proxy_mode(cfg: Settings) -> tuple[str, bytes]:
+def _require_proxy_mode(cfg: OrchestratorSettings) -> tuple[str, bytes]:
     if cfg.github_token is not None:
         raise SystemExit(
             "robomp orchestrator refuses to start with GITHUB_TOKEN set in env. "
             "The PAT must live only in the gh-proxy container."
         )
-    if cfg.gh_proxy_url is None or cfg.gh_proxy_hmac_key is None:
-        raise SystemExit(
-            "robomp orchestrator requires ROBOMP_GH_PROXY_URL and "
-            "ROBOMP_GH_PROXY_HMAC_KEY (run gh-proxy in a sibling container)."
-        )
     return cfg.gh_proxy_url, cfg.gh_proxy_hmac_key.get_secret_value().encode("utf-8")
 
 
-def _build_github(cfg: Settings) -> GitHubProxyClient:
+def _build_github(cfg: OrchestratorSettings) -> GitHubProxyClient:
     base_url, key = _require_proxy_mode(cfg)
     return GitHubProxyClient(base_url=base_url, hmac_key=key)
 
 
-def _default_wait_timeout(cfg: Settings) -> float:
+def _default_wait_timeout(cfg: OrchestratorSettings) -> float:
     return cfg.task_timeout_seconds + cfg.task_timeout_hard_grace_seconds + 30.0
 
 

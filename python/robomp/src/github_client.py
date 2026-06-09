@@ -5,10 +5,26 @@ from __future__ import annotations
 import logging
 import time
 from collections.abc import Mapping
-from dataclasses import dataclass
 from typing import Any
 
 import httpx
+
+from robomp.github_payloads import issue_from_payload as _issue_from_payload
+from robomp.github_payloads import repo_from_payload as _repo_from_payload
+from robomp.github_types import (
+    CommentInfo,
+    GitHubError,
+    IssueInfo,
+    IssueSummary,
+    PullRequestCommitAuthorInfo,
+    PullRequestCommitInfo,
+    PullRequestFileInfo,
+    PullRequestInfo,
+    PullRequestReviewInfo,
+    ReactionInfo,
+    RepoInfo,
+    ReviewCommentInfo,
+)
 
 log = logging.getLogger(__name__)
 
@@ -16,118 +32,6 @@ GITHUB_API = "https://api.github.com"
 ACCEPT = "application/vnd.github+json"
 API_VERSION = "2022-11-28"
 
-
-class GitHubError(RuntimeError):
-    """Raised on non-2xx responses from GitHub."""
-
-    def __init__(self, status: int, message: str, *, retry_after: float | None = None) -> None:
-        super().__init__(f"GitHub {status}: {message}")
-        self.status = status
-        self.message = message
-        self.retry_after = retry_after
-
-
-@dataclass(slots=True, frozen=True)
-class IssueInfo:
-    repo: str
-    number: int
-    title: str
-    body: str
-    state: str
-    author: str
-    labels: tuple[str, ...]
-    is_pull_request: bool
-
-
-@dataclass(slots=True, frozen=True)
-class CommentInfo:
-    id: int
-    author: str
-    body: str
-    created_at: str
-
-
-@dataclass(slots=True, frozen=True)
-class RepoInfo:
-    full_name: str
-    default_branch: str
-    clone_url: str
-    private: bool
-
-
-@dataclass(slots=True, frozen=True)
-class PullRequestInfo:
-    repo: str
-    number: int
-    html_url: str
-    head_ref: str
-    base_ref: str
-    state: str
-    author: str = ""
-    head_repo: str = ""
-    title: str = ""
-    body: str = ""
-
-
-@dataclass(slots=True, frozen=True)
-class PullRequestFileInfo:
-    path: str
-    status: str
-    additions: int
-    deletions: int
-
-
-@dataclass(slots=True, frozen=True)
-class ReviewCommentInfo:
-    """In-line PR review comment (attached to a file/line)."""
-
-    id: int
-    author: str
-    body: str
-    path: str
-    line: int | None
-    created_at: str
-
-
-@dataclass(slots=True, frozen=True)
-class PullRequestReviewInfo:
-    """Top-level PR review (the summary block, not the inline comments)."""
-
-    id: int
-    author: str
-    body: str
-    state: str  # APPROVED / CHANGES_REQUESTED / COMMENTED
-    submitted_at: str
-
-
-@dataclass(slots=True, frozen=True)
-class IssueSummary:
-    """Lightweight projection of an issue for list views (no body)."""
-
-    repo: str
-    number: int
-    title: str
-    state: str
-    author: str
-    labels: tuple[str, ...]
-    comments: int
-    updated_at: str
-    created_at: str
-    html_url: str
-
-
-@dataclass(slots=True, frozen=True)
-class ReactionInfo:
-    """A reaction on an issue/comment.
-
-    `content` is GitHub's reaction string: `+1`, `-1`, `laugh`, `hooray`,
-    `confused`, `heart`, `rocket`, `eyes`. The auto-close scheduler only
-    looks at `-1` (👎) reactions from the issue's original author.
-    """
-
-    content: str
-    user_login: str
-    user_type: str
 
 
 def _parse_retry_after(resp: httpx.Response) -> float | None:
@@ -158,6 +62,7 @@ class GitHubClient:
             "User-Agent": "robomp/0.1",
         }
         self._transport = transport
+        self._async_client_instance: httpx.AsyncClient | None = None
 
     def _client(self) -> httpx.Client:
         return httpx.Client(
@@ -169,13 +74,27 @@ class GitHubClient:
         )
 
     def _async_client(self) -> httpx.AsyncClient:
-        return httpx.AsyncClient(
-            base_url=GITHUB_API,
-            headers=self._headers,
-            transport=self._transport,  # type: ignore[arg-type]
-            timeout=httpx.Timeout(30.0, connect=10.0),
-            follow_redirects=True,
-        )
+        if self._async_client_instance is None:
+            self._async_client_instance = httpx.AsyncClient(
+                base_url=GITHUB_API,
+                headers=self._headers,
+                transport=self._transport,  # type: ignore[arg-type]
+                timeout=httpx.Timeout(30.0, connect=10.0),
+                follow_redirects=True,
+            )
+        return self._async_client_instance
+
+    async def aclose(self) -> None:
+        if self._async_client_instance is not None:
+            await self._async_client_instance.aclose()
+            self._async_client_instance = None
+
+    async def __aenter__(self) -> GitHubClient:
+        self._async_client()
+        return self
+
+    async def __aexit__(self, exc_type: object, exc: object, tb: object) -> None:
+        await self.aclose()
 
     # ---- request helpers ----
     def _check(self, resp: httpx.Response) -> Any:
@@ -209,9 +128,22 @@ class GitHubClient:
     async def request(
         self, method: str, path: str, *, json: Mapping[str, Any] | None = None, params: Mapping[str, Any] | None = None
     ) -> Any:
-        async with self._async_client() as client:
-            resp = await client.request(method, path, json=json, params=params)
-            return self._check(resp)
+        resp = await self._async_client().request(method, path, json=json, params=params)
+        return self._check(resp)
+
+    async def _paginate(self, path: str, params: Mapping[str, Any] | None = None) -> list[Any]:
+        items: list[Any] = []
+        page = 1
+        while True:
+            page_params = dict(params or {})
+            page_params["per_page"] = 100
+            page_params["page"] = page
+            data = await self.request("GET", path, params=page_params)
+            batch = list(data or [])
+            items.extend(batch)
+            if len(batch) < 100:
+                return items
+            page += 1
 
     # ---- repos / issues / comments / PRs ----
     async def get_repo(self, repo: str) -> RepoInfo:
@@ -265,19 +197,12 @@ class GitHubClient:
         return _pr_from_payload(repo, data)
 
     async def list_pr_files(self, repo: str, pr_number: int) -> list[PullRequestFileInfo]:
-        files: list[PullRequestFileInfo] = []
-        page = 1
-        while True:
-            data = await self.request(
-                "GET",
-                f"/repos/{repo}/pulls/{pr_number}/files",
-                params={"per_page": 100, "page": page},
-            )
-            batch = [_pr_file_from_payload(item) for item in (data or [])]
-            files.extend(batch)
-            if len(batch) < 100:
-                return files
-            page += 1
+        data = await self._paginate(f"/repos/{repo}/pulls/{pr_number}/files")
+        return [_pr_file_from_payload(item) for item in data]
+
+    async def list_pr_commits(self, repo: str, pr_number: int) -> list[PullRequestCommitInfo]:
+        data = await self._paginate(f"/repos/{repo}/pulls/{pr_number}/commits")
+        return [_pr_commit_from_payload(item) for item in data]
 
     async def list_issues(
         self,
@@ -323,58 +248,37 @@ class GitHubClient:
         return out
 
     async def list_comments(self, repo: str, number: int) -> list[CommentInfo]:
-        data = await self.request("GET", f"/repos/{repo}/issues/{number}/comments", params={"per_page": 100})
-        return [_comment_from_payload(item) for item in (data or [])]
+        data = await self._paginate(f"/repos/{repo}/issues/{number}/comments")
+        return [_comment_from_payload(item) for item in data]
 
     async def list_review_comments(self, repo: str, pr_number: int) -> list[ReviewCommentInfo]:
         """List inline review comments on a PR (the ones attached to a path:line)."""
+        data = await self._paginate(f"/repos/{repo}/pulls/{pr_number}/comments")
+        return [_review_comment_from_payload(item) for item in data]
+
+    async def list_review_comments_for_review(
+        self,
+        repo: str,
+        pr_number: int,
+        review_id: int,
+    ) -> list[ReviewCommentInfo]:
         data = await self.request(
             "GET",
-            f"/repos/{repo}/pulls/{pr_number}/comments",
+            f"/repos/{repo}/pulls/{pr_number}/reviews/{review_id}/comments",
             params={"per_page": 100},
         )
-        out: list[ReviewCommentInfo] = []
-        for item in data or []:
-            user = item.get("user") or {}
-            line = item.get("line")
-            if not isinstance(line, int):
-                orig = item.get("original_line")
-                line = orig if isinstance(orig, int) else None
-            out.append(
-                ReviewCommentInfo(
-                    id=int(item.get("id") or 0),
-                    author=str(user.get("login") or ""),
-                    body=str(item.get("body") or ""),
-                    path=str(item.get("path") or ""),
-                    line=line,
-                    created_at=str(item.get("created_at") or ""),
-                )
-            )
-        return out
+        return [_review_comment_from_payload(item) for item in (data or [])]
 
     async def list_pr_reviews(self, repo: str, pr_number: int) -> list[PullRequestReviewInfo]:
         """List top-level reviews on a PR. Empty-body reviews are skipped — they
         carry no novel text beyond what the inline comments + merge state convey."""
-        data = await self.request(
-            "GET",
-            f"/repos/{repo}/pulls/{pr_number}/reviews",
-            params={"per_page": 100},
-        )
+        data = await self._paginate(f"/repos/{repo}/pulls/{pr_number}/reviews")
         out: list[PullRequestReviewInfo] = []
-        for item in data or []:
-            user = item.get("user") or {}
-            body = str(item.get("body") or "").strip()
-            if not body:
+        for item in data:
+            review = _pr_review_from_payload(item)
+            if not review.body:
                 continue
-            out.append(
-                PullRequestReviewInfo(
-                    id=int(item.get("id") or 0),
-                    author=str(user.get("login") or ""),
-                    body=body,
-                    state=str(item.get("state") or ""),
-                    submitted_at=str(item.get("submitted_at") or item.get("created_at") or ""),
-                )
-            )
+            out.append(review)
         return out
 
     async def post_comment(self, repo: str, number: int, body: str) -> CommentInfo:
@@ -498,29 +402,33 @@ class GitHubClient:
         return str(data["login"])
 
 
-def _repo_from_payload(data: Mapping[str, Any]) -> RepoInfo:
-    return RepoInfo(
-        full_name=str(data["full_name"]),
-        default_branch=str(data["default_branch"]),
-        clone_url=str(data["clone_url"]),
-        private=bool(data.get("private", False)),
-    )
-
-
-def _issue_from_payload(repo: str, data: Mapping[str, Any]) -> IssueInfo:
-    labels_raw = data.get("labels") or []
-    labels = tuple(str(lbl["name"]) if isinstance(lbl, dict) else str(lbl) for lbl in labels_raw)
-    user = data.get("user") or {}
-    return IssueInfo(
-        repo=repo,
-        number=int(data["number"]),
-        title=str(data.get("title") or ""),
-        body=str(data.get("body") or ""),
-        state=str(data.get("state") or "open"),
+def _review_comment_from_payload(item: Mapping[str, Any]) -> ReviewCommentInfo:
+    user = item.get("user") or {}
+    line = item.get("line")
+    if not isinstance(line, int):
+        orig = item.get("original_line")
+        line = orig if isinstance(orig, int) else None
+    start_line = item.get("start_line")
+    original_line = item.get("original_line")
+    review_id = item.get("pull_request_review_id")
+    in_reply_to_id = item.get("in_reply_to_id")
+    return ReviewCommentInfo(
+        id=int(item.get("id") or 0),
         author=str(user.get("login") or ""),
-        labels=labels,
-        is_pull_request="pull_request" in data,
+        body=str(item.get("body") or ""),
+        path=str(item.get("path") or ""),
+        line=line,
+        created_at=str(item.get("created_at") or ""),
+        start_line=start_line if isinstance(start_line, int) else None,
+        original_line=original_line if isinstance(original_line, int) else None,
+        html_url=str(item.get("html_url") or ""),
+        review_id=review_id if isinstance(review_id, int) else None,
+        commit_id=str(item.get("commit_id") or ""),
+        diff_hunk=str(item.get("diff_hunk") or ""),
+        in_reply_to_id=in_reply_to_id if isinstance(in_reply_to_id, int) else None,
     )
+
+
 
 
 def _pr_review_from_payload(data: Mapping[str, Any]) -> PullRequestReviewInfo:
@@ -532,6 +440,7 @@ def _pr_review_from_payload(data: Mapping[str, Any]) -> PullRequestReviewInfo:
         body=body,
         state=str(data.get("state") or ""),
         submitted_at=str(data.get("submitted_at") or data.get("created_at") or ""),
+        commit_id=str(data.get("commit_id") or ""),
     )
 
 
@@ -541,6 +450,47 @@ def _pr_file_from_payload(data: Mapping[str, Any]) -> PullRequestFileInfo:
         status=str(data.get("status") or ""),
         additions=int(data.get("additions") or 0),
         deletions=int(data.get("deletions") or 0),
+        previous_filename=str(data.get("previous_filename") or ""),
+    )
+
+
+def _pr_commit_from_payload(data: Mapping[str, Any]) -> PullRequestCommitInfo:
+    commit = data.get("commit") or {}
+    raw_message = commit.get("message") if isinstance(commit, Mapping) else None
+    message = str(raw_message or "")
+    headline, sep, body = message.partition("\n")
+    authors: list[PullRequestCommitAuthorInfo] = []
+    seen: set[tuple[str, str]] = set()
+
+    def add_author(login: Any = "", name: Any = "") -> None:
+        login_text = str(login or "")
+        name_text = str(name or "")
+        key = (login_text, name_text)
+        if not login_text and not name_text:
+            return
+        if key in seen:
+            return
+        seen.add(key)
+        authors.append(PullRequestCommitAuthorInfo(login=login_text, name=name_text))
+
+    author_user = data.get("author")
+    if isinstance(author_user, Mapping):
+        add_author(author_user.get("login"), "")
+    committer_user = data.get("committer")
+    if isinstance(committer_user, Mapping):
+        add_author(committer_user.get("login"), "")
+    commit_author = commit.get("author") if isinstance(commit, Mapping) else None
+    if isinstance(commit_author, Mapping):
+        add_author("", commit_author.get("name"))
+    commit_committer = commit.get("committer") if isinstance(commit, Mapping) else None
+    if isinstance(commit_committer, Mapping):
+        add_author("", commit_committer.get("name"))
+
+    return PullRequestCommitInfo(
+        sha=str(data.get("sha") or ""),
+        message_headline=headline,
+        message_body=body if sep else "",
+        authors=tuple(authors),
     )
 
 
@@ -556,7 +506,10 @@ def _pr_from_payload(repo: str, data: Mapping[str, Any]) -> PullRequestInfo:
         head_ref=str(head.get("ref") or "") if isinstance(head, Mapping) else "",
         base_ref=str(base.get("ref") or "") if isinstance(base, Mapping) else "",
         state=str(data.get("state") or "open"),
+        draft=bool(data.get("draft")),
+        head_sha=str(head.get("sha") or "") if isinstance(head, Mapping) else "",
         author=str(user.get("login") or "") if isinstance(user, Mapping) else "",
+        author_type=str(user.get("type") or "") if isinstance(user, Mapping) else "",
         head_repo=str(head_repo.get("full_name") or "") if isinstance(head_repo, Mapping) else "",
         title=str(data.get("title") or ""),
         body=str(data.get("body") or ""),
@@ -582,27 +535,10 @@ def _reaction_from_payload(data: Mapping[str, Any]) -> ReactionInfo:
     )
 
 
-def parse_issue_payload(payload: Mapping[str, Any]) -> tuple[RepoInfo, IssueInfo]:
-    """Build typed records from a webhook payload (issues.opened, etc.)."""
-    repo_payload = payload["repository"]
-    repo = _repo_from_payload(repo_payload)
-    issue = _issue_from_payload(repo.full_name, payload["issue"])
-    return repo, issue
 
 
 __all__ = [
     "ACCEPT",
     "API_VERSION",
-    "CommentInfo",
     "GitHubClient",
-    "GitHubError",
-    "IssueInfo",
-    "IssueSummary",
-    "PullRequestFileInfo",
-    "PullRequestInfo",
-    "PullRequestReviewInfo",
-    "ReactionInfo",
-    "RepoInfo",
-    "ReviewCommentInfo",
-    "parse_issue_payload",
 ]

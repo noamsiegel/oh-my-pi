@@ -14,19 +14,34 @@ import re
 import subprocess
 import time
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
+from hashlib import sha256
 from pathlib import Path
 from typing import Any, NoReturn
 
-from omp_rpc import HostTool, HostToolContext, RpcCommandError, host_tool
+from omp_rpc import HostTool, HostToolContext, RpcClient, RpcCommandError, host_tool
 
 from robomp import persona
 from robomp.config import Settings
 from robomp.db import Database, issue_key
 from robomp.git_ops import GitCommandError, HeadDriftError
 from robomp.github_backend import GitHubBackend
-from robomp.github_client import GitHubError, IssueInfo, PullRequestFileInfo, RepoInfo
+from robomp.github_types import (
+    GitHubError,
+    IssueInfo,
+    PullRequestFileInfo,
+    RepoInfo,
+)
+from robomp.pr_review_tools import (
+    load_json_checked,
+    pr_review_delegate_models,
+    pr_review_helper_path,
+    pr_review_model_family,
+    pr_review_parse_diff_anchors,
+    pr_review_paths,
+    run_pr_review_helper,
+)
 from robomp.sandbox import (
     GitTransport,
     Workspace,
@@ -43,12 +58,7 @@ from robomp.sandbox import (
 log = logging.getLogger(__name__)
 _PRE_PR_FIX_COMMAND = ("bun", "run", "fix")
 _PRE_PR_CHECK_COMMAND = ("bun", "check")
-_REPO_COMMAND_SCRUBBED_ENV_KEYS: tuple[str, ...] = (
-    "GITHUB_TOKEN",
-    "GITHUB_WEBHOOK_SECRET",
-    "ROBOMP_REPLAY_TOKEN",
-    "ROBOMP_GH_PROXY_HMAC_KEY",
-)
+_REPO_COMMAND_PARENT_ENV_KEYS: frozenset[str] = frozenset({"PATH", "LANG", "LC_ALL"})
 _AGENT_HOME = Path("/srv/agent-home")
 _PRE_PR_FIX_TIMEOUT_SECONDS = 600.0
 _PRE_PR_CHECK_TIMEOUT_SECONDS = 600.0
@@ -149,8 +159,48 @@ def _audit(
     )
 
 
+def _side_effect_payload_suffix(payload: Mapping[str, Any]) -> str:
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+    return sha256(encoded.encode("utf-8")).hexdigest()
+
+
 def _raise_command(message: str) -> NoReturn:
     raise RpcCommandError(message, error={"message": message})
+
+def _control_roots(bindings: ToolBindings) -> tuple[Path, ...]:
+    return (
+        bindings.workspace.session_dir,
+        bindings.workspace.context_dir,
+        bindings.workspace.root / "artifacts",
+    )
+
+
+def _ensure_control_target(bindings: ToolBindings, path: Path) -> None:
+    resolved_parent = path.parent.resolve(strict=True)
+    resolved_target = path.resolve(strict=False)
+    for root in _control_roots(bindings):
+        resolved_root = root.resolve(strict=False)
+        if resolved_parent != resolved_root and resolved_root not in resolved_parent.parents:
+            continue
+        if resolved_target != resolved_root and resolved_root not in resolved_target.parents:
+            continue
+        return
+    _raise_command(f"refusing to write outside workspace control dirs: {path}")
+
+
+def _write_control_file(bindings: ToolBindings, path: Path, text: str) -> None:
+    _ensure_control_target(bindings, path)
+    flags = os.O_CREAT | os.O_TRUNC | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    try:
+        fd = os.open(path, flags, 0o644)
+    except OSError as exc:
+        _raise_command(f"failed to write control file {path}: {exc}")
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(text)
+
+
+def _write_control_json(bindings: ToolBindings, path: Path, data: Any) -> None:
+    _write_control_file(bindings, path, json.dumps(data, indent=2))
 
 
 def _git_identity_env(author_name: str, author_email: str) -> dict[str, str]:
@@ -163,17 +213,21 @@ def _git_identity_env(author_name: str, author_email: str) -> dict[str, str]:
     }
 
 
-def _repo_command_env(bindings: ToolBindings) -> dict[str, str]:
+def _repo_command_env(bindings: ToolBindings, *, include_auth_broker: bool = False) -> dict[str, str]:
     """Environment for repo-owned commands (`bun`, formatter, local git).
 
-    These commands execute code from the checked-out repository, so they must
-    not inherit GitHub credentials from the orchestrator. They also need the
-    exact same HOME/XDG/TMP/Bun cache paths as the agent process; otherwise
-    host-side pre-publish gates validate a different machine than the agent saw.
+    Repo package scripts execute checked-out code, so they inherit only a small
+    locale/path allowlist plus deliberate workspace/git overlays. Auth-broker
+    variables are reserved for child agent sessions and must not reach package
+    scripts.
     """
-    env = os.environ.copy()
-    for key in _REPO_COMMAND_SCRUBBED_ENV_KEYS:
-        env[key] = ""
+    env: dict[str, str] = {
+        key: value
+        for key, value in os.environ.items()
+        if key in _REPO_COMMAND_PARENT_ENV_KEYS
+        or key.startswith("LC_")
+        or (include_auth_broker and key.startswith("OMP_AUTH_BROKER_"))
+    }
     if _AGENT_HOME.is_dir():
         env["HOME"] = str(_AGENT_HOME)
     env.update(_prepare_slot_runtime_env(bindings.workspace, bindings.slot_uid))
@@ -681,8 +735,6 @@ def _build_open_pr(bindings: ToolBindings) -> HostTool[Any, Any]:
                     f"PR body missing required section header {required!r}. "
                     "Follow the template in the system prompt verbatim."
                 )
-        # Auto-close keyword. GitHub closes the linked issue on merge only when
-        # one of `Fixes / Closes / Resolves #<n>` is present in the PR body.
         n = bindings.issue.number
         accepted = [f"{kw} #{n}" for kw in ("Fixes", "Closes", "Resolves", "fixes", "closes", "resolves")]
         if not any(form in body for form in accepted):
@@ -714,19 +766,17 @@ def _build_open_pr(bindings: ToolBindings) -> HostTool[Any, Any]:
             _raise_command(f"GitHub rejected PR: {exc.status} {exc.message}")
         bindings.db.set_issue_pr(bindings.issue_key, pr.number)
         bindings.db.set_issue_state(bindings.issue_key, "opened")
-        artifact = bindings.workspace.artifacts_dir / "pr.json"
-        artifact.write_text(
-            json.dumps(
-                {
-                    "repo": pr.repo,
-                    "number": pr.number,
-                    "url": pr.html_url,
-                    "head": pr.head_ref,
-                    "base": pr.base_ref,
-                },
-                indent=2,
-            ),
-            encoding="utf-8",
+        artifact = bindings.workspace.root / "artifacts" / "pr.json"
+        _write_control_json(
+            bindings,
+            artifact,
+            {
+                "repo": pr.repo,
+                "number": pr.number,
+                "url": pr.html_url,
+                "head": pr.head_ref,
+                "base": pr.base_ref,
+            },
         )
         _audit(bindings, "gh_open_pr", args, result={"pr_number": pr.number, "url": pr.html_url})
         return f"opened #{pr.number}: {pr.html_url}"
@@ -829,19 +879,17 @@ def _build_repro_record(bindings: ToolBindings) -> HostTool[Any, Any]:
         slug = "".join(c if c.isalnum() else "-" for c in title.lower()).strip("-")[:48] or "repro"
         ts = int(time.time())
         target = bindings.workspace.repro_dir / f"{ts}-{slug}.md"
-        target.write_text(
+        _write_control_file(
+            bindings,
+            target,
             f"# {title}\n\n"
             f"- exit_code: {exit_code}\n"
             f"- command:\n\n```\n{command}\n```\n\n"
             f"## Output\n\n```\n{output}\n```\n",
-            encoding="utf-8",
         )
-        # Single-ownership invariant: workspace files belong to the active
-        # slot. The orchestrator (root) wrote this file directly, so hand it
-        # over before the audit row lands so the agent can edit/delete it.
         if _slot_permissions_active(bindings.slot_uid):
             assert bindings.slot_uid is not None
-            os.chown(target, bindings.slot_uid, bindings.slot_uid)
+            os.chown(target, bindings.slot_uid, bindings.slot_uid, follow_symlinks=False)
         _audit(bindings, "repro_record", args, result={"path": str(target.relative_to(bindings.workspace.root))})
         return "recorded"
 
@@ -991,7 +1039,7 @@ _AUTO_PR_CLASSIFICATIONS = frozenset({"bug", "documentation"})
 _PRIORITIES = ("prio:p0", "prio:p1", "prio:p2", "prio:p3")
 _FUNCTIONAL = ("agent", "tool", "tui", "cli", "prompting", "sdk", "auth", "setup", "ux", "providers")
 _PLATFORMS = ("platform:linux", "platform:macos", "platform:windows", "platform:wsl")
-_PR_RANKS = ("review:p0", "review:p1", "review:p2", "review:p3")
+_PR_REVIEW_LABELS = ("review:clean", "review:minor", "review:maintainer-call", "review:deprioritized")
 _PR_TYPES = ("feat", "fix", "docs", "refactor", "perf", "test", "chore", "ci", "build")
 _CLOSING_ISSUE_RE = re.compile(r"\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+#(\d+)", re.IGNORECASE)
 
@@ -1004,6 +1052,13 @@ def _enforce_impl_authorization(
     action: str,
 ) -> None:
     """Refuse first publish on issue classes that require maintainer authorization."""
+    if bindings.settings is not None and bindings.settings.labels_comments_only:
+        msg = (
+            f"refusing to {action}: ROBOMP_LABELS_COMMENTS_ONLY is enabled; "
+            "phase-one deployment may apply labels and post comments only."
+        )
+        _audit(bindings, tool_name, args, error=msg)
+        _raise_command(msg)
     if bindings.impl_authorized:
         return
     row = bindings.db.get_issue(bindings.issue_key)
@@ -1077,12 +1132,727 @@ def _build_fetch_pr(bindings: ToolBindings) -> HostTool[Any, Any]:
     )
 
 
+def _pr_review_helper_path(bindings: ToolBindings) -> Path | None:
+    return pr_review_helper_path(bindings.settings)
+
+
+def _pr_review_unavailable(bindings: ToolBindings, name: str, args: Mapping[str, Any], reason: str) -> str:
+    _audit(bindings, name, args, result={"available": False, "reason": reason})
+    return "PR review helper unavailable; continue with prompt policy."
+
+_DELEGATE_DOMAIN_RE = re.compile(r"^[a-z0-9_-]{1,64}$")
+
+
+def _validate_delegate_domain(domain: str) -> str:
+    normalized = domain.strip().lower()
+    if not _DELEGATE_DOMAIN_RE.fullmatch(normalized):
+        raise ValueError("delegate_pr_review domain must match ^[a-z0-9_-]{1,64}$")
+    return normalized
+
+
+def _audit_pr_review_helper_error(bindings: ToolBindings, tool_name: str, args: Mapping[str, Any], exc: RpcCommandError) -> None:
+    error = getattr(exc, "error", None)
+    if isinstance(error, Mapping) and isinstance(error.get("output"), str):
+        _audit(bindings, tool_name, args, error=error["output"])
+    else:
+        _audit(bindings, tool_name, args, error=str(exc))
+
+
+def _pr_review_run_gate(bindings: ToolBindings, helper: Path, args: Mapping[str, Any]) -> dict[str, Any]:
+    paths = pr_review_paths(bindings.workspace)
+    classification_path = paths.classification
+    if not classification_path.is_file():
+        msg = "PR review delegation gate unavailable; run prepare_pr_review first."
+        _audit(bindings, "validate_pr_review", args, error=msg)
+        _raise_command(msg)
+    helper_args: list[str | Path] = [
+        "gate",
+        "--classification",
+        classification_path,
+        "--out",
+        paths.gate,
+    ]
+    if paths.metadata.is_file():
+        helper_args.extend(["--review-metadata", paths.metadata])
+    timeout = bindings.settings.request_timeout_seconds if bindings.settings is not None else None
+    try:
+        run_pr_review_helper(bindings, helper, helper_args, timeout, "PR review delegation gate failed")
+    except RpcCommandError as exc:
+        _audit_pr_review_helper_error(bindings, "validate_pr_review", args, exc)
+        raise
+    return load_json_checked(paths.gate)
+
+
+
+def _build_prepare_pr_review(bindings: ToolBindings) -> HostTool[Any, Any]:
+    def execute(args: dict[str, Any], _ctx: HostToolContext[Any]) -> str:
+        _require_review_mode(bindings, "prepare_pr_review", args)
+        helper = _pr_review_helper_path(bindings)
+        if helper is None:
+            return _pr_review_unavailable(bindings, "prepare_pr_review", args, "helper not configured")
+        pr_number = bindings.default_comment_number
+        repo_full = bindings.repo.full_name
+        try:
+            pr = _run_coro(bindings.loop, bindings.github.get_pull_request(repo_full, pr_number))
+            files = _run_coro(bindings.loop, bindings.github.list_pr_files(repo_full, pr_number))
+            reviews = _run_coro(bindings.loop, bindings.github.list_pr_reviews(repo_full, pr_number))
+            comments = _run_coro(bindings.loop, bindings.github.list_review_comments(repo_full, pr_number))
+        except GitHubError as exc:
+            _audit(bindings, "prepare_pr_review", args, error=str(exc))
+            _raise_command(f"PR review evidence GitHub fetch failed: {exc.status} {exc.message}")
+        try:
+            commits = _run_coro(bindings.loop, bindings.github.list_pr_commits(repo_full, pr_number))
+        except GitHubError as exc:
+            _audit(bindings, "prepare_pr_review", args, error=str(exc))
+            _raise_command(f"PR review evidence commit fetch failed: {exc.status} {exc.message}")
+
+        reviewer_login = ""
+        try:
+            reviewer_login = _run_coro(bindings.loop, bindings.github.get_authenticated_login(repo_full))  # type: ignore[call-arg]
+        except TypeError:
+            try:
+                reviewer_login = _run_coro(bindings.loop, bindings.github.get_authenticated_login())
+            except GitHubError as exc:
+                _audit(bindings, "prepare_pr_review", args, result={"warning": f"authenticated login fetch failed: {exc}"})
+        except GitHubError as exc:
+            _audit(bindings, "prepare_pr_review", args, result={"warning": f"authenticated login fetch failed: {exc}"})
+
+        pr_conversation_comments = []
+        try:
+            issue_comments = _run_coro(bindings.loop, bindings.github.list_comments(repo_full, pr_number))
+            pr_conversation_comments = [
+                {
+                    "id": comment.id,
+                    "body": comment.body,
+                    "created_at": comment.created_at,
+                    "user": {"login": comment.author},
+                }
+                for comment in issue_comments
+            ]
+        except GitHubError as exc:
+            _audit(bindings, "prepare_pr_review", args, result={"warning": f"conversation comments fetch failed: {exc}"})
+
+        timeout = bindings.settings.request_timeout_seconds if bindings.settings is not None else None
+        diff_proc = _run_repo_command(bindings, ("git", "diff", "--no-color", f"origin/{pr.base_ref}...HEAD"), timeout=timeout)
+        if diff_proc.returncode != 0:
+            output = _format_process_output(diff_proc.stdout, diff_proc.stderr)
+            _audit(bindings, "prepare_pr_review", args, error=output)
+            _raise_command(f"PR review evidence diff failed: {output}")
+
+        bot_login = getattr(bindings.settings, "bot_login", "") if bindings.settings is not None else ""
+        review_login = reviewer_login or bot_login
+        review_login_lower = review_login.lower()
+        reviewer_cr_reviews = [
+            review
+            for review in reviews
+            if review_login_lower
+            and review.author.lower() == review_login_lower
+            and review.state.upper() == "CHANGES_REQUESTED"
+        ]
+        latest_cr_review = max(reviewer_cr_reviews, key=lambda review: review.submitted_at) if reviewer_cr_reviews else None
+        verify_fixes = bool(latest_cr_review and latest_cr_review.commit_id and latest_cr_review.commit_id != pr.head_sha)
+        mode = "verify-fixes" if verify_fixes else "fresh"
+        delta_diff: str | None = None
+        delta_anchors: list[dict[str, Any]] | None = None
+        prior_review: dict[str, Any] | None = None
+        reviewer_prior_review_bodies: list[dict[str, Any]] = []
+        reviewer_prior_inline_comments_unioned: list[dict[str, Any]] | None = None
+
+        if latest_cr_review is not None and verify_fixes:
+            prior_sha = latest_cr_review.commit_id
+            delta_cmd: list[str] = ["git", "diff", "--no-color", f"{prior_sha}..HEAD"]
+            delta_proc = _run_repo_command(bindings, tuple(delta_cmd), timeout=timeout)
+            if delta_proc.returncode != 0:
+                output = _format_process_output(delta_proc.stdout, delta_proc.stderr)
+                _audit(bindings, "prepare_pr_review", args, error=output)
+                _raise_command(f"PR review helper verify-fixes delta diff failed: {output}")
+            delta_diff = delta_proc.stdout
+            delta_anchors = pr_review_parse_diff_anchors(delta_diff)
+            prior_review = {
+                "state": "CHANGES_REQUESTED",
+                "review_id": latest_cr_review.id,
+                "sha": latest_cr_review.commit_id,
+                "submitted_at": latest_cr_review.submitted_at,
+                "dismissed": False,
+                "is_latest_by_submitted_at": True,
+                "is_outdated": False,
+                "all_reviewer_cr_review_ids": [review.id for review in reviewer_cr_reviews],
+                "reviewer_inline_comment_count": sum(1 for comment in comments if comment.author.lower() == review_login_lower),
+                "reviewer_review_body_present": bool(latest_cr_review.body.strip()),
+            }
+            reviewer_prior_review_bodies = [
+                {
+                    "review_id": review.id,
+                    "state": review.state,
+                    "body": review.body,
+                    "sha": review.commit_id,
+                }
+                for review in reviewer_cr_reviews
+            ]
+            reviewer_prior_inline_comments_unioned = [
+                {
+                    "comment_id": comment.id,
+                    "path": comment.path,
+                    "line": comment.line,
+                    "start_line": comment.start_line,
+                    "original_line": comment.original_line,
+                    "body": comment.body,
+                    "html_url": comment.html_url,
+                    "is_outdated": False,
+                    "thread_is_resolved": False,
+                }
+                for comment in comments
+                if comment.author.lower() == review_login_lower
+            ]
+
+        paths = pr_review_paths(bindings.workspace)
+        evidence_path = paths.evidence
+        classification_path = paths.classification
+        prior_review_comments = [
+            {
+                "id": comment.id,
+                "path": comment.path,
+                "line": comment.line,
+                "start_line": comment.start_line,
+                "original_line": comment.original_line,
+                "body": comment.body,
+                "html_url": comment.html_url,
+                "user": {"login": comment.author},
+            }
+            for comment in comments
+        ]
+        prior_reviews = [
+            {
+                "id": review.id,
+                "body": review.body,
+                "state": review.state,
+                "submitted_at": review.submitted_at,
+                "user": {"login": review.author},
+                "commit_id": review.commit_id,
+            }
+            for review in reviews
+        ]
+        evidence = {
+            "repo": repo_full,
+            "pr": pr_number,
+            "diff": diff_proc.stdout,
+            "head_sha": pr.head_sha,
+            "anchors": pr_review_parse_diff_anchors(diff_proc.stdout),
+            "reviewer_login": reviewer_login,
+            "review_requested_by_reviewer": None,
+            "mode": mode,
+            "prior_review": prior_review,
+            "delta_diff": delta_diff,
+            "delta_anchors": delta_anchors,
+            "prior_review_comments": prior_review_comments,
+            "prior_reviews": prior_reviews,
+            "pr_conversation_comments": pr_conversation_comments,
+            "reviewer_prior_review_bodies": reviewer_prior_review_bodies,
+            "reviewer_prior_inline_comments_unioned": reviewer_prior_inline_comments_unioned,
+            "view": {
+                "number": pr_number,
+                "title": pr.title,
+                "body": pr.body,
+                "author": {"login": pr.author},
+                "baseRefName": pr.base_ref,
+                "headRefName": pr.head_ref,
+                "headRefOid": pr.head_sha,
+                "isDraft": pr.draft,
+                "additions": sum(file.additions for file in files),
+                "deletions": sum(file.deletions for file in files),
+                "changedFiles": len(files),
+                "files": [
+                    {
+                        "path": file.path,
+                        "status": file.status,
+                        "additions": file.additions,
+                        "deletions": file.deletions,
+                    }
+                    for file in files
+                ],
+                "commits": [
+                    {
+                        "oid": commit.sha,
+                        "authors": [{"login": author.login, "name": author.name} for author in commit.authors],
+                        "messageHeadline": commit.message_headline,
+                        "messageBody": commit.message_body,
+                    }
+                    for commit in commits
+                ],
+                "reviewDecision": None,
+            },
+        }
+        _write_control_json(bindings, evidence_path, evidence)
+        try:
+            run_pr_review_helper(
+                bindings,
+                helper,
+                ["classify", "--evidence", evidence_path, "--out", classification_path],
+                timeout,
+                "PR review evidence classify failed",
+            )
+        except RpcCommandError as exc:
+            _audit_pr_review_helper_error(bindings, "prepare_pr_review", args, exc)
+            raise
+        classification = load_json_checked(classification_path)
+        _audit(
+            bindings,
+            "prepare_pr_review",
+            args,
+            result={"available": True, "evidence": str(evidence_path), "classification": str(classification_path), "mode": mode},
+        )
+        return "\n".join(
+            [
+                "PR review helper review helper prepared.",
+                f"- evidence: `{evidence_path}`",
+                f"- classification: `{classification_path}`",
+                f"- mode: {mode}",
+                f"- risk_level: {classification.get('risk_level', '(unknown)')}",
+                f"- delegation_required: {classification.get('delegation_required', '(unknown)')}",
+                f"- domains_required: {classification.get('domains_required', [])}",
+                f"- reviewability.status: {(classification.get('reviewability') or {}).get('status', '(unknown)')}",
+                "- model_diversity.cross_family_review_recommended: "
+                f"{(classification.get('model_diversity') or {}).get('cross_family_review_recommended', '(unknown)')}",
+            ]
+        )
+
+    return host_tool(
+        name="prepare_pr_review",
+        description=persona.host_tool_description("prepare_pr_review"),
+        parameters={"type": "object", "properties": {}, "additionalProperties": False},
+        execute=execute,
+    )
+
+
+def _build_delegate_pr_review(bindings: ToolBindings) -> HostTool[Any, Any]:
+    def execute(args: dict[str, Any], _ctx: HostToolContext[Any]) -> str:
+        _require_review_mode(bindings, "delegate_pr_review", args)
+        helper = _pr_review_helper_path(bindings)
+        paths = pr_review_paths(bindings.workspace)
+        if helper is None or not paths.evidence.is_file() or not paths.classification.is_file():
+            _audit(bindings, "delegate_pr_review", args, result={"available": False})
+            return "PR review delegation unavailable; run prepare_pr_review first and continue only if policy permits."
+        classification = load_json_checked(paths.classification)
+        requested_domains = args.get("domains")
+        try:
+            if requested_domains is None:
+                domains = []
+                for domain in classification.get("domains_required", []):
+                    normalized = _validate_delegate_domain(str(domain))
+                    if normalized != "correctness" and normalized not in domains:
+                        domains.append(normalized)
+            elif isinstance(requested_domains, list):
+                domains = []
+                for domain in requested_domains:
+                    normalized = _validate_delegate_domain(str(domain))
+                    if normalized not in domains:
+                        domains.append(normalized)
+            else:
+                msg = "delegate_pr_review domains must be an array of strings."
+                _audit(bindings, "delegate_pr_review", args, error=msg)
+                _raise_command(msg)
+        except ValueError as exc:
+            msg = str(exc)
+            _audit(bindings, "delegate_pr_review", args, error=msg)
+            _raise_command(msg)
+
+        yield_suggestion: dict[str, Any] | None = None
+        if bindings.settings is not None and bindings.settings.pr_review_learning_db is not None:
+            suggest_path = bindings.workspace.session_dir / "pr-review-yield-suggest.json"
+            try:
+                run_pr_review_helper(
+                    bindings,
+                    helper,
+                    [
+                        "reviewer-yield-suggest",
+                        "--classification",
+                        paths.classification,
+                        "--evidence",
+                        paths.evidence,
+                        "--db",
+                        bindings.settings.pr_review_learning_db,
+                        "--out",
+                        suggest_path,
+                    ],
+                    bindings.settings.request_timeout_seconds if bindings.settings is not None else 120.0,
+                    "PR reviewer yield suggest failed",
+                )
+                if suggest_path.is_file():
+                    parsed = load_json_checked(suggest_path)
+                    if isinstance(parsed, dict) and parsed.get("status") == "ok":
+                        yield_suggestion = parsed
+            except Exception:
+                yield_suggestion = None
+        if yield_suggestion is not None and isinstance(yield_suggestion.get("extra_domains"), list):
+            for extra_domain in yield_suggestion["extra_domains"]:
+                try:
+                    domain = _validate_delegate_domain(str(extra_domain))
+                except ValueError as exc:
+                    msg = str(exc)
+                    _audit(bindings, "delegate_pr_review", args, error=msg)
+                    _raise_command(msg)
+                if domain not in domains:
+                    domains.append(domain)
+        if not domains:
+            _audit(bindings, "delegate_pr_review", args, result={"delegated": False, "reason": "no domains required"})
+            return "PR review delegation gate has no non-correctness domains to delegate."
+        timeout = min(bindings.settings.task_timeout_seconds, 900.0) if bindings.settings is not None else 600.0
+        request_timeout = bindings.settings.request_timeout_seconds if bindings.settings is not None else 120.0
+        metadata_path = paths.metadata
+        outputs: list[str] = []
+        completed: list[dict[str, Any]] = []
+        for domain in domains:
+            reviewer = str(args.get("reviewer") or f"{domain.title().replace('_', '')}Reviewer")
+            model_candidates = pr_review_delegate_models(bindings.settings, domain=domain, reviewer=reviewer)
+            if yield_suggestion is not None and isinstance(yield_suggestion.get("model_preferences"), list):
+                preferred_families = [
+                    str(pref.get("model_family") or "")
+                    for pref in yield_suggestion["model_preferences"]
+                    if isinstance(pref, dict) and str(pref.get("domain") or "") == domain
+                ]
+                if preferred_families and bindings.settings is not None:
+                    preferred_models = [
+                        model
+                        for family in preferred_families
+                        for model in bindings.settings.pr_review_delegate_models
+                        if pr_review_model_family(model) == family
+                    ]
+                    model_candidates = tuple(dict.fromkeys([*preferred_models, *model_candidates]))
+            result_path = bindings.workspace.session_dir / f"pai-pr-reviewer-{domain}.md"
+            ingest_path = bindings.workspace.session_dir / f"pai-pr-reviewer-{domain}-ingest.json"
+            packet_path = bindings.workspace.session_dir / f"pai-pr-reviewer-{domain}-packet.md"
+            try:
+                run_pr_review_helper(
+                    bindings,
+                    helper,
+                    [
+                        "packet",
+                        "--pr",
+                        str(bindings.default_comment_number),
+                        "--domain",
+                        domain,
+                        "--evidence",
+                        paths.evidence,
+                        "--classification",
+                        paths.classification,
+                        "--reviewer",
+                        reviewer,
+                        "--out",
+                        packet_path,
+                    ],
+                    request_timeout,
+                    "PR reviewer packet failed",
+                )
+            except RpcCommandError as exc:
+                _audit_pr_review_helper_error(bindings, "delegate_pr_review", args, exc)
+                raise
+            packet = packet_path.read_text(encoding="utf-8")
+            prompt = (
+                f"{packet}\n\n"
+                "You are a delegated PR reviewer for Robo-MS. Read only. Do not edit files, "
+                "do not post to GitHub, and do not run network commands. Inspect only the "
+                f"{domain!r} risk surface and changed code.\n"
+                "Return only YAML with top-level keys: overall, summary, model_family, findings.\n"
+                "Each finding must include severity, intent, path, line, body, and evidence. "
+                "Include suggestion.kind=github_suggestion plus suggestion.replacement only when "
+                "you can provide an exact contiguous GitHub suggested-change replacement; "
+                "otherwise leave suggestion out and use prose.\n"
+            )
+            text = ""
+            selected_model: str | None = None
+            selected_model_label = "(default)"
+            succeeded = False
+            selected_family = "other"
+            failures: list[dict[str, str]] = []
+            for candidate_model in model_candidates:
+                candidate_label = candidate_model or "(default)"
+                try:
+                    with RpcClient(
+                        executable=bindings.settings.omp_command if bindings.settings is not None else "omp",
+                        cwd=bindings.workspace.repo_dir,
+                        session_dir=bindings.workspace.session_dir / f"delegated-{domain}",
+                        env=_repo_command_env(bindings, include_auth_broker=True),
+                        no_session=True,
+                        no_skills=True,
+                        no_rules=True,
+                        no_title=True,
+                        model=candidate_model,
+                        provider=None,
+                        thinking="low",
+                        tools=("read", "search"),
+                        startup_timeout=60.0,
+                        request_timeout=request_timeout,
+                        user=bindings.slot_uid,
+                        group=bindings.slot_uid if bindings.slot_uid is not None else None,
+                        extra_groups=["omp"] if bindings.slot_uid is not None else None,
+                    ) as client:
+                        turn = client.prompt_and_wait(prompt, timeout=timeout)
+                        text = turn.require_assistant_text()
+                    _write_control_file(bindings, result_path, text)
+                    selected_family = pr_review_model_family(candidate_model) or "other"
+                    try:
+                        run_pr_review_helper(
+                            bindings,
+                            helper,
+                            [
+                                "reviewer-ingest",
+                                "--pr",
+                                str(bindings.default_comment_number),
+                                "--reviewer",
+                                reviewer,
+                                "--domains",
+                                domain,
+                                "--yaml-file",
+                                result_path,
+                                "--metadata",
+                                metadata_path,
+                                "--result-path",
+                                result_path,
+                                "--model-family",
+                                selected_family,
+                                "--out",
+                                ingest_path,
+                            ],
+                            request_timeout,
+                            "PR reviewer ingest failed",
+                        )
+                    except RpcCommandError as exc:
+                        error = getattr(exc, "error", None)
+                        output = error.get("output") if isinstance(error, Mapping) else None
+                        failures.append({"model": candidate_label, "error": output if isinstance(output, str) else str(exc)})
+                        continue
+                    selected_model = candidate_model
+                    selected_model_label = candidate_label
+                    succeeded = True
+                    break
+                except Exception as exc:
+                    failures.append({"model": candidate_label, "error": str(exc)})
+
+            if not succeeded and text == "":
+                reason = "; ".join(f"{failure['model']}: {failure['error']}" for failure in failures) or "no delegate models configured"
+                _write_control_file(bindings, result_path, f"overall: failed\nsummary: {reason}\nmodel_family: other\nfindings: []\n")
+            elif not succeeded:
+                reason = "; ".join(f"{failure['model']}: {failure['error']}" for failure in failures) or "reviewer-ingest failed"
+            else:
+                reason = ""
+
+            if not succeeded:
+                try:
+                    run_pr_review_helper(
+                        bindings,
+                        helper,
+                        [
+                            "metadata-add",
+                            "--pr",
+                            str(bindings.default_comment_number),
+                            "--reviewer",
+                            reviewer,
+                            "--domains",
+                            domain,
+                            "--metadata",
+                            metadata_path,
+                            "--result-path",
+                            result_path,
+                            "--completed",
+                            "false",
+                            "--reason",
+                            reason,
+                        ],
+                        request_timeout,
+                        "metadata-add failed",
+                    )
+                except RpcCommandError as exc:
+                    error = getattr(exc, "error", None)
+                    output = error.get("message") if isinstance(error, Mapping) else None
+                    reason = f"{reason}; {output if isinstance(output, str) else str(exc)}"
+                _audit(bindings, "delegate_pr_review", args, error=reason)
+                _raise_command(f"PR review delegationer {reviewer} failed: {reason}")
+
+            metadata = load_json_checked(metadata_path) if metadata_path.is_file() else {}
+            reviewers = metadata.setdefault("delegated_reviewers", [])
+            entry: dict[str, Any] = {
+                "id": reviewer,
+                "domains_covered": [domain],
+                "completed": True,
+                "result_path": str(result_path),
+                "model": selected_model,
+                "model_family": selected_family,
+            }
+            if isinstance(reviewers, list):
+                for candidate in reversed(reviewers):
+                    if isinstance(candidate, dict) and candidate.get("id") == reviewer and domain in candidate.get("domains_covered", []):
+                        entry = candidate
+                        break
+                if failures:
+                    entry["model_attempts"] = {"selected": selected_model_label, "failures": failures}
+                _write_control_json(bindings, metadata_path, metadata)
+            completed.append(entry)
+            failure_lines = [f"- fallback failure: {failure['model']}: {failure['error']}" for failure in failures]
+            header = f"## {reviewer} ({domain}; model={selected_model_label}; family={selected_family})"
+            outputs.append("\n".join([header, *failure_lines, "", text.strip()]))
+        _audit(
+            bindings,
+            "delegate_pr_review",
+            args,
+            result={
+                "metadata": str(metadata_path),
+                "delegated_reviewers": completed,
+                "yield_suggestion_available": yield_suggestion is not None,
+            },
+        )
+        tuning_line = (
+            "PR review yield tuning: unavailable"
+            if yield_suggestion is None
+            else f"PR review yield tuning: extra_domains={yield_suggestion.get('extra_domains', [])}, model_preferences={yield_suggestion.get('model_preferences', [])}"
+        )
+        return "\n\n".join([f"PR review delegation metadata: `{metadata_path}`", tuning_line, *outputs])
+
+    return host_tool(
+        name="delegate_pr_review",
+        description=persona.host_tool_description("delegate_pr_review"),
+        parameters={
+            "type": "object",
+            "properties": {
+                "domains": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional domains to delegate. Defaults to required non-correctness domains.",
+                },
+                "reviewer": {"type": "string", "description": "Optional reviewer id override for a single-domain run."},
+            },
+            "additionalProperties": False,
+        },
+        execute=execute,
+    )
+
+
+def _build_validate_pr_review(bindings: ToolBindings) -> HostTool[Any, Any]:
+    def execute(args: dict[str, Any], _ctx: HostToolContext[Any]) -> str:
+        _require_review_mode(bindings, "validate_pr_review", args)
+        helper = _pr_review_helper_path(bindings)
+        paths = pr_review_paths(bindings.workspace)
+        evidence_path = paths.evidence
+        if helper is None or not evidence_path.is_file():
+            _audit(bindings, "validate_pr_review", args, result={"available": False})
+            return "PR review validation unavailable; manually ensure anchors are in the PR diff and not duplicates."
+        findings = args.get("findings")
+        if not isinstance(findings, list):
+            msg = "validate_pr_review requires a findings array."
+            _audit(bindings, "validate_pr_review", args, error=msg)
+            _raise_command(msg)
+        findings_path = paths.findings
+        validated_path = paths.validated
+        verify_status_path = paths.verify_status
+        gate = _pr_review_run_gate(bindings, helper, args)
+        _write_control_json(bindings, findings_path, {"findings": findings})
+        timeout = bindings.settings.request_timeout_seconds if bindings.settings is not None else None
+        try:
+            run_pr_review_helper(
+                bindings,
+                helper,
+                ["verify-status", "--evidence", evidence_path, "--out", verify_status_path],
+                timeout,
+                "PR review helper verify-status failed",
+            )
+            run_pr_review_helper(
+                bindings,
+                helper,
+                [
+                    "validate",
+                    "--evidence",
+                    evidence_path,
+                    "--findings",
+                    findings_path,
+                    "--verify-status",
+                    verify_status_path,
+                    "--out",
+                    validated_path,
+                ],
+                timeout,
+                "PR review validation failed",
+            )
+        except RpcCommandError as exc:
+            _audit_pr_review_helper_error(bindings, "validate_pr_review", args, exc)
+            raise
+        validated = load_json_checked(validated_path)
+        raw_results = validated.get("findings") or validated.get("results") or []
+        recommendation = validated.get("recommendation") if isinstance(validated.get("recommendation"), Mapping) else {}
+        lines = [
+            f"PR review delegation gate passed: {gate.get('reason', '(no reason)')}",
+            f"PR review validation: `{validated_path}`",
+            f"- recommendation.event: {recommendation.get('event', '(unknown)')}",
+            f"- recommendation.blocking_count: {recommendation.get('blocking_count', '(unknown)')}",
+            f"- recommendation.optional_count: {recommendation.get('optional_count', '(unknown)')}",
+            f"- recommendation.reason: {recommendation.get('reason', '(unknown)')}",
+        ]
+        if isinstance(raw_results, list):
+            for index, item in enumerate(raw_results, start=1):
+                if isinstance(item, Mapping):
+                    lines.append(
+                        f"- finding {index}: anchor_valid={json.dumps(item.get('anchor_valid', '(unknown)'))}; "
+                        f"duplicate_suspected={json.dumps(item.get('duplicate_suspected', '(unknown)'))}"
+                    )
+        _audit(
+            bindings,
+            "validate_pr_review",
+            args,
+            result={
+                "validated": str(validated_path),
+                "verify_status": str(verify_status_path),
+                "recommendation_event": recommendation.get("event"),
+                "findings": len(findings),
+            },
+        )
+        return "\n".join(lines)
+
+    return host_tool(
+        name="validate_pr_review",
+        description=persona.host_tool_description("validate_pr_review"),
+        parameters={
+            "type": "object",
+            "properties": {
+                "findings": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string"},
+                            "line": {"type": "integer"},
+                            "start_line": {"type": "integer"},
+                            "body": {"type": "string"},
+                            "severity": {"type": "string", "enum": ["critical", "required", "optional"]},
+                            "intent": {
+                                "type": "string",
+                                "enum": ["required_change", "question", "suggestion", "nit", "thought"],
+                            },
+                            "suggestion": {
+                                "type": "object",
+                                "properties": {
+                                    "kind": {"type": "string", "enum": ["github_suggestion"]},
+                                    "replacement": {"type": "string"},
+                                },
+                                "required": ["kind", "replacement"],
+                                "additionalProperties": False,
+                            },
+                        },
+                        "required": ["path", "line", "body", "severity", "intent"],
+                        "additionalProperties": False,
+                    },
+                }
+            },
+            "required": ["findings"],
+            "additionalProperties": False,
+        },
+        execute=execute,
+    )
+
+
 def _build_classify_pr(bindings: ToolBindings) -> HostTool[Any, Any]:
     def execute(args: dict[str, Any], _ctx: HostToolContext[Any]) -> str:
         _require_review_mode(bindings, "classify_pr", args)
-        rank = args.get("rank")
-        if rank not in _PR_RANKS:
-            msg = f"classify_pr 'rank' must be one of {_PR_RANKS}; got {rank!r}."
+        review_label = args.get("review_label")
+        if review_label not in _PR_REVIEW_LABELS:
+            msg = f"classify_pr 'review_label' must be one of {_PR_REVIEW_LABELS}; got {review_label!r}."
             _audit(bindings, "classify_pr", args, error=msg)
             _raise_command(msg)
         pr_type = args.get("type")
@@ -1096,7 +1866,7 @@ def _build_classify_pr(bindings: ToolBindings) -> HostTool[Any, Any]:
             _audit(bindings, "classify_pr", args, error=msg)
             _raise_command(msg)
 
-        labels: list[str] = ["triaged", str(rank), str(pr_type)]
+        labels: list[str] = ["triaged", str(review_label), str(pr_type)]
         for area in args.get("area") or ():
             if isinstance(area, str) and area in _FUNCTIONAL:
                 labels.append(area)
@@ -1112,14 +1882,14 @@ def _build_classify_pr(bindings: ToolBindings) -> HostTool[Any, Any]:
         except GitHubError as exc:
             _audit(bindings, "classify_pr", args, error=str(exc))
             _raise_command(f"GitHub rejected labels: {exc.status} {exc.message}")
-        bindings.db.set_issue_classification(bindings.issue_key, str(rank))
+        bindings.db.set_issue_classification(bindings.issue_key, str(review_label))
         _audit(
             bindings,
             "classify_pr",
             args,
-            result={"rank": rank, "type": pr_type, "labels": list(applied), "rationale": rationale},
+            result={"review_label": review_label, "type": pr_type, "labels": list(applied), "rationale": rationale},
         )
-        return f"classified PR as {rank}; labels applied: {', '.join(applied)}."
+        return f"classified PR as {review_label}; labels applied: {', '.join(applied)}."
 
     return host_tool(
         name="classify_pr",
@@ -1127,10 +1897,10 @@ def _build_classify_pr(bindings: ToolBindings) -> HostTool[Any, Any]:
         parameters={
             "type": "object",
             "properties": {
-                "rank": {
+                "review_label": {
                     "type": "string",
-                    "enum": list(_PR_RANKS),
-                    "description": persona.host_tool_parameter_description("classify_pr", "rank"),
+                    "enum": list(_PR_REVIEW_LABELS),
+                    "description": persona.host_tool_parameter_description("classify_pr", "review_label"),
                 },
                 "type": {
                     "type": "string",
@@ -1151,7 +1921,7 @@ def _build_classify_pr(bindings: ToolBindings) -> HostTool[Any, Any]:
                     "description": persona.host_tool_parameter_description("classify_pr", "rationale"),
                 },
             },
-            "required": ["rank", "type", "rationale"],
+            "required": ["review_label", "type", "rationale"],
             "additionalProperties": False,
         },
         execute=execute,
@@ -1240,7 +2010,6 @@ def _build_pr_review_comment(bindings: ToolBindings) -> HostTool[Any, Any]:
                 "side": {
                     "type": "string",
                     "enum": ["RIGHT", "LEFT"],
-                    "default": "RIGHT",
                     "description": persona.host_tool_parameter_description("pr_review_comment", "side"),
                 },
                 "start_line": {
@@ -1260,6 +2029,49 @@ def _build_pr_review_comment(bindings: ToolBindings) -> HostTool[Any, Any]:
     )
 
 
+def _pr_review_payload_available(bindings: ToolBindings) -> bool:
+    if _pr_review_helper_path(bindings) is None:
+        return False
+    paths = pr_review_paths(bindings.workspace)
+    return all(getattr(paths, name).is_file() for name in ("evidence", "classification", "findings", "validated"))
+
+
+def _pr_review_build_payload(bindings: ToolBindings, *, event: str, body: str, args: Mapping[str, Any]) -> dict[str, Any]:
+    helper = _pr_review_helper_path(bindings)
+    if helper is None:
+        msg = "PR review payload unavailable; helper not configured."
+        _audit(bindings, "submit_pr_review", args, error=msg)
+        _raise_command(msg)
+    paths = pr_review_paths(bindings.workspace)
+    _write_control_file(bindings, paths.body, body.strip())
+    helper_args: list[str | Path] = [
+        "payload",
+        "--evidence",
+        paths.evidence,
+        "--findings",
+        paths.findings,
+        "--classification",
+        paths.classification,
+        "--body-file",
+        paths.body,
+        "--event",
+        event,
+        "--out",
+        paths.payload,
+    ]
+    if paths.metadata.is_file():
+        helper_args.extend(["--review-metadata", paths.metadata])
+    if paths.verify_status.is_file():
+        helper_args.extend(["--verify-status", paths.verify_status])
+    timeout = bindings.settings.request_timeout_seconds if bindings.settings is not None else None
+    try:
+        run_pr_review_helper(bindings, helper, helper_args, timeout, "PR review payload refused")
+    except RpcCommandError as exc:
+        _audit_pr_review_helper_error(bindings, "submit_pr_review", args, exc)
+        raise
+    return load_json_checked(paths.payload)
+
+
 def _build_submit_pr_review(bindings: ToolBindings) -> HostTool[Any, Any]:
     def execute(args: dict[str, Any], _ctx: HostToolContext[Any]) -> str:
         _require_review_mode(bindings, "submit_pr_review", args)
@@ -1268,30 +2080,133 @@ def _build_submit_pr_review(bindings: ToolBindings) -> HostTool[Any, Any]:
             msg = "submit_pr_review requires a non-empty 'body'."
             _audit(bindings, "submit_pr_review", args, error=msg)
             _raise_command(msg)
-        staged = bindings.db.list_staged_review_comments(bindings.issue_key)
-        comments = [_review_comment_to_payload(comment) for comment in staged]
+        raw_event = str(args.get("event") or "COMMENT").upper()
+        terminal_enabled = bool(bindings.settings and bindings.settings.pr_review_terminal_events)
+        allowed_events = {"COMMENT", "APPROVE", "REQUEST_CHANGES"} if terminal_enabled else {"COMMENT"}
+        if raw_event not in allowed_events:
+            if terminal_enabled:
+                msg = (
+                    "submit_pr_review event must be COMMENT, APPROVE, or REQUEST_CHANGES when "
+                    "ROBOMP_PR_REVIEW_TERMINAL_EVENTS is enabled."
+                )
+            else:
+                msg = "submit_pr_review event must be COMMENT; terminal review events are disabled."
+            _audit(bindings, "submit_pr_review", args, error=msg)
+            _raise_command(msg)
+        requested_event = raw_event
+        pr_review_payload_available = _pr_review_payload_available(bindings)
+        if requested_event in {"APPROVE", "REQUEST_CHANGES"} and not pr_review_payload_available:
+            msg = "PR review payload state required before terminal PR review; run prepare_pr_review and validate_pr_review."
+            _audit(bindings, "submit_pr_review", args, error=msg)
+            _raise_command(msg)
+
+        bot_login = getattr(bindings.settings, "bot_login", "") if bindings.settings is not None else ""
+        self_authored = bool(
+            bot_login
+            and bindings.issue.author.lower() == bot_login.lower()
+            and requested_event in {"APPROVE", "REQUEST_CHANGES"}
+        )
+        staged_count = 0
+        if pr_review_payload_available:
+            staged_count = len(bindings.db.list_staged_review_comments(bindings.issue_key))
+            payload = _pr_review_build_payload(bindings, event=requested_event, body=body, args=args)
+            submit_body = str(payload.get("body") or body).strip()
+            payload_comments = payload.get("comments")
+            comments = list(payload_comments) if isinstance(payload_comments, list) else []
+            raw_event = str(payload.get("event") or requested_event).upper()
+        else:
+            staged = bindings.db.list_staged_review_comments(bindings.issue_key)
+            staged_count = len(staged)
+            comments = [_review_comment_to_payload(comment) for comment in staged]
+            submit_body = body.strip()
+
+        if self_authored:
+            raw_event = "COMMENT"
+        operation_suffix = _side_effect_payload_suffix({"body": submit_body, "comments": comments, "event": raw_event})
+        operation_key = f"submit_pr_review:{bindings.issue_key}:{raw_event}:{operation_suffix}"
+        if not bindings.db.reserve_side_effect(operation_key):
+            if bindings.db.side_effect_succeeded(operation_key):
+                message = f"side effect already succeeded: {operation_key}"
+                _audit(bindings, "submit_pr_review", args, result={"skipped": "side_effect_already_succeeded", "operation_key": operation_key})
+                return message
+            message = f"side effect already pending: {operation_key}"
+            _audit(bindings, "submit_pr_review", args, result={"skipped": "side_effect_already_pending", "operation_key": operation_key})
+            return message
         try:
             review = _run_coro(
                 bindings.loop,
                 bindings.github.submit_pr_review(
                     repo=bindings.repo.full_name,
                     pr_number=bindings.default_comment_number,
-                    body=body.strip(),
-                    event="COMMENT",
+                    body=submit_body,
+                    event=raw_event,
                     comments=comments,
                 ),
             )
         except GitHubError as exc:
+            bindings.db.mark_side_effect_failed(operation_key, str(exc))
             _audit(bindings, "submit_pr_review", args, error=str(exc))
             _raise_command(f"GitHub rejected PR review: {exc.status} {exc.message}")
-        cleared = bindings.db.clear_staged_review_comments(bindings.issue_key)
-        _audit(
-            bindings,
-            "submit_pr_review",
-            args,
-            result={"review_id": review.id, "comments": len(comments), "cleared": cleared, "event": "COMMENT"},
+        completed_head_sha: str | None = None
+        posted_findings_count = 0
+        posted_findings_warning: str | None = None
+        if pr_review_payload_available:
+            paths = pr_review_paths(bindings.workspace)
+            try:
+                findings_data = load_json_checked(paths.findings)
+                evidence_data = load_json_checked(paths.evidence)
+                findings = findings_data if isinstance(findings_data, list) else findings_data.get("findings", [])
+                if not isinstance(findings, list):
+                    findings = []
+                head_sha = evidence_data.get("head_sha") if isinstance(evidence_data, dict) else None
+                completed_head_sha = head_sha if isinstance(head_sha, str) else None
+                posted_comments = _run_coro(
+                    bindings.loop,
+                    bindings.github.list_review_comments_for_review(
+                        bindings.repo.full_name,
+                        bindings.default_comment_number,
+                        review.id,
+                    ),
+                )
+                posted_findings_count = bindings.db.record_pr_review_posted_findings(
+                    issue_key=bindings.issue_key,
+                    repo=bindings.repo.full_name,
+                    pr_number=bindings.default_comment_number,
+                    head_sha=completed_head_sha,
+                    review_id=review.id,
+                    findings=findings,
+                    posted_comments=[asdict(comment) for comment in posted_comments],
+                )
+            except Exception as exc:
+                posted_findings_warning = str(exc)
+        bindings.db.record_pr_review_completed_review(
+            issue_key=bindings.issue_key,
+            repo=bindings.repo.full_name,
+            pr_number=bindings.default_comment_number,
+            head_sha=completed_head_sha,
+            github_review_id=review.id,
+            event=raw_event,
         )
-        return f"submitted PR review id={review.id}; comments={len(comments)}"
+        cleared = bindings.db.clear_staged_review_comments(bindings.issue_key)
+        result = {
+            "review_id": review.id,
+            "comments": len(comments),
+            "cleared": cleared,
+            "event": raw_event,
+            "requested_event": requested_event,
+            "self_authored_terminal_downgrade": self_authored,
+            "source": "pr_review_payload" if pr_review_payload_available else "staged_comments",
+        }
+        if pr_review_payload_available:
+            result["ignored_staged_comments"] = staged_count
+            result["posted_findings"] = posted_findings_count
+            if posted_findings_warning is not None:
+                result["posted_findings_warning"] = posted_findings_warning
+        bindings.db.mark_side_effect_succeeded(operation_key)
+        _audit(bindings, "submit_pr_review", args, result=result)
+        suffix = f"; requested_event={requested_event}" if requested_event != raw_event else ""
+        posted_suffix = f"; posted_findings={posted_findings_count}" if pr_review_payload_available else ""
+        return f"submitted PR review id={review.id}; event={raw_event}{suffix}; comments={len(comments)}{posted_suffix}"
 
     return host_tool(
         name="submit_pr_review",
@@ -1305,7 +2220,7 @@ def _build_submit_pr_review(bindings: ToolBindings) -> HostTool[Any, Any]:
                 },
                 "event": {
                     "type": "string",
-                    "enum": ["COMMENT"],
+                    "enum": ["COMMENT", "APPROVE", "REQUEST_CHANGES"],
                     "default": "COMMENT",
                     "description": persona.host_tool_parameter_description("submit_pr_review", "event"),
                 },
@@ -1552,6 +2467,9 @@ def build(bindings: ToolBindings) -> tuple[HostTool[Any, Any], ...]:
         _build_classify_issue(bindings),
         _build_set_issue_labels(bindings),
         _build_fetch_pr(bindings),
+        _build_prepare_pr_review(bindings),
+        _build_delegate_pr_review(bindings),
+        _build_validate_pr_review(bindings),
         _build_classify_pr(bindings),
         _build_pr_review_comment(bindings),
         _build_submit_pr_review(bindings),

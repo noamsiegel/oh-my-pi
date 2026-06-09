@@ -10,7 +10,10 @@ from pydantic import SecretStr
 from robomp.autoclose import AutocloseScheduler
 from robomp.config import Settings
 from robomp.db import Database, issue_key
-from robomp.github_client import GitHubError, ReactionInfo
+from robomp.github_types import (
+    GitHubError,
+    ReactionInfo,
+)
 
 
 def _settings(*, enabled: bool = True, hours: float = 4.0, scan: float = 60.0) -> Settings:

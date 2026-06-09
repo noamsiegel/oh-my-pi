@@ -204,6 +204,7 @@ def test_route_incoming_pr_opened_queues_review_pr() -> None:
         },
         allowlist=ALLOWLIST,
         bot_login=BOT,
+        pr_review_label_allowlist=frozenset(),
     )
     assert decision.should_queue
     assert decision.task == "review_pr"
@@ -212,20 +213,116 @@ def test_route_incoming_pr_opened_queues_review_pr() -> None:
     assert decision.association == "CONTRIBUTOR"
 
 
+def test_route_incoming_pr_opened_label_allowlist_exact_matching() -> None:
+    base_payload = {
+        "action": "opened",
+        "pull_request": {
+            "number": 9,
+            "draft": False,
+            "user": {"login": "alice", "type": "User"},
+            "author_association": "CONTRIBUTOR",
+            "labels": [],
+        },
+        "repository": {"full_name": "octo/widget"},
+    }
+    allow = frozenset({"robo-review"})
+
+    unlabeled = route("pull_request", base_payload, allowlist=ALLOWLIST, bot_login=BOT, pr_review_label_allowlist=allow)
+    assert not unlabeled.should_queue
+    assert unlabeled.reason == "PR lacks review trigger label"
+
+    base_payload["pull_request"]["labels"] = [{"name": "Robo-Review"}]  # type: ignore[index]
+    robo_review = route("pull_request", base_payload, allowlist=ALLOWLIST, bot_login=BOT, pr_review_label_allowlist=allow)
+    assert robo_review.should_queue
+
+    base_payload["pull_request"]["labels"] = [{"name": "ROBO-REVIEW"}]  # type: ignore[index]
+    robo_review_upper = route("pull_request", base_payload, allowlist=ALLOWLIST, bot_login=BOT, pr_review_label_allowlist=allow)
+    assert robo_review_upper.should_queue
+
+    base_payload["pull_request"]["labels"] = [{"name": "mailroom"}]  # type: ignore[index]
+    mailroom = route("pull_request", base_payload, allowlist=ALLOWLIST, bot_login=BOT, pr_review_label_allowlist=allow)
+    assert not mailroom.should_queue
+
+
+def test_route_pull_request_labeled_queues_only_matching_label() -> None:
+    payload = {
+        "action": "labeled",
+        "label": {"name": "robo-review"},
+        "pull_request": {"number": 9, "draft": False, "user": {"login": "alice"}, "labels": [{"name": "robo-review"}]},
+        "repository": {"full_name": "octo/widget"},
+    }
+    decision = route(
+        "pull_request",
+        payload,
+        allowlist=ALLOWLIST,
+        bot_login=BOT,
+        pr_review_label_allowlist=frozenset({"robo-review"}),
+    )
+    assert decision.should_queue
+    assert decision.task == "review_pr"
+
+    payload["label"] = {"name": "backend"}
+    payload["pull_request"]["labels"] = [{"name": "backend"}]  # type: ignore[index]
+    skipped = route(
+        "pull_request",
+        payload,
+        allowlist=ALLOWLIST,
+        bot_login=BOT,
+        pr_review_label_allowlist=frozenset({"robo-review"}),
+    )
+    assert not skipped.should_queue
+    assert skipped.reason == "pull_request.labeled ignored"
+
+
+def test_route_issues_labeled_on_pr_queues_matching_label() -> None:
+    decision = route(
+        "issues",
+        {
+            "action": "labeled",
+            "label": {"name": "robo-review"},
+            "issue": {"number": 9, "pull_request": {}, "user": {"login": "alice"}},
+            "repository": {"full_name": "octo/widget"},
+        },
+        allowlist=ALLOWLIST,
+        bot_login=BOT,
+        pr_review_label_allowlist=frozenset({"robo-review"}),
+    )
+    assert decision.should_queue
+    assert decision.task == "review_pr"
+    assert decision.reason == "issues.labeled on PR"
+
+
 def test_route_incoming_pr_opened_skips_draft_bot_and_disabled() -> None:
     payload = {
         "action": "opened",
-        "pull_request": {"number": 9, "draft": True, "user": {"login": "alice", "type": "User"}},
+        "pull_request": {"number": 9, "draft": True, "user": {"login": "alice", "type": "User"}, "labels": [{"name": "Robo-Review"}]},
         "repository": {"full_name": "octo/widget"},
     }
-    assert not route("pull_request", payload, allowlist=ALLOWLIST, bot_login=BOT).should_queue
+    assert not route("pull_request", payload, allowlist=ALLOWLIST, bot_login=BOT, pr_review_label_allowlist=frozenset({"robo-review"})).should_queue
 
     payload["pull_request"]["draft"] = False  # type: ignore[index]
     payload["pull_request"]["user"] = {"login": BOT, "type": "Bot"}  # type: ignore[index]
-    assert not route("pull_request", payload, allowlist=ALLOWLIST, bot_login=BOT).should_queue
+    assert not route("pull_request", payload, allowlist=ALLOWLIST, bot_login=BOT, pr_review_label_allowlist=frozenset({"robo-review"})).should_queue
+
+    payload["pull_request"]["user"] = {"login": BOT, "type": "User"}  # type: ignore[index]
+    configured_login_user = route(
+        "pull_request",
+        payload,
+        allowlist=ALLOWLIST,
+        bot_login=BOT,
+        pr_review_label_allowlist=frozenset({"robo-review"}),
+    )
+    assert configured_login_user.should_queue
 
     payload["pull_request"]["user"] = {"login": "alice", "type": "User"}  # type: ignore[index]
-    disabled = route("pull_request", payload, allowlist=ALLOWLIST, bot_login=BOT, pr_review_enabled=False)
+    disabled = route(
+        "pull_request",
+        payload,
+        allowlist=ALLOWLIST,
+        bot_login=BOT,
+        pr_review_enabled=False,
+        pr_review_label_allowlist=frozenset({"robo-review"}),
+    )
     assert not disabled.should_queue
     assert "disabled" in disabled.reason
 
@@ -244,6 +341,22 @@ def test_route_pull_request_synchronize_stays_skipped() -> None:
     assert not decision.should_queue
 
 
+def test_route_pull_request_synchronize_with_matching_label_queues_for_task_gate() -> None:
+    decision = route(
+        "pull_request",
+        {
+            "action": "synchronize",
+            "pull_request": {"number": 9, "user": {"login": "alice"}, "labels": [{"name": "Robo-Review"}]},
+            "repository": {"full_name": "octo/widget"},
+        },
+        allowlist=ALLOWLIST,
+        bot_login=BOT,
+        pr_review_label_allowlist=frozenset({"robo-review"}),
+    )
+    assert decision.should_queue
+    assert decision.task == "review_pr"
+
+
 def test_route_incoming_pr_comment_skips() -> None:
     decision = route(
         "issue_comment",
@@ -257,7 +370,7 @@ def test_route_incoming_pr_comment_skips() -> None:
         bot_login=BOT,
     )
     assert not decision.should_queue
-    assert "incoming PR comments ignored" == decision.reason
+    assert "incoming PR comments observed" == decision.reason
 
 
 def test_route_incoming_pr_comment_with_maintainer_mention_still_skips() -> None:
@@ -278,7 +391,7 @@ def test_route_incoming_pr_comment_with_maintainer_mention_still_skips() -> None
     )
     assert not decision.should_queue
     assert decision.issue_key == "octo/widget#9"
-    assert decision.reason == "incoming PR comments ignored"
+    assert decision.reason == "incoming PR comments observed"
 
 
 def test_route_review_only_for_bot_authored_pr() -> None:
@@ -329,6 +442,42 @@ def test_route_review_comment_falls_back_to_pr_key_when_resolver_misses() -> Non
     assert decision.task == "handle_review"
     assert decision.submitter == "alice"
     assert decision.issue_key == "octo/widget#9"
+
+
+def test_route_pull_request_review_submitted_observed() -> None:
+    decision = route(
+        "pull_request_review",
+        {
+            "action": "submitted",
+            "review": {"id": 1, "state": "commented"},
+            "pull_request": {"number": 9},
+            "repository": {"full_name": "octo/widget"},
+        },
+        allowlist=ALLOWLIST,
+        bot_login=BOT,
+        resolve_issue_from_pr=lambda _r, _n: "octo/widget#42",
+    )
+    assert not decision.should_queue
+    assert decision.issue_key == "octo/widget#42"
+    assert decision.reason == "pull_request_review.submitted observed"
+
+
+def test_route_pull_request_review_thread_resolved_observed() -> None:
+    decision = route(
+        "pull_request_review_thread",
+        {
+            "action": "resolved",
+            "thread": {"id": "t1"},
+            "pull_request": {"number": 9},
+            "repository": {"full_name": "octo/widget"},
+        },
+        allowlist=ALLOWLIST,
+        bot_login=BOT,
+        resolve_issue_from_pr=lambda _r, _n: "octo/widget#42",
+    )
+    assert not decision.should_queue
+    assert decision.issue_key == "octo/widget#42"
+    assert decision.reason == "pull_request_review_thread.resolved observed"
 
 
 def test_route_pr_closed_cleans_up_any_tracked_pr() -> None:
@@ -682,7 +831,7 @@ def test_route_directive_on_incoming_pr_conversation_is_ignored() -> None:
         resolve_issue_from_pr=lambda _r, _n: "octo/widget#42",
     )
     assert not decision.should_queue
-    assert decision.reason == "incoming PR comments ignored"
+    assert decision.reason == "incoming PR comments observed"
 
 
 def test_route_directive_set_on_review_comment() -> None:
@@ -729,7 +878,7 @@ def test_route_reviewer_bot_comment_on_incoming_pr_is_ignored() -> None:
         resolve_issue_from_pr=lambda _r, _n: "octo/widget#42",
     )
     assert not decision.should_queue
-    assert decision.reason == "incoming PR comments ignored"
+    assert decision.reason == "incoming PR comments observed"
 
 
 def test_route_reviewer_bot_review_comment_is_directive() -> None:

@@ -180,4 +180,39 @@ def test_review_completion_reminder_mentions_submit_only() -> None:
         workspace=_Workspace(branch="review/pr-99"),
     )
     assert "submit_pr_review" in out
+    assert 'event="APPROVE"' in out
+    assert 'event="REQUEST_CHANGES"' in out
     assert "gh_open_pr" not in out
+
+
+def test_seeded_review_pr_todos_include_validate_and_exclude_pr_review_comment_primary() -> None:
+    """Test that seeded review_pr todos include validate_pr_review and exclude pr_review_comment as primary."""
+    phases = persona.seed_phases("review_pr")
+    
+    # Find the Review phase
+    review_phase = None
+    for phase in phases:
+        if phase["name"] == "Review":
+            review_phase = phase
+            break
+    
+    assert review_phase is not None, "Review phase should exist"
+    
+    # Check that validate_pr_review is included
+    tasks = review_phase["tasks"]
+    validate_task_found = False
+    for task in tasks:
+        if "validate_pr_review" in task:
+            validate_task_found = True
+            break
+    
+    assert validate_task_found, "validate_pr_review should be in Review phase tasks"
+    
+    # Check that pr_review_comment is not a primary seeded task
+    pr_review_comment_primary = False
+    for task in tasks:
+        if task == "Stage inline findings with pr_review_comment":
+            pr_review_comment_primary = True
+            break
+    
+    assert not pr_review_comment_primary, "pr_review_comment should not be a primary seeded task"

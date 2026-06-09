@@ -2,18 +2,20 @@
 
 from __future__ import annotations
 
+import json
 import os
 import platform
 import subprocess
 import time
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
 from pydantic import SecretStr
 
-from robomp.config import Settings
+from robomp.config import ProxySettings
 from robomp.github_client import GitHubClient
 from robomp.proxy.server import create_proxy_app
 from robomp.proxy_hmac import HEADER_SIGNATURE, HEADER_TIMESTAMP, sign
@@ -26,30 +28,24 @@ _TOKEN = "ghp_test_token_value"
 # ---------- shared fixtures ----------
 
 
-def _build_settings(tmp_path: Path) -> Settings:
-    """Construct a Settings object for the proxy side without going through
-    the orchestrator-mode mutual-exclusion validator (the proxy reads token +
-    hmac key directly; the validator is geared at orchestrator deployments)."""
-    cfg = Settings.model_construct(
+def _build_settings(tmp_path: Path) -> ProxySettings:
+    """Construct a ProxySettings object for the proxy side."""
+    cfg = ProxySettings.model_construct(
         github_token=SecretStr(_TOKEN),
-        github_webhook_secret=SecretStr("webhook-secret"),
-        bot_login="robomp-bot",
-        git_author_email="robomp-bot@example.invalid",
-        repo_allowlist_raw="octo/widget",
-        gh_proxy_url=None,
         gh_proxy_hmac_key=SecretStr(_HMAC),
         gh_proxy_bind_host="0.0.0.0",
         gh_proxy_bind_port=8081,
         workspace_root=tmp_path / "workspaces",
-        sqlite_path=tmp_path / "robomp.sqlite",
         log_dir=tmp_path / "logs",
+        gh_proxy_max_body_bytes=1 << 20,
+        gh_proxy_git_timeout_seconds=60.0,
     )
     cfg.ensure_paths()
     return cfg
 
 
 @pytest.fixture
-def proxy_settings(tmp_path: Path) -> Settings:
+def proxy_settings(tmp_path: Path) -> ProxySettings:
     return _build_settings(tmp_path)
 
 
@@ -86,8 +82,54 @@ def upstream_repo(tmp_path: Path) -> Path:
     _git(["-C", str(seed), "push", "origin", "main"], tmp_path)
     return repo
 
+def _partial_clone_upstream(tmp_path: Path) -> Path:
+    repo = tmp_path / "partial-upstream.git"
+    repo.mkdir()
+    _git(["init", "--initial-branch=main", "--bare", str(repo)], tmp_path)
+    _git(["-C", str(repo), "config", "uploadpack.allowFilter", "true"], tmp_path)
+    _git(["-C", str(repo), "config", "uploadpack.allowAnySHA1InWant", "true"], tmp_path)
+    seed = tmp_path / "partial-seed"
+    seed.mkdir()
+    _git(["init", "--initial-branch=main", str(seed)], tmp_path)
+    (seed / "README.md").write_text("hello\n", encoding="utf-8")
+    _git(["-C", str(seed), "add", "."], tmp_path)
+    _git(["-C", str(seed), "commit", "-m", "init"], tmp_path)
+    _git(["-C", str(seed), "remote", "add", "origin", str(repo)], tmp_path)
+    _git(["-C", str(seed), "push", "origin", "main"], tmp_path)
+    return repo
 
-def _stage_workspace(cfg: Settings, upstream: Path, repo: str, number: int, branch: str) -> tuple[Path, str]:
+
+def _publish_pr_with_files(upstream: Path, tmp_path: Path) -> None:
+    pr_seed = tmp_path / "proxy-pr-seed"
+    _git(["clone", f"file://{upstream}", str(pr_seed)], tmp_path)
+    (pr_seed / "src").mkdir()
+    (pr_seed / "docs").mkdir()
+    (pr_seed / "src" / "changed.txt").write_text("changed payload\n", encoding="utf-8")
+    (pr_seed / "docs" / "untouched.txt").write_text("untouched payload\n", encoding="utf-8")
+    _git(["-C", str(pr_seed), "add", "src/changed.txt", "docs/untouched.txt"], tmp_path)
+    _git(["-C", str(pr_seed), "commit", "-m", "add pr files"], tmp_path)
+    _git(["-C", str(pr_seed), "push", "origin", "HEAD:refs/pull/7/head"], tmp_path)
+
+
+def _partial_pool(proxy_settings: ProxySettings, upstream: Path, tmp_path: Path) -> Path:
+    pool = Path(proxy_settings.workspace_root) / "_pool" / "test__widget"
+    pool.parent.mkdir(parents=True, exist_ok=True)
+    _git(
+        [
+            "clone",
+            "--filter=blob:none",
+            "--no-tags",
+            "--branch",
+            "main",
+            f"file://{upstream}",
+            str(pool),
+        ],
+        tmp_path,
+    )
+    return pool
+
+
+def _stage_workspace(cfg: ProxySettings, upstream: Path, repo: str, number: int, branch: str) -> tuple[Path, str]:
     """Pre-stage a workspace clone with one new commit on `branch`."""
     ws_dir = Path(cfg.workspace_root) / workspace_key(repo, number)
     ws_dir.mkdir(parents=True, exist_ok=True)
@@ -142,7 +184,7 @@ def _signed(
     return {HEADER_TIMESTAMP: timestamp, HEADER_SIGNATURE: sig}
 
 
-def _build_app(cfg: Settings, gh_handler: Callable[[httpx.Request], httpx.Response] | None = None):
+def _build_app(cfg: ProxySettings, gh_handler: Callable[[httpx.Request], httpx.Response] | None = None):
     app = create_proxy_app(cfg)
     transport = httpx.MockTransport(gh_handler) if gh_handler is not None else None
     app.state.github = GitHubClient(_TOKEN, transport=transport)
@@ -192,7 +234,7 @@ def test_read_origin_url_uses_safe_directory_and_slot_identity(tmp_path: Path, m
 # ============================================================================
 
 
-async def test_hmac_accept_post_comment_round_trip(proxy_settings: Settings) -> None:
+async def test_hmac_accept_post_comment_round_trip(proxy_settings: ProxySettings) -> None:
     captured: dict[str, httpx.Request] = {}
 
     def gh(req: httpx.Request) -> httpx.Response:
@@ -220,14 +262,14 @@ async def test_hmac_accept_post_comment_round_trip(proxy_settings: Settings) -> 
     assert captured["req"].url.path == "/repos/octo/widget/issues/1/comments"
 
 
-async def test_hmac_reject_missing_headers(proxy_settings: Settings) -> None:
+async def test_hmac_reject_missing_headers(proxy_settings: ProxySettings) -> None:
     app = _build_app(proxy_settings, lambda _: httpx.Response(200, json={}))
     async with await _async_client(app) as client:
         resp = await client.get("/gh/v1/repo", params={"repo": "octo/widget"})
     assert resp.status_code == 401
 
 
-async def test_hmac_reject_bad_signature(proxy_settings: Settings) -> None:
+async def test_hmac_reject_bad_signature(proxy_settings: ProxySettings) -> None:
     app = _build_app(proxy_settings, lambda _: httpx.Response(200, json={}))
     async with await _async_client(app) as client:
         resp = await client.get(
@@ -238,7 +280,7 @@ async def test_hmac_reject_bad_signature(proxy_settings: Settings) -> None:
     assert resp.status_code == 401
 
 
-async def test_hmac_reject_stale_timestamp(proxy_settings: Settings) -> None:
+async def test_hmac_reject_stale_timestamp(proxy_settings: ProxySettings) -> None:
     app = _build_app(proxy_settings, lambda _: httpx.Response(200, json={}))
     stale = str(int(time.time()) - 120)
     headers = _signed("GET", "/gh/v1/repo", ts=stale)
@@ -252,7 +294,7 @@ async def test_hmac_reject_stale_timestamp(proxy_settings: Settings) -> None:
 # ============================================================================
 
 
-async def test_get_repo(proxy_settings: Settings) -> None:
+async def test_get_repo(proxy_settings: ProxySettings) -> None:
     def gh(req: httpx.Request) -> httpx.Response:
         assert req.url.path == "/repos/octo/widget"
         return httpx.Response(
@@ -281,7 +323,7 @@ async def test_get_repo(proxy_settings: Settings) -> None:
     }
 
 
-async def test_get_issue(proxy_settings: Settings) -> None:
+async def test_get_issue(proxy_settings: ProxySettings) -> None:
     def gh(req: httpx.Request) -> httpx.Response:
         assert req.url.path == "/repos/octo/widget/issues/1"
         return httpx.Response(
@@ -311,7 +353,7 @@ async def test_get_issue(proxy_settings: Settings) -> None:
     assert payload["is_pull_request"] is False
 
 
-async def test_list_issues(proxy_settings: Settings) -> None:
+async def test_list_issues(proxy_settings: ProxySettings) -> None:
     def gh(req: httpx.Request) -> httpx.Response:
         assert req.url.path == "/repos/octo/widget/issues"
         return httpx.Response(
@@ -351,7 +393,7 @@ async def test_list_issues(proxy_settings: Settings) -> None:
     assert items[0]["number"] == 1
 
 
-async def test_list_comments(proxy_settings: Settings) -> None:
+async def test_list_comments(proxy_settings: ProxySettings) -> None:
     def gh(req: httpx.Request) -> httpx.Response:
         assert req.url.path == "/repos/octo/widget/issues/1/comments"
         return httpx.Response(
@@ -374,7 +416,7 @@ async def test_list_comments(proxy_settings: Settings) -> None:
     }
 
 
-async def test_list_review_comments(proxy_settings: Settings) -> None:
+async def test_list_review_comments(proxy_settings: ProxySettings) -> None:
     def gh(req: httpx.Request) -> httpx.Response:
         assert req.url.path == "/repos/octo/widget/pulls/1/comments"
         return httpx.Response(
@@ -404,7 +446,43 @@ async def test_list_review_comments(proxy_settings: Settings) -> None:
     assert items[0]["line"] == 5
 
 
-async def test_list_pr_reviews(proxy_settings: Settings) -> None:
+async def test_list_review_comments_for_review(proxy_settings: ProxySettings) -> None:
+    def gh(req: httpx.Request) -> httpx.Response:
+        assert req.url.path == "/repos/octo/widget/pulls/1/reviews/44/comments"
+        return httpx.Response(
+            200,
+            json=[
+                {
+                    "id": 55,
+                    "pull_request_review_id": 44,
+                    "user": {"login": "rev"},
+                    "body": "nit",
+                    "path": "a.py",
+                    "line": 5,
+                    "created_at": "2026-01-01T00:00:00Z",
+                    "commit_id": "abc",
+                    "diff_hunk": "@@ -1 +1 @@",
+                    "in_reply_to_id": 54,
+                }
+            ],
+        )
+
+    app = _build_app(proxy_settings, gh)
+    params = {"repo": "octo/widget", "pr_number": 1, "review_id": 44}
+    async with await _async_client(app) as client:
+        resp = await client.get(
+            "/gh/v1/review_comments_for_review",
+            params=params,
+            headers=_signed("GET", "/gh/v1/review_comments_for_review", params=params),
+        )
+    assert resp.status_code == 200
+    items = resp.json()["items"]
+    assert items[0]["review_id"] == 44
+    assert items[0]["commit_id"] == "abc"
+    assert items[0]["in_reply_to_id"] == 54
+
+
+async def test_list_pr_reviews(proxy_settings: ProxySettings) -> None:
     def gh(req: httpx.Request) -> httpx.Response:
         assert req.url.path == "/repos/octo/widget/pulls/1/reviews"
         return httpx.Response(
@@ -416,6 +494,7 @@ async def test_list_pr_reviews(proxy_settings: Settings) -> None:
                     "body": "looks good",
                     "state": "APPROVED",
                     "submitted_at": "2026-01-01T00:00:00Z",
+                    "commit_id": "abc",
                 },
                 # Empty body — must be filtered out by GitHubClient.
                 {"id": 12, "user": {"login": "rev"}, "body": "  ", "state": "COMMENTED"},
@@ -433,9 +512,37 @@ async def test_list_pr_reviews(proxy_settings: Settings) -> None:
     items = resp.json()["items"]
     assert len(items) == 1
     assert items[0]["state"] == "APPROVED"
+    assert items[0]["commit_id"] == "abc"
 
 
-async def test_authenticated_login(proxy_settings: Settings) -> None:
+async def test_list_pr_commits(proxy_settings: ProxySettings) -> None:
+    def gh(req: httpx.Request) -> httpx.Response:
+        assert req.url.path == "/repos/octo/widget/pulls/1/commits"
+        return httpx.Response(
+            200,
+            json=[
+                {
+                    "sha": "abc",
+                    "author": {"login": "alice"},
+                    "commit": {"message": "Fix\nbody", "author": {"name": "Alice"}},
+                }
+            ],
+        )
+
+    app = _build_app(proxy_settings, gh)
+    async with await _async_client(app) as client:
+        resp = await client.get(
+            "/gh/v1/pr_commits",
+            params={"repo": "octo/widget", "pr_number": 1},
+            headers=_signed("GET", "/gh/v1/pr_commits", params={"repo": "octo/widget", "pr_number": 1}),
+        )
+    assert resp.status_code == 200
+    item = resp.json()["items"][0]
+    assert item["sha"] == "abc"
+    assert item["authors"][0]["login"] == "alice"
+
+
+async def test_authenticated_login(proxy_settings: ProxySettings) -> None:
     def gh(req: httpx.Request) -> httpx.Response:
         assert req.url.path == "/user"
         return httpx.Response(200, json={"login": "robomp-bot"})
@@ -455,7 +562,7 @@ async def test_authenticated_login(proxy_settings: Settings) -> None:
 # ============================================================================
 
 
-async def test_post_comment_forwards_body(proxy_settings: Settings) -> None:
+async def test_post_comment_forwards_body(proxy_settings: ProxySettings) -> None:
     captured: dict[str, httpx.Request] = {}
 
     def gh(req: httpx.Request) -> httpx.Response:
@@ -482,7 +589,7 @@ async def test_post_comment_forwards_body(proxy_settings: Settings) -> None:
     assert json.loads(req.content) == {"body": "hi"}
 
 
-async def test_add_issue_labels(proxy_settings: Settings) -> None:
+async def test_add_issue_labels(proxy_settings: ProxySettings) -> None:
     captured: dict[str, httpx.Request] = {}
 
     def gh(req: httpx.Request) -> httpx.Response:
@@ -505,7 +612,7 @@ async def test_add_issue_labels(proxy_settings: Settings) -> None:
     assert json.loads(captured["req"].content) == {"labels": ["triage", "bug"]}
 
 
-async def test_add_assignees(proxy_settings: Settings) -> None:
+async def test_add_assignees(proxy_settings: ProxySettings) -> None:
     captured: dict[str, httpx.Request] = {}
 
     def gh(req: httpx.Request) -> httpx.Response:
@@ -528,7 +635,7 @@ async def test_add_assignees(proxy_settings: Settings) -> None:
     assert json.loads(captured["req"].content) == {"assignees": ["alice"]}
 
 
-async def test_comment_reactions(proxy_settings: Settings) -> None:
+async def test_comment_reactions(proxy_settings: ProxySettings) -> None:
     captured: dict[str, httpx.Request] = {}
 
     def gh(req: httpx.Request) -> httpx.Response:
@@ -554,7 +661,7 @@ async def test_comment_reactions(proxy_settings: Settings) -> None:
     assert req.url.params.get("content") == "-1"
 
 
-async def test_close_issue(proxy_settings: Settings) -> None:
+async def test_close_issue(proxy_settings: ProxySettings) -> None:
     captured: dict[str, httpx.Request] = {}
 
     def gh(req: httpx.Request) -> httpx.Response:
@@ -579,7 +686,7 @@ async def test_close_issue(proxy_settings: Settings) -> None:
     assert json.loads(req.content) == {"state": "closed", "state_reason": "completed"}
 
 
-async def test_close_issue_defaults_reason_to_completed(proxy_settings: Settings) -> None:
+async def test_close_issue_defaults_reason_to_completed(proxy_settings: ProxySettings) -> None:
     captured: dict[str, httpx.Request] = {}
 
     def gh(req: httpx.Request) -> httpx.Response:
@@ -600,7 +707,7 @@ async def test_close_issue_defaults_reason_to_completed(proxy_settings: Settings
     assert json.loads(captured["req"].content) == {"state": "closed", "state_reason": "completed"}
 
 
-async def test_open_pull_request(proxy_settings: Settings) -> None:
+async def test_open_pull_request(proxy_settings: ProxySettings) -> None:
     captured: dict[str, httpx.Request] = {}
 
     def gh(req: httpx.Request) -> httpx.Response:
@@ -638,7 +745,7 @@ async def test_open_pull_request(proxy_settings: Settings) -> None:
     assert sent["title"] == "t"
 
 
-async def test_request_reviewers(proxy_settings: Settings) -> None:
+async def test_request_reviewers(proxy_settings: ProxySettings) -> None:
     captured: dict[str, httpx.Request] = {}
 
     def gh(req: httpx.Request) -> httpx.Response:
@@ -666,7 +773,7 @@ async def test_request_reviewers(proxy_settings: Settings) -> None:
 # ============================================================================
 
 
-async def test_github_error_passthrough_422(proxy_settings: Settings) -> None:
+async def test_github_error_passthrough_422(proxy_settings: ProxySettings) -> None:
     def gh(_: httpx.Request) -> httpx.Response:
         return httpx.Response(422, json={"message": "validation failed"})
 
@@ -690,9 +797,9 @@ async def test_github_error_passthrough_422(proxy_settings: Settings) -> None:
 # ============================================================================
 
 
-async def test_git_clone_creates_pool_dir(proxy_settings: Settings, upstream_repo: Path) -> None:
+async def test_git_clone_creates_pool_dir(proxy_settings: ProxySettings, upstream_repo: Path) -> None:
     app = _build_app(proxy_settings)
-    body = b'{"repo":"octo/widget","clone_url":"' + str(upstream_repo).encode() + b'","default_branch":"main"}'
+    body = b'{"repo":"test/widget","clone_url":"' + str(upstream_repo).encode() + b'","default_branch":"main"}'
     async with await _async_client(app) as client:
         resp = await client.post(
             "/gh/v1/git/clone",
@@ -702,12 +809,62 @@ async def test_git_clone_creates_pool_dir(proxy_settings: Settings, upstream_rep
     assert resp.status_code == 200
     pool_dir = Path(resp.json()["pool_dir"])
     assert pool_dir.is_dir()
-    assert pool_dir == Path(proxy_settings.workspace_root) / "_pool" / "octo__widget"
+    assert pool_dir == Path(proxy_settings.workspace_root) / "_pool" / "test__widget"
     assert (pool_dir / "HEAD").exists() or (pool_dir / ".git" / "HEAD").exists()
 
 
-async def test_git_fetch_repairs_missing_alternate_and_bad_ref(proxy_settings: Settings, upstream_repo: Path) -> None:
-    pool_dir = Path(proxy_settings.workspace_root) / "_pool" / "octo__widget"
+async def test_git_clone_rejects_local_remote_for_non_test_repo(proxy_settings: ProxySettings, upstream_repo: Path) -> None:
+    app = _build_app(proxy_settings)
+    body = b'{"repo":"octo/widget","clone_url":"' + str(upstream_repo).encode() + b'","default_branch":"main"}'
+    async with await _async_client(app) as client:
+        resp = await client.post(
+            "/gh/v1/git/clone",
+            content=body,
+            headers={**_signed("POST", "/gh/v1/git/clone", body), "Content-Type": "application/json"},
+        )
+    assert resp.status_code == 400
+    assert "local git remotes" in resp.text
+
+
+async def test_git_clone_rejects_mismatched_repo_url(proxy_settings: ProxySettings) -> None:
+    app = _build_app(proxy_settings)
+    body = b'{"repo":"octo/widget","clone_url":"https://github.com/attacker/other.git","default_branch":"main"}'
+    async with await _async_client(app) as client:
+        resp = await client.post(
+            "/gh/v1/git/clone",
+            content=body,
+            headers={**_signed("POST", "/gh/v1/git/clone", body), "Content-Type": "application/json"},
+        )
+    assert resp.status_code == 400
+    assert "clone url does not match repo" in resp.text
+
+
+def test_git_error_response_redacts_authorization() -> None:
+    test_git_error_response_redacts_secrets()
+
+
+
+
+def test_git_error_response_redacts_secrets() -> None:
+    from robomp.git_ops import GitCommandError
+    from robomp.proxy import server as proxy_server
+
+    token = "ghp_abcdefghijklmnopqrstuvwxyz123456"
+    exc = GitCommandError(
+        ["git", "fetch", f"https://x-access-token:{token}@github.com/octo/widget.git"],
+        128,
+        f"Authorization: Bearer {token}\n",
+        f"remote: https://alice:{token}@github.com/octo/widget.git\n",
+    )
+    resp = proxy_server._git_error_response(exc)  # noqa: SLF001 - redaction boundary
+    payload = json.loads(resp.body)
+    encoded = json.dumps(payload)
+    assert token not in encoded
+    assert "Authorization: Bearer ***" in encoded
+    assert "https://***@github.com/octo/widget.git" in encoded
+
+async def test_git_fetch_repairs_missing_alternate_and_bad_ref(proxy_settings: ProxySettings, upstream_repo: Path) -> None:
+    pool_dir = Path(proxy_settings.workspace_root) / "_pool" / "test__widget"
     pool_dir.parent.mkdir(parents=True, exist_ok=True)
     _git(["clone", "--filter=blob:none", str(upstream_repo), str(pool_dir)], Path(proxy_settings.workspace_root))
 
@@ -719,7 +876,7 @@ async def test_git_fetch_repairs_missing_alternate_and_bad_ref(proxy_settings: S
     alternates.write_text(str(Path(proxy_settings.workspace_root) / "missing-objects") + "\n", encoding="utf-8")
 
     app = _build_app(proxy_settings)
-    body = b'{"repo":"octo/widget"}'
+    body = b'{"repo":"test/widget"}'
     async with await _async_client(app) as client:
         resp = await client.post(
             "/gh/v1/git/fetch",
@@ -733,13 +890,137 @@ async def test_git_fetch_repairs_missing_alternate_and_bad_ref(proxy_settings: S
     assert not alternates.exists()
 
 
-async def test_git_push_happy_path(proxy_settings: Settings, upstream_repo: Path) -> None:
+async def test_git_prepare_pr_worktree_sparse_endpoint(proxy_settings: ProxySettings, tmp_path: Path) -> None:
+    upstream = _partial_clone_upstream(tmp_path)
+    _publish_pr_with_files(upstream, tmp_path)
+    _partial_pool(proxy_settings, upstream, tmp_path)
+    app = _build_app(proxy_settings)
+    body = (
+        b'{"repo":"test/widget","workspace_key":"test__widget__7","pr_number":7,'
+        b'"base_ref":"main","changed_paths":["src/changed.txt"]}'
+    )
+    async with await _async_client(app) as client:
+        resp = await client.post(
+            "/gh/v1/git/prepare_pr_worktree",
+            content=body,
+            headers={**_signed("POST", "/gh/v1/git/prepare_pr_worktree", body), "Content-Type": "application/json"},
+        )
+
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    repo_dir = Path(data["repo_dir"])
+    assert repo_dir.exists()
+    assert data["hydrated_paths"] == ["src/changed.txt"]
+    assert (repo_dir / "src/changed.txt").read_text(encoding="utf-8") == "changed payload\n"
+    assert not (repo_dir / "docs" / "untouched.txt").exists()
+
+
+async def test_git_prepare_pr_worktree_rejects_bad_workspace_key(
+    proxy_settings: ProxySettings, tmp_path: Path
+) -> None:
+    upstream = _partial_clone_upstream(tmp_path)
+    _publish_pr_with_files(upstream, tmp_path)
+    _partial_pool(proxy_settings, upstream, tmp_path)
+    app = _build_app(proxy_settings)
+    body = (
+        b'{"repo":"test/widget","workspace_key":"other__repo__7","pr_number":7,'
+        b'"base_ref":"main","changed_paths":["src/changed.txt"]}'
+    )
+    async with await _async_client(app) as client:
+        resp = await client.post(
+            "/gh/v1/git/prepare_pr_worktree",
+            content=body,
+            headers={**_signed("POST", "/gh/v1/git/prepare_pr_worktree", body), "Content-Type": "application/json"},
+        )
+
+    assert resp.status_code == 400
+    assert not (Path(proxy_settings.workspace_root) / "other__repo__7" / "repo").exists()
+
+
+async def test_git_prepare_pr_worktree_uses_proxy_timeout_setting(
+    proxy_settings: ProxySettings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from robomp.proxy import server as proxy_server
+
+    captured: dict[str, object] = {}
+    proxy_settings.gh_proxy_git_timeout_seconds = 42.0
+
+    def fake_prepare_pr_worktree(
+        pool: Path,
+        repo_dir: Path,
+        *,
+        pr_number: int,
+        base_ref: str,
+        changed_paths: list[str],
+        token: str | None,
+        timeout: float | None = None,
+    ):
+        captured["pool"] = pool
+        captured["repo_dir"] = repo_dir
+        captured["pr_number"] = pr_number
+        captured["base_ref"] = base_ref
+        captured["changed_paths"] = changed_paths
+        captured["token"] = token
+        captured["timeout"] = timeout
+        from robomp.git_ops import PrWorktreeResult
+
+        return PrWorktreeResult(head="abc", hydrated_paths=("src/changed.txt",))
+
+    monkeypatch.setattr(proxy_server, "git_prepare_pr_worktree", fake_prepare_pr_worktree)
+    monkeypatch.setattr(proxy_server, "_assert_origin_safe_for_repo", lambda *args, **kwargs: None)
+    app = _build_app(proxy_settings)
+    body = (
+        b'{"repo":"test/widget","workspace_key":"test__widget__7","pr_number":7,'
+        b'"base_ref":"main","changed_paths":["src/changed.txt"]}'
+    )
+    async with await _async_client(app) as client:
+        resp = await client.post(
+            "/gh/v1/git/prepare_pr_worktree",
+            content=body,
+            headers={**_signed("POST", "/gh/v1/git/prepare_pr_worktree", body), "Content-Type": "application/json"},
+        )
+
+    assert resp.status_code == 200, resp.text
+    assert captured["timeout"] == 37.0
+    assert captured["changed_paths"] == ["src/changed.txt"]
+
+
+async def test_git_fetch_pr_head_uses_proxy_timeout_setting(
+    proxy_settings: ProxySettings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from robomp.proxy import server as proxy_server
+
+    captured: dict[str, object] = {}
+    proxy_settings.gh_proxy_git_timeout_seconds = 42.0
+
+    def fake_fetch_pr_head(target: Path, pr_number: int, *, token: str | None, timeout: float | None = None) -> None:
+        captured["target"] = target
+        captured["pr_number"] = pr_number
+        captured["token"] = token
+        captured["timeout"] = timeout
+
+    monkeypatch.setattr(proxy_server, "git_fetch_pr_head", fake_fetch_pr_head)
+    app = _build_app(proxy_settings)
+    body = b'{"repo":"octo/widget","pr_number":8177}'
+    async with await _async_client(app) as client:
+        resp = await client.post(
+            "/gh/v1/git/fetch_pr_head",
+            content=body,
+            headers={**_signed("POST", "/gh/v1/git/fetch_pr_head", body), "Content-Type": "application/json"},
+        )
+
+    assert resp.status_code == 200, resp.text
+    assert captured["pr_number"] == 8177
+    assert captured["timeout"] == 37.0
+
+
+async def test_git_push_happy_path(proxy_settings: ProxySettings, upstream_repo: Path) -> None:
     branch = "farm/abc/feature"
-    _, head = _stage_workspace(proxy_settings, upstream_repo, "octo/widget", 1, branch)
+    _, head = _stage_workspace(proxy_settings, upstream_repo, "test/widget", 1, branch)
     # Rewire origin to the bare upstream so the proxy's push lands there.
     app = _build_app(proxy_settings)
     body = (
-        b'{"repo":"octo/widget","workspace_key":"octo__widget__1","branch":"'
+        b'{"repo":"test/widget","workspace_key":"test__widget__1","branch":"'
         + branch.encode()
         + b'","expected_head":"'
         + head.encode()
@@ -757,19 +1038,22 @@ async def test_git_push_happy_path(proxy_settings: Settings, upstream_repo: Path
 
 
 async def test_git_push_passes_slot_uid_to_git_push(
-    proxy_settings: Settings, upstream_repo: Path, monkeypatch: pytest.MonkeyPatch
+    proxy_settings: ProxySettings, upstream_repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from robomp.git_ops import PushResult
 
     branch = "farm/abc/slot"
-    repo_dir, head = _stage_workspace(proxy_settings, upstream_repo, "octo/widget", 1, branch)
+    repo_dir, head = _stage_workspace(proxy_settings, upstream_repo, "test/widget", 1, branch)
+    slot_uid = 2001
     # The push handler reads the origin URL as the slot uid. On Linux+root
     # the staged workspace is root-owned; hand it to slot 2001 so the
     # subprocess can stat it. On macOS dev this is a no-op (slot identity
-    # is never activated).
+    # is never activated), so use the actual owner for the new owner check.
     if platform.system() == "Linux" and os.geteuid() == 0:
         for path in [repo_dir.parent, repo_dir, *repo_dir.rglob("*")]:
-            os.chown(path, 2001, 2001, follow_symlinks=False)
+            os.chown(path, slot_uid, slot_uid, follow_symlinks=False)
+    else:
+        slot_uid = repo_dir.stat().st_uid
     captured: dict[str, object] = {}
 
     def fake_git_push(path: Path, **kwargs: object) -> PushResult:
@@ -779,13 +1063,15 @@ async def test_git_push_passes_slot_uid_to_git_push(
 
     monkeypatch.setattr("robomp.proxy.server.git_push", fake_git_push)
     app = _build_app(proxy_settings)
-    body = (
-        b'{"repo":"octo/widget","workspace_key":"octo__widget__1","branch":"'
-        + branch.encode()
-        + b'","expected_head":"'
-        + head.encode()
-        + b'","slot_uid":2001}'
-    )
+    body = json.dumps(
+        {
+            "repo": "test/widget",
+            "workspace_key": "test__widget__1",
+            "branch": branch,
+            "expected_head": head,
+            "slot_uid": slot_uid,
+        }
+    ).encode()
     async with await _async_client(app) as client:
         resp = await client.post(
             "/gh/v1/git/push",
@@ -795,11 +1081,11 @@ async def test_git_push_passes_slot_uid_to_git_push(
 
     assert resp.status_code == 200, resp.text
     assert captured["path"] == repo_dir
-    assert captured["slot_uid"] == 2001
+    assert captured["slot_uid"] == slot_uid
 
 
 @pytest.mark.parametrize("slot_uid", [0, -1, 65536])
-async def test_git_push_rejects_invalid_slot_uid(proxy_settings: Settings, slot_uid: int) -> None:
+async def test_git_push_rejects_invalid_slot_uid(proxy_settings: ProxySettings, slot_uid: int) -> None:
     app = _build_app(proxy_settings)
     body = (
         b'{"repo":"octo/widget","workspace_key":"octo__widget__1","branch":"x","expected_head":"'
@@ -819,13 +1105,63 @@ async def test_git_push_rejects_invalid_slot_uid(proxy_settings: Settings, slot_
     assert "slot_uid" in resp.text
 
 
-async def test_git_push_head_drift(proxy_settings: Settings, upstream_repo: Path) -> None:
+async def test_git_push_rejects_slot_owner_mismatch(proxy_settings: ProxySettings, upstream_repo: Path) -> None:
+    branch = "farm/abc/slot-owner"
+    repo_dir, head = _stage_workspace(proxy_settings, upstream_repo, "test/widget", 1, branch)
+    wrong_uid = repo_dir.stat().st_uid + 1
+    if wrong_uid >= 65536:
+        wrong_uid = repo_dir.stat().st_uid - 1
+    app = _build_app(proxy_settings)
+    body = json.dumps(
+        {
+            "repo": "test/widget",
+            "workspace_key": "test__widget__1",
+            "branch": branch,
+            "expected_head": head,
+            "slot_uid": wrong_uid,
+        }
+    ).encode()
+    async with await _async_client(app) as client:
+        resp = await client.post(
+            "/gh/v1/git/push",
+            content=body,
+            headers={**_signed("POST", "/gh/v1/git/push", body), "Content-Type": "application/json"},
+        )
+    assert resp.status_code == 400
+    assert "slot_uid does not match workspace owner" in resp.text
+
+
+async def test_git_push_rejects_mismatched_slot_uid(proxy_settings: ProxySettings, upstream_repo: Path) -> None:
+    await test_git_push_rejects_slot_owner_mismatch(proxy_settings, upstream_repo)
+
+
+async def test_git_push_rejects_invalid_branch_before_workspace_lookup(proxy_settings: ProxySettings) -> None:
+    app = _build_app(proxy_settings)
+    body = json.dumps(
+        {
+            "repo": "test/widget",
+            "workspace_key": "test__widget__1",
+            "branch": "-bad",
+            "expected_head": "0" * 40,
+        }
+    ).encode()
+    async with await _async_client(app) as client:
+        resp = await client.post(
+            "/gh/v1/git/push",
+            content=body,
+            headers={**_signed("POST", "/gh/v1/git/push", body), "Content-Type": "application/json"},
+        )
+    assert resp.status_code == 400
+    assert "branch" in resp.text
+
+
+async def test_git_push_head_drift(proxy_settings: ProxySettings, upstream_repo: Path) -> None:
     branch = "farm/abc/drift"
-    _, _ = _stage_workspace(proxy_settings, upstream_repo, "octo/widget", 1, branch)
+    _, _ = _stage_workspace(proxy_settings, upstream_repo, "test/widget", 1, branch)
     app = _build_app(proxy_settings)
     fake_head = "0" * 40
     body = (
-        b'{"repo":"octo/widget","workspace_key":"octo__widget__1","branch":"'
+        b'{"repo":"test/widget","workspace_key":"test__widget__1","branch":"'
         + branch.encode()
         + b'","expected_head":"'
         + fake_head.encode()
@@ -842,7 +1178,7 @@ async def test_git_push_head_drift(proxy_settings: Settings, upstream_repo: Path
     assert not _bare_has_branch(upstream_repo, branch)
 
 
-async def test_git_push_workspace_key_mismatch(proxy_settings: Settings) -> None:
+async def test_git_push_workspace_key_mismatch(proxy_settings: ProxySettings) -> None:
     app = _build_app(proxy_settings)
     body = (
         b'{"repo":"octo/widget","workspace_key":"other__repo__1","branch":"x","expected_head":"' + (b"0" * 40) + b'"}'
@@ -862,7 +1198,7 @@ async def test_git_push_workspace_key_mismatch(proxy_settings: Settings) -> None
 # ============================================================================
 
 
-async def test_hmac_rejects_query_mutation(proxy_settings: Settings) -> None:
+async def test_hmac_rejects_query_mutation(proxy_settings: ProxySettings) -> None:
     """Sign `/gh/v1/issue?repo=octo/widget&number=1`, replay with number=2.
 
     The verifier MUST notice the mutated query and 401. Without binding the
@@ -901,7 +1237,7 @@ async def test_hmac_rejects_query_mutation(proxy_settings: Settings) -> None:
 # ============================================================================
 
 
-async def test_oversized_content_length_rejected_with_413(proxy_settings: Settings) -> None:
+async def test_oversized_content_length_rejected_with_413(proxy_settings: ProxySettings) -> None:
     """Setting Content-Length above the cap is rejected at 413 cheaply.
 
     With the fix in place the proxy never reads the (huge) body into memory:
@@ -922,7 +1258,7 @@ async def test_oversized_content_length_rejected_with_413(proxy_settings: Settin
     assert resp.status_code == 413, resp.text
 
 
-async def test_streamed_body_above_cap_rejected_with_413(proxy_settings: Settings) -> None:
+async def test_streamed_body_above_cap_rejected_with_413(proxy_settings: ProxySettings) -> None:
     """When Content-Length is honest but > cap, we still 413."""
     proxy_settings.gh_proxy_max_body_bytes = 64  # type: ignore[misc]
     app = _build_app(proxy_settings, lambda _: httpx.Response(500, json={}))
@@ -941,7 +1277,7 @@ async def test_streamed_body_above_cap_rejected_with_413(proxy_settings: Setting
 # ============================================================================
 
 
-async def test_git_push_rejects_attacker_origin(proxy_settings: Settings, upstream_repo: Path) -> None:
+async def test_git_push_rejects_attacker_origin(proxy_settings: ProxySettings, upstream_repo: Path) -> None:
     """If the worktree's origin is rewritten to a non-github HTTPS URL,
     the push endpoint MUST refuse with 400 BEFORE invoking `git push` (which
     would carry the PAT to the attacker's host)."""
@@ -969,7 +1305,7 @@ async def test_git_push_rejects_attacker_origin(proxy_settings: Settings, upstre
     assert not _bare_has_branch(upstream_repo, branch)
 
 
-async def test_git_push_rejects_origin_with_wrong_repo(proxy_settings: Settings, upstream_repo: Path) -> None:
+async def test_git_push_rejects_origin_with_wrong_repo(proxy_settings: ProxySettings, upstream_repo: Path) -> None:
     """github.com host is not enough — owner/repo MUST match the request."""
     branch = "farm/abc/mismatch"
     repo_dir, head = _stage_workspace(proxy_settings, upstream_repo, "octo/widget", 1, branch)
@@ -991,3 +1327,59 @@ async def test_git_push_rejects_origin_with_wrong_repo(proxy_settings: Settings,
         )
     assert resp.status_code == 400, resp.text
     assert not _bare_has_branch(upstream_repo, branch)
+
+
+async def test_git_fetch_pr_head_rejects_bool_pr_number(proxy_settings: ProxySettings) -> None:
+    """JSON true for pr_number should be rejected with HTTP 400."""
+    app = _build_app(proxy_settings)
+    body = json.dumps({"repo": "octo/widget", "pr_number": True}).encode()
+    headers = _signed("POST", "/gh/v1/git/fetch_pr_head", body, key=_HMAC.encode())
+    async with await _async_client(app) as client:
+        resp = await client.post("/gh/v1/git/fetch_pr_head", content=body, headers=headers)
+    assert resp.status_code == 400
+    assert "pr_number" in resp.text
+
+
+async def test_git_push_uses_proxy_timeout_setting(
+    proxy_settings: ProxySettings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """git_push should receive timeout=_git_subprocess_timeout() from proxy settings."""
+    from robomp.proxy import server as proxy_server
+
+    captured: dict[str, Any] = {}
+
+    def mock_git_push(*args: Any, **kwargs: Any) -> Any:
+        from robomp.git_ops import PushResult
+        captured.update(kwargs)
+        return PushResult(head="abc123", branch="test-branch")
+
+    def mock_workspace_repo_dir(*args: Any) -> Path:
+        # Mock workspace directory that "exists"
+        return Path("/fake/workspace/test__widget__123/repo")
+
+    def mock_is_dir(self) -> bool:
+        return True
+
+    def mock_assert_origin_safe(*args: Any, **kwargs: Any) -> None:
+        # Mock the origin safety check to do nothing
+        return None
+
+    monkeypatch.setattr(proxy_server, "git_push", mock_git_push)
+    monkeypatch.setattr(proxy_server, "_workspace_repo_dir", mock_workspace_repo_dir)
+    monkeypatch.setattr("pathlib.Path.is_dir", mock_is_dir)
+    monkeypatch.setattr(proxy_server, "_assert_origin_safe_for_repo", mock_assert_origin_safe)
+    proxy_settings.gh_proxy_git_timeout_seconds = 42.0
+
+    app = _build_app(proxy_settings)
+    body = json.dumps({
+        "repo": "test/widget",
+        "workspace_key": "test__widget__123",
+        "branch": "test-branch",
+        "expected_head": "abc123",
+    }).encode()
+    headers = _signed("POST", "/gh/v1/git/push", body, key=_HMAC.encode())
+    async with await _async_client(app) as client:
+        resp = await client.post("/gh/v1/git/push", content=body, headers=headers)
+
+    assert resp.status_code == 200, resp.text
+    assert captured["timeout"] == 37.0

@@ -28,10 +28,15 @@ import pytest
 
 INTEGRATION = os.environ.get("ROBOMP_INTEGRATION") == "1"
 
-pytestmark = pytest.mark.skipif(
-    not INTEGRATION,
-    reason="ROBOMP_INTEGRATION=1 required to run the omp-backed smoke test",
-)
+pytestmark = [
+    pytest.mark.integration,
+    pytest.mark.local_git,
+    pytest.mark.slow,
+    pytest.mark.skipif(
+        not INTEGRATION,
+        reason="ROBOMP_INTEGRATION=1 required to run the omp-backed smoke test",
+    ),
+]
 
 
 def _git(cwd: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:

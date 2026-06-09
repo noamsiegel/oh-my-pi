@@ -33,7 +33,7 @@ robomp = "robomp.cli:main"
 
 [tool.setuptools]
 package-dir = { "robomp" = "src" }
-packages = ["robomp", "robomp.proxy"]
+packages = ["robomp", "robomp.proxy", "robomp.routers"]
 
 [tool.setuptools.package-data]
 robomp = ["prompts/*", "py.typed", "static/*", "static/assets/*"]
@@ -41,6 +41,12 @@ robomp = ["prompts/*", "py.typed", "static/*", "static/assets/*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+markers = [
+  "integration: tests that exercise external integration flows",
+  "permission_e2e: slot permission end-to-end tests requiring Linux root",
+  "local_git: tests that create or mutate local git repositories",
+  "slow: tests that are intentionally heavier than unit tests",
+]
 filterwarnings = [
   "ignore::DeprecationWarning",
 ]

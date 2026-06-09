@@ -16,46 +16,71 @@ import pytest
 from robomp.config import Settings
 from robomp.db import Database, EventRow
 from robomp.queue import WorkerPool
-from robomp.slot_pool import SlotPool
+from tests.fakes import (
+    RecordingGitHub as _StubGitHub,
+)
+from tests.fakes import (
+    RecordingSandbox as _StubSandbox,
+)
+from tests.fakes import (
+    StubGitTransport as _StubGitTransport,
+)
+from tests.fakes import (
+    event_row_factory as _row,
+)
+from tests.fakes import (
+    make_pool as _make_pool,
+)
 
 
-class _StubGitHub:
-    """Sentinel; queue tests don't talk to GitHub."""
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("event_type", "payload"),
+    [
+        ("pull_request", {"action": "labeled", "pull_request": {"number": 1}, "repository": {"full_name": "octo/widget"}}),
+        (
+            "pull_request",
+            {"action": "synchronize", "pull_request": {"number": 1}, "repository": {"full_name": "octo/widget"}},
+        ),
+        (
+            "issues",
+            {
+                "action": "labeled",
+                "issue": {"number": 1, "pull_request": {"url": "https://api.github.com/repos/octo/widget/pulls/1"}},
+                "repository": {"full_name": "octo/widget"},
+            },
+        ),
+    ],
+)
+async def test_pr_review_label_queue_actions_dispatch_review_pr(
+    settings: Settings, db: Database, monkeypatch: pytest.MonkeyPatch, event_type: str, payload: dict
+) -> None:
+    from robomp import queue
 
+    calls: list[dict] = []
 
-class _StubSandbox:
-    """Sentinel; queue tests don't touch the workspace pool."""
+    async def fake_review_pr(**kwargs):
+        calls.append(kwargs)
 
-    natives_cache = None
-
-
-class _StubGitTransport:
-    """Sentinel; queue tests don't push."""
-
-
-def _make_pool(settings: Settings, db: Database) -> WorkerPool:
-    return WorkerPool(
-        settings=settings,
-        db=db,
-        github=_StubGitHub(),  # type: ignore[arg-type]
-        sandbox=_StubSandbox(),  # type: ignore[arg-type]
-        git_transport=_StubGitTransport(),  # type: ignore[arg-type]
-        slot_pool=SlotPool(),
-    )
-
-
-def _row(delivery: str = "d1") -> EventRow:
-    return EventRow(
-        delivery_id=delivery,
-        event_type="issues",
+    monkeypatch.setattr(queue.tasks, "review_pr", fake_review_pr)
+    pool = _make_pool(settings, db)
+    row = EventRow(
+        delivery_id="d-pr-review",
+        event_type=event_type,
         repo="octo/widget",
         issue_key="octo/widget#1",
-        payload={"action": "opened"},
+        payload=payload,
         received_at="2026-01-01T00:00:00Z",
         state="running",
         attempts=1,
         last_error=None,
     )
+
+    await pool._dispatch(row)  # noqa: SLF001
+
+    assert len(calls) == 1
+    assert calls[0]["payload"] is payload
+    assert calls[0]["delivery_id"] == "d-pr-review"
 
 
 @pytest.mark.asyncio

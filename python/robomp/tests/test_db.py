@@ -25,6 +25,31 @@ def test_record_event_dedupes_by_delivery(db: Database) -> None:
     )
 
 
+def test_events_persist_route_task(db: Database) -> None:
+    assert db.record_event(
+        delivery_id="route-1",
+        event_type="issues",
+        repo="octo/widget",
+        issue_key=issue_key("octo/widget", 7),
+        payload={"action": "opened"},
+        task="triage_issue",
+        route_reason="issues.opened",
+        route_version=2,
+    )
+    row = db.get_event("route-1")
+    assert row is not None
+    assert row.task == "triage_issue"
+    assert row.route_reason == "issues.opened"
+    assert row.route_version == 2
+    assert row.outcome == "queued"
+
+    claimed = db.claim_next_event()
+    assert claimed is not None
+    assert claimed.task == "triage_issue"
+    db.mark_event("route-1", "done")
+    assert db.get_event("route-1").outcome == "done"
+
+
 def test_claim_next_event_singleton_under_contention(db: Database) -> None:
     for i in range(5):
         db.record_event(
@@ -262,6 +287,20 @@ def test_log_tool_call(db: Database) -> None:
         result={"comment_id": 9},
     )
     assert row_id > 0
+
+
+def test_side_effect_reservation_is_unique(db: Database) -> None:
+    operation_key = "post_pr_review_failed_comment:d-1"
+
+    assert db.reserve_side_effect(operation_key)
+    assert not db.reserve_side_effect(operation_key)
+    assert not db.side_effect_succeeded(operation_key)
+
+    assert db.mark_side_effect_failed(operation_key, "transient")
+    assert db.reserve_side_effect(operation_key)
+    assert db.mark_side_effect_succeeded(operation_key)
+    assert db.side_effect_succeeded(operation_key)
+    assert not db.reserve_side_effect(operation_key)
 
 
 def test_pr_review_comment_staging_round_trip(db: Database) -> None:
@@ -650,3 +689,158 @@ def test_requeue_claimed_closure_only_flips_claimed(db: Database) -> None:
     assert row is not None and row.state == "pending"
     # Now in pending state, requeue is a no-op.
     assert not db.requeue_claimed_closure(_KEY)
+
+
+# -------- PR review learning -------------------------------------------
+
+
+def test_pr_review_lifecycle_event_dedupes_delivery(db: Database) -> None:
+    assert db.record_pr_review_lifecycle_event(
+        delivery_id="delivery-1",
+        event_type="pull_request_review_comment",
+        action="created",
+        repo="octo/widget",
+        pr_number=12,
+        object_kind="review_comment",
+        object_id="100",
+        actor_login="reviewer",
+        body="Please add a regression test.",
+    )
+    assert not db.record_pr_review_lifecycle_event(
+        delivery_id="delivery-1",
+        event_type="pull_request_review_comment",
+        action="created",
+        repo="octo/widget",
+        pr_number=12,
+        object_kind="review_comment",
+    )
+
+
+def test_pr_review_posted_finding_status_update_by_comment(db: Database) -> None:
+    count = db.record_pr_review_posted_findings(
+        issue_key="octo/widget#12",
+        repo="octo/widget",
+        pr_number=12,
+        head_sha="abc",
+        review_id=44,
+        findings=[
+            {
+                "path": "src/a.ts",
+                "line": 10,
+                "body": "Fix this bug.",
+                "severity": "required",
+                "intent": "bug",
+                "category": "correctness",
+                "suggestion_replacement": "return true;",
+            }
+        ],
+        posted_comments=[{"id": 55, "path": "src/a.ts", "line": 10, "body": "Fix this bug."}],
+    )
+    assert count == 1
+    assert db.record_pr_review_posted_findings(
+        issue_key="octo/widget#12",
+        repo="octo/widget",
+        pr_number=12,
+        head_sha="abc",
+        review_id=44,
+        findings=[{"path": "src/a.ts", "line": 10, "body": "Fix this bug.", "severity": "required", "intent": "bug", "suggestion_replacement": "return true;"}],
+        posted_comments=[{"id": 55, "path": "src/a.ts", "line": 10, "body": "Fix this bug."}],
+    ) == 0
+
+    rows = db.list_pr_review_posted_findings("octo/widget", 12)
+    assert len(rows) == 1
+    assert rows[0].comment_id == 55
+    assert rows[0].review_id == 44
+    assert rows[0].severity == "required"
+    assert rows[0].suggestion_hash
+
+    assert db.update_pr_review_posted_finding_status(comment_id=55, status="resolved", reason="thread resolved") == 1
+    assert db.list_pr_review_posted_findings("octo/widget", 12)[0].status == "resolved"
+
+
+def test_pr_review_gap_event_dedupes_and_lists(db: Database) -> None:
+    kwargs = dict(
+        gap_kind="missed_by_agent",
+        repo="octo/widget",
+        pr_number=12,
+        head_sha="abc",
+        source_label="human",
+        source_object_kind="review_comment",
+        source_object_id="100",
+        severity_hint="required",
+        confidence=0.8,
+        reason="human signal",
+        path="src/a.ts",
+        line=10,
+        body="Please add a test.",
+    )
+    assert db.record_pr_review_gap_event(**kwargs)
+    assert not db.record_pr_review_gap_event(**kwargs)
+    rows = db.list_pr_review_gap_events("octo/widget", 12)
+    assert len(rows) == 1
+    assert rows[0].gap_kind == "missed_by_agent"
+    assert rows[0].body_hash
+
+
+def test_pr_review_merged_with_unaddressed_required_gap(db: Database) -> None:
+    assert db.record_pr_review_gap_event(
+        gap_kind="merged_with_unaddressed_required",
+        repo="octo/widget",
+        pr_number=12,
+        head_sha="abc",
+        source_label="agent",
+        source_object_kind="pull_request",
+        source_object_id="12",
+        severity_hint="required",
+        confidence=1.0,
+        reason="merged with required finding still open",
+        matched_posted_finding_id="finding-1",
+    )
+    rows = db.list_pr_review_gap_events("octo/widget", 12)
+    assert rows[0].gap_kind == "merged_with_unaddressed_required"
+def test_migration_adds_event_route_columns_to_existing_db(tmp_path: Path) -> None:
+    """Opening a legacy events table adds route/task columns without losing rows."""
+    import sqlite3
+    db_path = tmp_path / "legacy.sqlite"
+    # Create legacy DB without model column
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript("""
+        CREATE TABLE events (
+            delivery_id TEXT PRIMARY KEY,
+            event_type TEXT NOT NULL,
+            repo TEXT,
+            issue_key TEXT,
+            payload_json TEXT NOT NULL,
+            received_at TEXT NOT NULL,
+            state TEXT NOT NULL CHECK (state IN ('queued','running','done','failed','skipped')),
+            attempts INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT,
+            started_at TEXT,
+            finished_at TEXT
+        );
+        
+        INSERT INTO events (delivery_id, event_type, repo, issue_key, payload_json, received_at, state) 
+        VALUES ('d-1', 'issues', 'octo/widget', 'octo/widget#1', '{"issue": {"number": 1}}', '2026-05-15T10:00:00.000000Z', 'queued');
+        """)
+    
+    # Open with Database class - should trigger migration
+    database = Database(db_path)
+    # Assert migrated event columns exist.
+    with sqlite3.connect(db_path) as conn:
+        columns = conn.execute("PRAGMA table_info(events)").fetchall()
+        column_names = [col[1] for col in columns]
+        assert {"model", "task", "route_reason", "route_version", "outcome"}.issubset(column_names)
+    # Call set_event_model
+    database.set_event_model("d-1", "claude-sonnet-4-0")
+    events = database.list_events()
+    assert len(events) == 1
+    assert events[0].task is None
+    assert events[0].route_reason is None
+    assert events[0].route_version == 1
+    assert events[0].outcome is None
+    # Assert model visible through running events API
+    database.mark_event("d-1", "running")
+    running = database.list_running_events()
+    assert len(running) == 1
+    # list_running_events returns dict format, so use subscript access
+    assert running[0]["model"] == "claude-sonnet-4-0"

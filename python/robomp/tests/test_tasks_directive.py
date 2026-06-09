@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
-from robomp.tasks import _directive_from_payload
+from unittest.mock import patch
+
+from robomp.tasks import _attach_thread, _directive_from_payload
+from robomp.worker import DirectiveInfo, ThreadMessage
 
 
 def test_directive_from_payload_parses_pragmas() -> None:
@@ -65,3 +68,36 @@ def test_directive_from_payload_parses_implementation_authorization() -> None:
 def test_directive_from_payload_returns_none_for_missing_directive() -> None:
     assert _directive_from_payload({}) is None
     assert _directive_from_payload({"_robomp_directive": "not-a-mapping"}) is None
+
+
+def test_attach_thread_preserves_authorizes_impl() -> None:
+    """Test that _attach_thread preserves DirectiveInfo.authorizes_impl=True."""
+    directive = DirectiveInfo(
+        body="go", 
+        author="maintainer", 
+        authorizes_impl=True
+    )
+    mock_thread = ThreadMessage(
+        kind="comment",
+        author="test",
+        body="test message",
+        created_at="2026-06-09T00:00:00Z"
+    )
+    
+    # Mock _fetch_thread to return our test thread
+    with patch("robomp.tasks._fetch_thread", return_value=[mock_thread]):
+        import asyncio
+        from robomp.github_backend import GitHubBackend
+        
+        # Create a mock GitHubBackend since we're not actually using it
+        github = None
+        
+        # Call _attach_thread directly
+        result = asyncio.run(_attach_thread(github, directive, "repo", 123, is_pr=False))
+    
+    # Verify authorizes_impl is preserved and thread is attached
+    assert result is not None
+    assert result.authorizes_impl is True
+    assert result.thread == [mock_thread]
+    assert result.body == "go"
+    assert result.author == "maintainer"

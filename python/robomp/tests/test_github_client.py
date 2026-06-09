@@ -7,11 +7,24 @@ import asyncio
 import httpx
 import pytest
 
-from robomp.github_client import GitHubClient, GitHubError
+from robomp.github_client import GitHubClient
+from robomp.github_types import GitHubError
 
 
 def _run_async(coro):
     return asyncio.new_event_loop().run_until_complete(coro)
+
+
+async def test_async_client_reused_and_closed_per_instance() -> None:
+    client = GitHubClient("tok", transport=httpx.MockTransport(lambda req: httpx.Response(200, json=[])))
+    first = client._async_client()
+    second = client._async_client()
+    assert first is second
+    async with client:
+        assert client._async_client() is first
+    assert first.is_closed
+    assert client._async_client() is not first
+    await client.aclose()
 
 
 def test_4xx_maps_to_github_error_with_message() -> None:
@@ -138,7 +151,15 @@ def test_list_pr_files_parses_changed_file_summary() -> None:
         assert request.url.params.get("per_page") == "100"
         return httpx.Response(
             200,
-            json=[{"filename": "src/app.py", "status": "modified", "additions": 5, "deletions": 2}],
+            json=[
+                {
+                    "filename": "src/app.py",
+                    "status": "renamed",
+                    "additions": 5,
+                    "deletions": 2,
+                    "previous_filename": "src/old_app.py",
+                }
+            ],
         )
 
     client = GitHubClient("tok", transport=httpx.MockTransport(handler))
@@ -147,6 +168,7 @@ def test_list_pr_files_parses_changed_file_summary() -> None:
     assert files[0].path == "src/app.py"
     assert files[0].additions == 5
     assert files[0].deletions == 2
+    assert files[0].previous_filename == "src/old_app.py"
 
 
 def test_list_pr_files_paginates_past_first_page() -> None:
@@ -181,6 +203,132 @@ def test_list_pr_files_paginates_past_first_page() -> None:
     assert len(files) == 101
     assert files[-1].path == "src/final.py"
 
+
+def test_list_comments_paginates_past_first_page() -> None:
+    seen_pages: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/repos/octo/widget/issues/9/comments"
+        page = request.url.params.get("page")
+        seen_pages.append(page)
+        if page == "1":
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "id": idx,
+                        "user": {"login": "alice"},
+                        "body": f"comment {idx}",
+                        "created_at": "2026-01-01T00:00:00Z",
+                    }
+                    for idx in range(100)
+                ],
+            )
+        assert page == "2"
+        return httpx.Response(
+            200,
+            json=[
+                {
+                    "id": 101,
+                    "user": {"login": "bob"},
+                    "body": "final",
+                    "created_at": "2026-01-02T00:00:00Z",
+                }
+            ],
+        )
+
+    client = GitHubClient("tok", transport=httpx.MockTransport(handler))
+    comments = _run_async(client.list_comments("octo/widget", 9))
+    assert seen_pages == ["1", "2"]
+    assert len(comments) == 101
+    assert comments[-1].body == "final"
+
+
+def test_list_pr_commits_parses_message_and_authors() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/repos/octo/widget/pulls/9/commits"
+        assert request.url.params.get("per_page") == "100"
+        return httpx.Response(
+            200,
+            json=[
+                {
+                    "sha": "abc",
+                    "author": {"login": "alice"},
+                    "committer": {"login": "github-actions[bot]"},
+                    "commit": {
+                        "message": "Fix bug\n\nLong body",
+                        "author": {"name": "Alice"},
+                        "committer": {"name": "CI"},
+                    },
+                }
+            ],
+        )
+
+    client = GitHubClient("tok", transport=httpx.MockTransport(handler))
+    commits = _run_async(client.list_pr_commits("octo/widget", 9))
+    assert commits[0].sha == "abc"
+    assert commits[0].message_headline == "Fix bug"
+    assert commits[0].message_body == "\nLong body"
+    assert [(a.login, a.name) for a in commits[0].authors] == [
+        ("alice", ""),
+        ("github-actions[bot]", ""),
+        ("", "Alice"),
+        ("", "CI"),
+    ]
+
+
+def test_list_pr_reviews_preserves_commit_id() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/repos/octo/widget/pulls/9/reviews"
+        return httpx.Response(
+            200,
+            json=[
+                {
+                    "id": 1,
+                    "user": {"login": "robomp-bot"},
+                    "body": "needs fixes",
+                    "state": "CHANGES_REQUESTED",
+                    "submitted_at": "2026-01-01T00:00:00Z",
+                    "commit_id": "oldsha",
+                }
+            ],
+        )
+
+    client = GitHubClient("tok", transport=httpx.MockTransport(handler))
+    reviews = _run_async(client.list_pr_reviews("octo/widget", 9))
+    assert reviews[0].commit_id == "oldsha"
+
+
+def test_list_review_comments_for_review_parses_ids_and_hunk() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/repos/octo/widget/pulls/9/reviews/44/comments"
+        return httpx.Response(
+            200,
+            json=[
+                {
+                    "id": 55,
+                    "pull_request_review_id": 44,
+                    "user": {"login": "robomp-bot"},
+                    "body": "finding",
+                    "path": "src/app.py",
+                    "line": 12,
+                    "start_line": 10,
+                    "original_line": 12,
+                    "html_url": "https://github.test/c/55",
+                    "commit_id": "abc",
+                    "diff_hunk": "@@ -1 +1 @@",
+                    "in_reply_to_id": 54,
+                    "created_at": "2026-01-01T00:00:00Z",
+                }
+            ],
+        )
+
+    client = GitHubClient("tok", transport=httpx.MockTransport(handler))
+    comments = _run_async(client.list_review_comments_for_review("octo/widget", 9, 44))
+    assert comments[0].review_id == 44
+    assert comments[0].commit_id == "abc"
+    assert comments[0].diff_hunk == "@@ -1 +1 @@"
+    assert comments[0].in_reply_to_id == 54
 
 def test_submit_pr_review_posts_comment_event_and_inline_comments() -> None:
     captured: dict[str, object] = {}

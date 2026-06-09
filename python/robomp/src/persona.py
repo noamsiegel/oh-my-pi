@@ -16,7 +16,12 @@ from importlib import resources
 from typing import Any
 
 from robomp.git_ops import DirtyState
-from robomp.github_client import CommentInfo, IssueInfo, PullRequestInfo, RepoInfo
+from robomp.github_types import (
+    CommentInfo,
+    IssueInfo,
+    PullRequestInfo,
+    RepoInfo,
+)
 from robomp.sandbox import Workspace
 
 _PLACEHOLDER = re.compile(r"\{\{\s*([a-zA-Z0-9_.]+)\s*\}\}")

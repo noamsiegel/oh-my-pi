@@ -16,15 +16,23 @@ import pytest
 from robomp import host_tools
 from robomp.db import Database
 from robomp.github_backend import GitHubBackend
-from robomp.github_client import IssueInfo, RepoInfo
+from robomp.github_types import (
+    IssueInfo,
+    RepoInfo,
+)
 from robomp.natives_cache import NativesCache
 from robomp.natives_cache import compute_key as natives_compute_key
 from robomp.sandbox import LocalGitTransport, SandboxManager, Workspace
 
-pytestmark = pytest.mark.skipif(
-    os.environ.get("ROBOMP_PERMISSION_E2E") != "1",
-    reason="set ROBOMP_PERMISSION_E2E=1 to run slot-permission e2e tests",
-)
+pytestmark = [
+    pytest.mark.permission_e2e,
+    pytest.mark.local_git,
+    pytest.mark.slow,
+    pytest.mark.skipif(
+        os.environ.get("ROBOMP_PERMISSION_E2E") != "1",
+        reason="set ROBOMP_PERMISSION_E2E=1 to run slot-permission e2e tests",
+    ),
+]
 
 _SLOT_ONE = 2001
 _SLOT_TWO = 2002

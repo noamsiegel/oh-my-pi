@@ -18,8 +18,9 @@ import logging
 import os
 import platform
 import re
+import signal
 import subprocess
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -32,6 +33,9 @@ log = logging.getLogger(__name__)
 AUTH_ENV_VAR = "ROBOMP_GIT_HTTP_AUTH"
 
 _CRED_URL = re.compile(r"(https?://)([^:/@\s]+):([^@/\s]+)@")
+_AUTH_HEADER_SECRET_RE = re.compile(r"(?i)\b(Authorization:\s*(?:Basic|Bearer)\s+)([^\s'\"]+)")
+_X_ACCESS_TOKEN_RE = re.compile(r"x-access-token:[^@/\s]+")
+_GITHUB_PAT_RE = re.compile(r"\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9_]{20,}\b|github_pat_[A-Za-z0-9_]+")
 _BAD_OBJECT_REF_RE = re.compile(
     r"(?:fatal: bad object (?P<bad>refs/[^\s]+)|error: (?P<invalid>refs/[^\s]+) does not point to a valid object!)"
 )
@@ -39,6 +43,27 @@ _FETCH_PRUNE_REPAIR_ATTEMPTS = 8
 
 _SHARED_OMP_GID = 2000
 _AGENT_HOME = Path("/srv/agent-home")
+_GIT_PARENT_ENV_KEYS: frozenset[str] = frozenset({"PATH", "LANG", "LC_ALL"})
+
+
+def _git_base_env(*, user: int | None = None) -> dict[str, str]:
+    env: dict[str, str] = {
+        key: value
+        for key, value in os.environ.items()
+        if key in _GIT_PARENT_ENV_KEYS or key.startswith("LC_")
+    }
+    if user is not None and _AGENT_HOME.is_dir():
+        env["HOME"] = str(_AGENT_HOME)
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    return env
+
+
+def _apply_controlled_git_env(env: dict[str, str], extra_env: Mapping[str, str] | None) -> None:
+    if not extra_env:
+        return
+    for key, value in extra_env.items():
+        if key.startswith("GIT_CONFIG_") or key == AUTH_ENV_VAR:
+            env[key] = value
 
 
 def _slot_permissions_active(slot_uid: int | None) -> bool:
@@ -75,15 +100,23 @@ def _local_remote_safe_directory(remote_url: str, *, cwd: Path) -> Path | None:
     return path if path.is_absolute() else (cwd / path).resolve()
 
 
-def redact_credentials(text: str | None) -> str:
-    """Strip `user:password@` from any embedded URL in `text`."""
+def redact_secrets(text: str | None) -> str:
+    """Strip credentials and token-shaped secrets from git output/argv text."""
     if not text:
         return text or ""
-    return _CRED_URL.sub(r"\1***@", text)
+    redacted = _CRED_URL.sub(r"\1***@", text)
+    redacted = _AUTH_HEADER_SECRET_RE.sub(r"\1***", redacted)
+    redacted = _X_ACCESS_TOKEN_RE.sub("x-access-token:***", redacted)
+    return _GITHUB_PAT_RE.sub("***", redacted)
+
+
+def redact_credentials(text: str | None) -> str:
+    """Backward-compatible wrapper for git secret redaction."""
+    return redact_secrets(text)
 
 
 def _redacted_cmd(cmd: list[str]) -> list[str]:
-    return [redact_credentials(part) for part in cmd]
+    return [redact_secrets(part) for part in cmd]
 
 
 class GitCommandError(RuntimeError):
@@ -120,6 +153,51 @@ event loop, but only this `timeout=` + kill below frees the OS process.
 """
 
 
+def _run_process(
+    args: list[str],
+    *,
+    cwd: Path | None,
+    env: Mapping[str, str],
+    timeout: float | None,
+    stdin: str | None = None,
+    user: int | None = None,
+    group: int | None = None,
+    extra_groups: list[int] | tuple[int, ...] | None = None,
+    umask: int | None = None,
+) -> subprocess.CompletedProcess[str]:
+    subprocess_kwargs: dict[str, Any] = {}
+    if user is not None:
+        subprocess_kwargs["user"] = user
+    if group is not None:
+        subprocess_kwargs["group"] = group
+    if extra_groups is not None:
+        subprocess_kwargs["extra_groups"] = extra_groups
+    if umask is not None:
+        subprocess_kwargs["umask"] = umask
+    proc = subprocess.Popen(
+        args,
+        cwd=str(cwd) if cwd else None,
+        env=dict(env),
+        text=True,
+        stdin=subprocess.PIPE if stdin is not None else None,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+        **subprocess_kwargs,
+    )
+    try:
+        stdout, stderr = proc.communicate(stdin, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        stdout, stderr = proc.communicate()
+        timeout_text = "unknown" if timeout is None else f"{timeout:g}"
+        raise GitCommandError(args, 124, stdout or "", f"git timed out after {timeout_text}s") from exc
+    return subprocess.CompletedProcess(args, proc.returncode, stdout or "", stderr or "")
+
+
 def _run_git(
     args: list[str],
     *,
@@ -132,6 +210,7 @@ def _run_git(
     extra_groups: list[int] | tuple[int, ...] | None = None,
     umask: int | None = None,
     timeout: float | None = None,
+    stdin: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run `git <args>` with optional PAT injection via `--config-env`.
 
@@ -140,16 +219,12 @@ def _run_git(
     (e.g. when probing for ref existence). Stdout/stderr are always
     credential-redacted before being returned.
 
-    On `timeout` expiry the child (and any descendants spawned by git's
-    helpers) is killed and `GitCommandError` is raised with a synthetic
-    returncode (124, matching coreutils `timeout`). `None` uses
-    `_DEFAULT_GIT_TIMEOUT_SECONDS`.
+    On `timeout` expiry the child process group is killed and `GitCommandError`
+    is raised with a synthetic returncode (124, matching coreutils `timeout`).
+    `None` uses `_DEFAULT_GIT_TIMEOUT_SECONDS`.
     """
-    env: dict[str, str] = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
-    if user is not None and _AGENT_HOME.is_dir():
-        env["HOME"] = str(_AGENT_HOME)
-    if extra_env:
-        env.update(extra_env)
+    env = _git_base_env(user=user)
+    _apply_controlled_git_env(env, extra_env)
     if safe_directory is not None:
         _append_safe_directory(env, safe_directory)
 
@@ -160,38 +235,21 @@ def _run_git(
     cmd.extend(args)
     log.debug("git", extra={"cmd": _redacted_cmd(cmd), "cwd": str(cwd) if cwd else None})
     effective_timeout = _DEFAULT_GIT_TIMEOUT_SECONDS if timeout is None else timeout
-    subprocess_kwargs: dict[str, Any] = {}
-    if user is not None:
-        subprocess_kwargs["user"] = user
-    if group is not None:
-        subprocess_kwargs["group"] = group
-    if extra_groups is not None:
-        subprocess_kwargs["extra_groups"] = extra_groups
-    if umask is not None:
-        subprocess_kwargs["umask"] = umask
-    try:
-        proc = subprocess.run(
-            cmd,
-            cwd=str(cwd) if cwd else None,
-            env=env,
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=effective_timeout,
-            **subprocess_kwargs,
-        )
-    except subprocess.TimeoutExpired as exc:
-        # `subprocess.run` already kills the direct child when the timeout
-        # fires, but we explicitly re-raise as `GitCommandError` so callers
-        # don't have to special-case `TimeoutExpired` alongside the regular
-        # non-zero-exit error path. 124 mirrors GNU `timeout`.
-        stdout = redact_credentials(exc.stdout or "") if isinstance(exc.stdout, str) else ""
-        stderr_msg = f"git timed out after {effective_timeout:.0f}s: {' '.join(_redacted_cmd(cmd))}"
-        raise GitCommandError(cmd, 124, stdout, stderr_msg) from exc
+    proc = _run_process(
+        cmd,
+        cwd=cwd,
+        env=env,
+        timeout=effective_timeout,
+        stdin=stdin,
+        user=user,
+        group=group,
+        extra_groups=extra_groups,
+        umask=umask,
+    )
     if proc.stdout:
-        proc.stdout = redact_credentials(proc.stdout)
+        proc.stdout = redact_secrets(proc.stdout)
     if proc.stderr:
-        proc.stderr = redact_credentials(proc.stderr)
+        proc.stderr = redact_secrets(proc.stderr)
     return proc
 
 
@@ -388,6 +446,7 @@ def clone(
     default_branch: str,
     token: str | None,
     safe_directory: Path | None = None,
+    timeout: float | None = None,
 ) -> None:
     """Fresh `git clone --filter=blob:none` into `target`."""
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -400,10 +459,10 @@ def clone(
         clone_url,
         str(target),
     ]
-    _check(_run_git(args, cwd=None, token=token, safe_directory=safe_directory), ["git", *args])
+    _check(_run_git(args, cwd=None, token=token, safe_directory=safe_directory, timeout=timeout), ["git", *args])
 
 
-def fetch_prune(repo_dir: Path, *, token: str | None, safe_directory: Path | None = None) -> None:
+def fetch_prune(repo_dir: Path, *, token: str | None, safe_directory: Path | None = None, timeout: float | None = None) -> None:
     """`git fetch --prune origin` on the shared pool clone.
 
     Pool clones are long-lived. If a transient git object alternate leaks into
@@ -417,7 +476,7 @@ def fetch_prune(repo_dir: Path, *, token: str | None, safe_directory: Path | Non
     _prune_missing_alternates(repo_dir)
     last_proc: subprocess.CompletedProcess[str] | None = None
     for _ in range(_FETCH_PRUNE_REPAIR_ATTEMPTS):
-        proc = _run_git(args, cwd=repo_dir, token=token, safe_directory=safe_directory)
+        proc = _run_git(args, cwd=repo_dir, token=token, safe_directory=safe_directory, timeout=timeout)
         if proc.returncode == 0:
             return
         last_proc = proc
@@ -428,7 +487,7 @@ def fetch_prune(repo_dir: Path, *, token: str | None, safe_directory: Path | Non
     _check(last_proc, ["git", *args])
 
 
-def fetch_ref(repo_dir: Path, ref: str, *, token: str | None, safe_directory: Path | None = None) -> None:
+def fetch_ref(repo_dir: Path, ref: str, *, token: str | None, safe_directory: Path | None = None, timeout: float | None = None) -> None:
     """Fetch ``<ref>`` from origin AND materialize every reachable blob locally.
 
     Callers invoke this immediately before a ``git worktree add`` / checkout
@@ -452,7 +511,7 @@ def fetch_ref(repo_dir: Path, ref: str, *, token: str | None, safe_directory: Pa
     surface a more actionable error than this fetch ever could).
     """
     args = ["fetch", "--refetch", "--no-filter", "origin", ref]
-    proc = _run_git(args, cwd=repo_dir, token=token, safe_directory=safe_directory)
+    proc = _run_git(args, cwd=repo_dir, token=token, safe_directory=safe_directory, timeout=timeout)
     if proc.returncode != 0:
         log.debug(
             "fetch_ref non-fatal failure",
@@ -466,6 +525,7 @@ def fetch_pr_head(
     *,
     token: str | None,
     safe_directory: Path | None = None,
+    timeout: float | None = None,
 ) -> None:
     """Fetch ``refs/pull/<n>/head`` into FETCH_HEAD with all reachable blobs.
 
@@ -478,7 +538,176 @@ def fetch_pr_head(
     if pr_number <= 0:
         raise ValueError(f"invalid PR number: {pr_number!r}")
     args = ["fetch", "--refetch", "--no-filter", "origin", f"pull/{pr_number}/head"]
-    _check(_run_git(args, cwd=repo_dir, token=token, safe_directory=safe_directory), ["git", *args])
+    _check(_run_git(args, cwd=repo_dir, token=token, safe_directory=safe_directory, timeout=timeout), ["git", *args])
+
+
+@dataclass(slots=True, frozen=True)
+class PrWorktreeResult:
+    head: str
+    hydrated_paths: tuple[str, ...]
+
+
+def normalize_pr_sparse_paths(paths: Iterable[str]) -> tuple[str, ...]:
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for raw in paths:
+        path = raw.strip().replace("\\", "/")
+        parts = path.split("/")
+        if (
+            not path
+            or "\0" in path
+            or path.startswith("/")
+            or path.endswith("/")
+            or ".." in parts
+            or ".git" in parts
+        ):
+            raise ValueError(f"unsafe PR sparse checkout path: {raw!r}")
+        if path in seen:
+            continue
+        seen.add(path)
+        normalized.append(path)
+    if not normalized:
+        raise ValueError("PR sparse checkout requires at least one changed path")
+    return tuple(normalized)
+
+
+def _is_safe_pr_base_ref(base_ref: str) -> bool:
+    if not base_ref or base_ref.startswith("-") or base_ref.startswith("/") or ".." in base_ref:
+        return False
+    return "\0" not in base_ref and "\r" not in base_ref and "\n" not in base_ref
+
+
+def _sanitize_path_error(text: str, path: str, ref: str) -> str:
+    return text.replace(f"{ref}:{path}", f"{ref}:<path>").replace(path, "<path>")
+
+
+def _git_ref_exists(
+    repo_dir: Path,
+    ref: str,
+    path: str,
+    *,
+    token: str | None,
+    timeout: float | None = None,
+) -> bool:
+    cmd_path = f"{ref}:{path}"
+    try:
+        proc = _run_git(["cat-file", "-e", cmd_path], cwd=repo_dir, token=token, timeout=timeout)
+    except GitCommandError as exc:
+        raise GitCommandError(
+            ["git", "cat-file", "-e", f"{ref}:<path>"],
+            exc.returncode,
+            _sanitize_path_error(exc.stdout, path, ref),
+            _sanitize_path_error(exc.stderr, path, ref),
+        ) from exc
+    if proc.returncode == 0:
+        return True
+    output = f"{proc.stderr}\n{proc.stdout}".lower()
+    missing_markers = (
+        "does not exist in",
+        "not a valid object name",
+        "exists on disk, but not in",
+        "pathspec",
+    )
+    if any(marker in output for marker in missing_markers):
+        return False
+    raise GitCommandError(
+        ["git", "cat-file", "-e", f"{ref}:<path>"],
+        proc.returncode,
+        _sanitize_path_error(proc.stdout, path, ref),
+        _sanitize_path_error(proc.stderr, path, ref),
+    )
+
+
+def _sparse_checkout_set(
+    repo_dir: Path,
+    paths: tuple[str, ...],
+    *,
+    token: str | None,
+    safe_directory: Path | None,
+    timeout: float | None,
+) -> None:
+    args = ["sparse-checkout", "set", "--no-cone", "--stdin"]
+    proc = _run_git(
+        args,
+        cwd=repo_dir,
+        token=token,
+        safe_directory=safe_directory,
+        timeout=timeout,
+        stdin="\n".join(paths) + "\n",
+    )
+    if proc.returncode == 0:
+        return
+    output = f"{proc.stderr}\n{proc.stdout}".lower()
+    if "stdin" not in output or ("unknown option" not in output and "unrecognized option" not in output):
+        _check(proc, ["git", *args])
+    fallback_args = ["sparse-checkout", "set", "--no-cone", "--", *paths]
+    _check(
+        _run_git(
+            fallback_args,
+            cwd=repo_dir,
+            token=token,
+            safe_directory=safe_directory,
+            timeout=timeout,
+        ),
+        ["git", *fallback_args],
+    )
+
+
+def prepare_pr_worktree(
+    pool_dir: Path,
+    repo_dir: Path,
+    *,
+    pr_number: int,
+    base_ref: str,
+    changed_paths: Iterable[str],
+    token: str | None,
+    safe_directory: Path | None = None,
+    timeout: float | None = None,
+) -> PrWorktreeResult:
+    if pr_number <= 0:
+        raise ValueError(f"invalid PR number: {pr_number!r}")
+    paths = normalize_pr_sparse_paths(changed_paths)
+    if not _is_safe_pr_base_ref(base_ref):
+        raise ValueError(f"invalid PR base ref: {base_ref!r}")
+    if repo_dir.exists():
+        raise GitCommandError(["git", "worktree", "add"], 128, "", f"worktree already exists: {repo_dir}")
+    repo_dir.parent.mkdir(parents=True, exist_ok=True)
+
+    base_fetch = ["fetch", "--prune", "origin", base_ref]
+    _check(
+        _run_git(base_fetch, cwd=pool_dir, token=token, safe_directory=safe_directory, timeout=timeout),
+        ["git", *base_fetch],
+    )
+    pr_fetch = ["fetch", "origin", f"pull/{pr_number}/head"]
+    _check(
+        _run_git(pr_fetch, cwd=pool_dir, token=token, safe_directory=safe_directory, timeout=timeout),
+        ["git", *pr_fetch],
+    )
+    worktree_args = ["worktree", "add", "--detach", "--no-checkout", str(repo_dir), "FETCH_HEAD"]
+    _check(
+        _run_git(worktree_args, cwd=pool_dir, token=token, safe_directory=safe_directory, timeout=timeout),
+        ["git", *worktree_args],
+    )
+    sparse_init = ["sparse-checkout", "init", "--no-cone"]
+    _check(
+        _run_git(sparse_init, cwd=repo_dir, token=token, safe_directory=safe_directory, timeout=timeout),
+        ["git", *sparse_init],
+    )
+    _sparse_checkout_set(repo_dir, paths, token=token, safe_directory=safe_directory, timeout=timeout)
+    checkout_args = ["checkout", "--force"]
+    _check(
+        _run_git(checkout_args, cwd=repo_dir, token=token, safe_directory=safe_directory, timeout=timeout),
+        ["git", *checkout_args],
+    )
+    for path in paths:
+        _git_ref_exists(repo_dir, "HEAD", path, token=token, timeout=timeout)
+        _git_ref_exists(repo_dir, f"origin/{base_ref}", path, token=token, timeout=timeout)
+    diff_args = ["diff", "--name-only", f"origin/{base_ref}...HEAD", "--"]
+    _check(
+        _run_git(diff_args, cwd=repo_dir, token=token, safe_directory=safe_directory, timeout=timeout),
+        ["git", *diff_args],
+    )
+    return PrWorktreeResult(head=rev_parse_head(repo_dir, safe_directory=safe_directory), hydrated_paths=paths)
 
 
 @dataclass(slots=True, frozen=True)
@@ -614,6 +843,7 @@ def push(
     token: str | None,
     slot_uid: int | None = None,
     safe_directory: Path | None = None,
+    timeout: float | None = None,
 ) -> PushResult:
     """`git push --force-with-lease=<ref>:<sha> --set-upstream origin <branch>` from `repo_dir`.
 
@@ -658,12 +888,12 @@ def push(
         cwd=repo_dir,
         token=None,
         safe_directory=git_safe_directory,
+        timeout=timeout,
         **slot_kwargs,
     )
     expected_remote = probe.stdout.strip() if probe.returncode == 0 else ""
-    push_extra_env: dict[str, str] | None = None
     origin = _run_git(
-        ["remote", "get-url", "origin"], cwd=repo_dir, token=None, safe_directory=git_safe_directory, **slot_kwargs
+        ["remote", "get-url", "origin"], cwd=repo_dir, token=None, safe_directory=git_safe_directory, timeout=timeout, **slot_kwargs
     )
     if origin.returncode == 0:
         local_remote = _local_remote_safe_directory(origin.stdout, cwd=repo_dir)
@@ -674,7 +904,7 @@ def push(
     args = ["push", lease, "--set-upstream", "origin", branch]
     _check(
         _run_git(
-            args, cwd=repo_dir, token=token, extra_env=push_extra_env, safe_directory=git_safe_directory, **slot_kwargs
+            args, cwd=repo_dir, token=token, extra_env=push_extra_env, safe_directory=git_safe_directory, timeout=timeout, **slot_kwargs
         ),
         ["git", *args],
     )
@@ -686,13 +916,16 @@ __all__ = [
     "DirtyState",
     "GitCommandError",
     "HeadDriftError",
+    "PrWorktreeResult",
     "PushResult",
     "clone",
     "fetch_pr_head",
     "fetch_prune",
     "fetch_ref",
-    "inspect_dirty_state",
+    "normalize_pr_sparse_paths",
+    "prepare_pr_worktree",
     "push",
     "redact_credentials",
+    "redact_secrets",
     "rev_parse_head",
 ]

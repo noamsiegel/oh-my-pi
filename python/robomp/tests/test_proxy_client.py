@@ -14,11 +14,11 @@ import httpx
 import pytest
 from pydantic import SecretStr
 
-from robomp.config import Settings
+from robomp.config import ProxySettings
 from robomp.git_ops import HeadDriftError
-from robomp.github_client import (
+from robomp.github_client import GitHubClient
+from robomp.github_types import (
     CommentInfo,
-    GitHubClient,
     GitHubError,
     IssueInfo,
     IssueSummary,
@@ -42,8 +42,8 @@ _TOKEN = "ghp_test_token_value"
 # ---------- shared helpers ----------
 
 
-def _build_settings(tmp_path: Path) -> Settings:
-    cfg = Settings.model_construct(
+def _build_settings(tmp_path: Path) -> ProxySettings:
+    cfg = ProxySettings.model_construct(
         github_token=SecretStr(_TOKEN),
         github_webhook_secret=SecretStr("webhook-secret"),
         bot_login="robomp-bot",
@@ -56,13 +56,14 @@ def _build_settings(tmp_path: Path) -> Settings:
         workspace_root=tmp_path / "workspaces",
         sqlite_path=tmp_path / "robomp.sqlite",
         log_dir=tmp_path / "logs",
+        pr_review_self_improve_enabled=False,
     )
     cfg.ensure_paths()
     return cfg
 
 
 @pytest.fixture
-def proxy_settings(tmp_path: Path) -> Settings:
+def proxy_settings(tmp_path: Path) -> ProxySettings:
     return _build_settings(tmp_path)
 
 
@@ -98,8 +99,54 @@ def upstream_repo(tmp_path: Path) -> Path:
     _git(["-C", str(seed), "push", "origin", "main"], tmp_path)
     return repo
 
+def _partial_clone_upstream(tmp_path: Path) -> Path:
+    repo = tmp_path / "partial-upstream.git"
+    repo.mkdir()
+    _git(["init", "--initial-branch=main", "--bare", str(repo)], tmp_path)
+    _git(["-C", str(repo), "config", "uploadpack.allowFilter", "true"], tmp_path)
+    _git(["-C", str(repo), "config", "uploadpack.allowAnySHA1InWant", "true"], tmp_path)
+    seed = tmp_path / "partial-seed"
+    seed.mkdir()
+    _git(["init", "--initial-branch=main", str(seed)], tmp_path)
+    (seed / "README.md").write_text("hello\n", encoding="utf-8")
+    _git(["-C", str(seed), "add", "."], tmp_path)
+    _git(["-C", str(seed), "commit", "-m", "init"], tmp_path)
+    _git(["-C", str(seed), "remote", "add", "origin", str(repo)], tmp_path)
+    _git(["-C", str(seed), "push", "origin", "main"], tmp_path)
+    return repo
 
-def _stage_workspace(cfg: Settings, upstream: Path, repo: str, number: int, branch: str) -> tuple[Path, str]:
+
+def _publish_pr_with_files(upstream: Path, tmp_path: Path) -> None:
+    pr_seed = tmp_path / "client-pr-seed"
+    _git(["clone", f"file://{upstream}", str(pr_seed)], tmp_path)
+    (pr_seed / "src").mkdir()
+    (pr_seed / "docs").mkdir()
+    (pr_seed / "src" / "changed.txt").write_text("changed payload\n", encoding="utf-8")
+    (pr_seed / "docs" / "untouched.txt").write_text("untouched payload\n", encoding="utf-8")
+    _git(["-C", str(pr_seed), "add", "src/changed.txt", "docs/untouched.txt"], tmp_path)
+    _git(["-C", str(pr_seed), "commit", "-m", "add pr files"], tmp_path)
+    _git(["-C", str(pr_seed), "push", "origin", "HEAD:refs/pull/7/head"], tmp_path)
+
+
+def _partial_pool(proxy_settings: ProxySettings, upstream: Path, tmp_path: Path) -> Path:
+    pool = Path(proxy_settings.workspace_root) / "_pool" / "test__widget"
+    pool.parent.mkdir(parents=True, exist_ok=True)
+    _git(
+        [
+            "clone",
+            "--filter=blob:none",
+            "--no-tags",
+            "--branch",
+            "main",
+            f"file://{upstream}",
+            str(pool),
+        ],
+        tmp_path,
+    )
+    return pool
+
+
+def _stage_workspace(cfg: ProxySettings, upstream: Path, repo: str, number: int, branch: str) -> tuple[Path, str]:
     ws_dir = Path(cfg.workspace_root) / workspace_key(repo, number)
     ws_dir.mkdir(parents=True, exist_ok=True)
     repo_dir = ws_dir / "repo"
@@ -204,7 +251,7 @@ async def test_signed_headers_present_and_verify() -> None:
 
 
 @pytest.fixture
-def round_trip_app(proxy_settings: Settings):
+def round_trip_app(proxy_settings: ProxySettings):
     """A proxy app whose GitHub-side `app.state.github` answers every GH
     endpoint the GitHubProxyClient exercises in the round-trip test."""
     app = create_proxy_app(proxy_settings)
@@ -277,6 +324,35 @@ def round_trip_app(proxy_settings: Settings):
                     }
                 ],
             )
+        if path == "/repos/octo/widget/pulls/2/reviews/12/comments":
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "id": 10,
+                        "pull_request_review_id": 12,
+                        "user": {"login": "rev"},
+                        "body": "finding",
+                        "path": "a.py",
+                        "line": 6,
+                        "created_at": "2026-01-01T00:00:00Z",
+                        "commit_id": "def",
+                        "diff_hunk": "@@ -1 +1 @@",
+                        "in_reply_to_id": 9,
+                    }
+                ],
+            )
+        if path == "/repos/octo/widget/pulls/2/commits":
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "sha": "abc",
+                        "author": {"login": "alice"},
+                        "commit": {"message": "Fix\nbody", "author": {"name": "Alice"}},
+                    }
+                ],
+            )
         if path == "/repos/octo/widget/pulls/2/reviews" and req.method == "GET":
             return httpx.Response(
                 200,
@@ -287,13 +363,22 @@ def round_trip_app(proxy_settings: Settings):
                         "body": "approved",
                         "state": "APPROVED",
                         "submitted_at": "2026-01-01T00:00:00Z",
+                        "commit_id": "abc",
                     }
                 ],
             )
         if path == "/repos/octo/widget/pulls/2/files":
             return httpx.Response(
                 200,
-                json=[{"filename": "src/app.py", "status": "modified", "additions": 2, "deletions": 1}],
+                json=[
+                    {
+                        "filename": "src/app.py",
+                        "status": "renamed",
+                        "additions": 2,
+                        "deletions": 1,
+                        "previous_filename": "src/old.py",
+                    }
+                ],
             )
         if path == "/repos/octo/widget/pulls/2/reviews" and req.method == "POST":
             body = json.loads(req.content)
@@ -369,13 +454,23 @@ async def test_round_trip_all_endpoints(round_trip_app) -> None:
     rcs = await client.list_review_comments("octo/widget", 2)
     assert len(rcs) == 1 and isinstance(rcs[0], ReviewCommentInfo)
     assert rcs[0].line == 5
+    review_rcs = await client.list_review_comments_for_review("octo/widget", 2, 12)
+    assert review_rcs[0].review_id == 12
+    assert review_rcs[0].commit_id == "def"
+    assert review_rcs[0].in_reply_to_id == 9
+
 
     prs = await client.list_pr_reviews("octo/widget", 2)
     assert len(prs) == 1 and isinstance(prs[0], PullRequestReviewInfo)
+    assert prs[0].commit_id == "abc"
 
+    commits = await client.list_pr_commits("octo/widget", 2)
+    assert commits[0].sha == "abc"
+    assert commits[0].authors[0].login == "alice"
     files = await client.list_pr_files("octo/widget", 2)
     assert len(files) == 1 and isinstance(files[0], PullRequestFileInfo)
     assert files[0].path == "src/app.py"
+    assert files[0].previous_filename == "src/old.py"
 
     submitted = await client.submit_pr_review(
         repo="octo/widget",
@@ -410,7 +505,7 @@ async def test_round_trip_all_endpoints(round_trip_app) -> None:
     assert await client.add_assignees("octo/widget", 1, ["alice"]) is None
 
 
-async def test_list_comment_reactions_round_trip(proxy_settings: Settings) -> None:
+async def test_list_comment_reactions_round_trip(proxy_settings: ProxySettings) -> None:
     app = create_proxy_app(proxy_settings)
     app.state.settings = proxy_settings
 
@@ -435,7 +530,7 @@ async def test_list_comment_reactions_round_trip(proxy_settings: Settings) -> No
     assert reactions == (ReactionInfo(content="-1", user_login="alice", user_type="User"),)
 
 
-async def test_close_issue_round_trip(proxy_settings: Settings) -> None:
+async def test_close_issue_round_trip(proxy_settings: ProxySettings) -> None:
     captured: dict[str, object] = {}
     app = create_proxy_app(proxy_settings)
     app.state.settings = proxy_settings
@@ -484,9 +579,10 @@ async def test_error_decode_github_422() -> None:
 # ============================================================================
 
 
-def test_proxy_git_transport_push_happy(proxy_settings: Settings, upstream_repo: Path) -> None:
-    branch = "farm/abc/feat"
-    _, head = _stage_workspace(proxy_settings, upstream_repo, "octo/widget", 1, branch)
+def test_proxy_git_transport_prepare_pr_worktree_sparse_e2e(proxy_settings: ProxySettings, tmp_path: Path) -> None:
+    upstream = _partial_clone_upstream(tmp_path)
+    _publish_pr_with_files(upstream, tmp_path)
+    pool = _partial_pool(proxy_settings, upstream, tmp_path)
     app = create_proxy_app(proxy_settings)
     app.state.settings = proxy_settings
     _attach_gh(app, lambda _: httpx.Response(500, json={"message": "should not be hit"}))
@@ -496,10 +592,47 @@ def test_proxy_git_transport_push_happy(proxy_settings: Settings, upstream_repo:
         hmac_key=_HMAC,
         transport=_SyncASGIBridge(app),
     )
+    repo_dir = Path(proxy_settings.workspace_root) / "test__widget__7" / "repo"
+    result = transport.prepare_pr_worktree(
+        repo="test/widget",
+        pool_dir=pool,
+        repo_dir=repo_dir,
+        pr_number=7,
+        base_ref="main",
+        changed_paths=("src/changed.txt",),
+    )
+
+    assert result.hydrated_paths == ("src/changed.txt",)
+    assert (repo_dir / "src/changed.txt").read_text(encoding="utf-8") == "changed payload\n"
+    assert not (repo_dir / "docs" / "untouched.txt").exists()
+    _git(["-C", str(pool), "remote", "set-url", "origin", "https://example.invalid/missing.git"], tmp_path)
+    diff_proc = subprocess.run(
+        ["git", "-C", str(repo_dir), "diff", "--name-only", "origin/main...HEAD", "--"],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=os.environ | {"GIT_TERMINAL_PROMPT": "0"},
+    )
+    assert "src/changed.txt" in diff_proc.stdout.splitlines()
+
+
+def test_proxy_git_transport_push_happy(proxy_settings: ProxySettings, upstream_repo: Path) -> None:
+    branch = "farm/abc/feat"
+    _, head = _stage_workspace(proxy_settings, upstream_repo, "test/widget", 1, branch)
+    app = create_proxy_app(proxy_settings)
+    app.state.settings = proxy_settings
+    _attach_gh(app, lambda _: httpx.Response(500, json={"message": "should not be hit"}))
+
+    transport = ProxyGitTransport(
+        base_url="http://proxy.test",
+        hmac_key=_HMAC,
+        transport=_SyncASGIBridge(app),
+    )
+    key = workspace_key("test/widget", 1)
     result = transport.push_branch(
-        repo="octo/widget",
-        workspace_key=workspace_key("octo/widget", 1),
-        repo_dir=Path(proxy_settings.workspace_root) / workspace_key("octo/widget", 1) / "repo",
+        repo="test/widget",
+        workspace_key=key,
+        repo_dir=Path(proxy_settings.workspace_root) / key / "repo",
         branch=branch,
         expected_head=head,
     )
@@ -508,9 +641,9 @@ def test_proxy_git_transport_push_happy(proxy_settings: Settings, upstream_repo:
     assert _bare_has_branch(upstream_repo, branch)
 
 
-def test_proxy_git_transport_push_head_drift(proxy_settings: Settings, upstream_repo: Path) -> None:
+def test_proxy_git_transport_push_head_drift(proxy_settings: ProxySettings, upstream_repo: Path) -> None:
     branch = "farm/abc/drift"
-    _, _ = _stage_workspace(proxy_settings, upstream_repo, "octo/widget", 1, branch)
+    _, _ = _stage_workspace(proxy_settings, upstream_repo, "test/widget", 1, branch)
     app = create_proxy_app(proxy_settings)
     app.state.settings = proxy_settings
     _attach_gh(app, lambda _: httpx.Response(500, json={"message": "should not be hit"}))
@@ -520,11 +653,12 @@ def test_proxy_git_transport_push_head_drift(proxy_settings: Settings, upstream_
         hmac_key=_HMAC,
         transport=_SyncASGIBridge(app),
     )
+    key = workspace_key("test/widget", 1)
     with pytest.raises(HeadDriftError):
         transport.push_branch(
-            repo="octo/widget",
-            workspace_key=workspace_key("octo/widget", 1),
-            repo_dir=Path(proxy_settings.workspace_root) / workspace_key("octo/widget", 1) / "repo",
+            repo="test/widget",
+            workspace_key=key,
+            repo_dir=Path(proxy_settings.workspace_root) / key / "repo",
             branch=branch,
             expected_head="0" * 40,
         )

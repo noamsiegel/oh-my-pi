@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 
-from robomp.config import Settings, reset_settings_cache
-from robomp.dashboard import reset_index_cache, static_dir
+from robomp.config import OrchestratorSettings as Settings
+from robomp.config import reset_settings_cache
+from robomp.dashboard import reset_index_cache
 from robomp.db import Database, close_database
 
 # Minimum HTML the dashboard handler needs to render: `<title>` plus a script
@@ -25,20 +27,23 @@ _PLACEHOLDER_INDEX_HTML = (
 )
 
 
-@pytest.fixture(autouse=True, scope="session")
-def _ensure_dashboard_bundle() -> None:
-    """Guarantee a renderable dashboard bundle for the whole session.
+@pytest.fixture
+def dashboard_bundle(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
+    """Provide a built-dashboard stand-in only to tests that render `/`."""
+    from robomp import dashboard
 
-    The real bundle is produced by `bun run web:build`; CI and fresh clones
-    might not have run it yet. We only synthesise an `index.html` when one
-    isn't already present, so a developer's locally-built bundle isn't
-    clobbered by the test run.
-    """
-    directory = static_dir()
+    directory = tmp_path / "dashboard-static"
+    directory.mkdir()
     index = directory / "index.html"
-    if not index.exists():
-        index.write_text(_PLACEHOLDER_INDEX_HTML, encoding="utf-8")
+    index.write_text(_PLACEHOLDER_INDEX_HTML, encoding="utf-8")
+
+    monkeypatch.setattr(dashboard, "_STATIC_DIR", directory)
+    monkeypatch.setattr(dashboard, "_INDEX_PATH", index)
     reset_index_cache()
+    try:
+        yield directory
+    finally:
+        reset_index_cache()
 
 
 @pytest.fixture(autouse=True)
@@ -90,6 +95,7 @@ def _baseline_env(tmp_path: Path) -> dict[str, str]:
         "ROBOMP_WORKSPACE_ROOT": str(tmp_path / "workspaces"),
         "ROBOMP_SQLITE_PATH": str(tmp_path / "robomp.sqlite"),
         "ROBOMP_LOG_DIR": str(tmp_path / "logs"),
+        "ROBOMP_PR_REVIEW_SELF_IMPROVE_REPORT_DIR": str(tmp_path / "pr-review-self-improvements"),
         # Production default is `/data/cache/pi-natives` (provisioned by the
         # container entrypoint). Tests need a writable, isolated path; we also
         # default-disable the cache so its background GC loop doesn't add
@@ -120,17 +126,15 @@ def env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> dict[str, str]:
 
 @pytest.fixture
 def proxy_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> dict[str, str]:
-    """Baseline env for the gh-proxy container: holds the PAT, no proxy vars."""
+    """Baseline env for the gh-proxy container: holds the PAT + HMAC key, no proxy URL."""
     baseline = _baseline_env(tmp_path)
     baseline.pop("ROBOMP_GH_PROXY_URL", None)
-    baseline.pop("ROBOMP_GH_PROXY_HMAC_KEY", None)
     baseline["GITHUB_TOKEN"] = "ghp_test_token_value_xxxxxxxxxxxxxxxx"
     for key, value in baseline.items():
         monkeypatch.setenv(key, value)
     # Same defense-in-depth as `env`: setenv("") rather than delenv so
     # pydantic_settings doesn't fall back to the on-disk `.env` file.
     monkeypatch.setenv("ROBOMP_GH_PROXY_URL", "")
-    monkeypatch.setenv("ROBOMP_GH_PROXY_HMAC_KEY", "")
     monkeypatch.delenv("ROBOMP_PROVIDER", raising=False)
     monkeypatch.setenv("ROBOMP_REPLAY_TOKEN", "")
     reset_settings_cache()
