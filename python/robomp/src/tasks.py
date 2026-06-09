@@ -406,7 +406,15 @@ async def triage_issue(
 
 def _comment_review_retryable(review_body: str) -> bool:
     body = review_body.lower()
-    return "promotedsection is not defined" in body
+    retryable_markers = (
+        "promotedsection is not defined",
+        "command not found: uv",
+        "`uv` is not installed",
+        "`uv` is unavailable",
+        "uv is not installed",
+        "uv is unavailable",
+    )
+    return any(marker in body for marker in retryable_markers)
 
 
 async def review_pr(

@@ -22,6 +22,14 @@ def _now_iso() -> str:
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
+def test_comment_review_retryable_includes_uv_environment_failures() -> None:
+    assert tasks._comment_review_retryable("Verification note: uv is not installed in this workspace.")
+    assert tasks._comment_review_retryable("Verification note: `uv` is not installed in this workspace.")
+    assert tasks._comment_review_retryable("error: command not found: uv")
+    assert tasks._comment_review_retryable("local backend command could not run because uv is unavailable")
+    assert not tasks._comment_review_retryable("review:clean — no blocking findings.")
+
+
 def _old_iso(seconds: float) -> str:
     return (datetime.now(UTC) - timedelta(seconds=seconds)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
