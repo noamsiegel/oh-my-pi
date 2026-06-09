@@ -34,13 +34,13 @@ def test_payload_label_name_reads_github_label_object() -> None:
 
 
 def test_review_label_matching_is_case_insensitive_and_exact() -> None:
-    allowlist = frozenset({"robo-review"})
-    labels = [" Robo-Review ", "mailroom", "review:robo-review", "robo-review-extra"]
-    assert matching_review_labels(labels, allowlist) == frozenset({"robo-review"})
+    allowlist = frozenset({"robo-review", "hoa", "mail"})
+    labels = [" Robo-Review ", "HOA", " mail ", "mailroom", "review:robo-review", "robo-review-extra"]
+    assert matching_review_labels(labels, allowlist) == frozenset({"robo-review", "hoa", "mail"})
     assert has_review_label(labels, allowlist)
 
 
 def test_review_label_matching_rejects_prefixes() -> None:
-    allowlist = frozenset({"robo-review"})
+    allowlist = frozenset({"robo-review", "hoa", "mail"})
     assert matching_review_labels(["robo-review-extra", "mailroom", "review:robo-review"], allowlist) == frozenset()
     assert not has_review_label(["robo-review-extra", "mailroom", "review:robo-review"], allowlist)

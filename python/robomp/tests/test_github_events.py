@@ -225,7 +225,7 @@ def test_route_incoming_pr_opened_label_allowlist_exact_matching() -> None:
         },
         "repository": {"full_name": "octo/widget"},
     }
-    allow = frozenset({"robo-review"})
+    allow = frozenset({"robo-review", "hoa", "mail"})
 
     unlabeled = route("pull_request", base_payload, allowlist=ALLOWLIST, bot_login=BOT, pr_review_label_allowlist=allow)
     assert not unlabeled.should_queue
@@ -238,6 +238,14 @@ def test_route_incoming_pr_opened_label_allowlist_exact_matching() -> None:
     base_payload["pull_request"]["labels"] = [{"name": "ROBO-REVIEW"}]  # type: ignore[index]
     robo_review_upper = route("pull_request", base_payload, allowlist=ALLOWLIST, bot_login=BOT, pr_review_label_allowlist=allow)
     assert robo_review_upper.should_queue
+
+    base_payload["pull_request"]["labels"] = [{"name": "hoa"}]  # type: ignore[index]
+    hoa = route("pull_request", base_payload, allowlist=ALLOWLIST, bot_login=BOT, pr_review_label_allowlist=allow)
+    assert hoa.should_queue
+
+    base_payload["pull_request"]["labels"] = [{"name": "mail"}]  # type: ignore[index]
+    mail = route("pull_request", base_payload, allowlist=ALLOWLIST, bot_login=BOT, pr_review_label_allowlist=allow)
+    assert mail.should_queue
 
     base_payload["pull_request"]["labels"] = [{"name": "mailroom"}]  # type: ignore[index]
     mailroom = route("pull_request", base_payload, allowlist=ALLOWLIST, bot_login=BOT, pr_review_label_allowlist=allow)
@@ -256,11 +264,33 @@ def test_route_pull_request_labeled_queues_only_matching_label() -> None:
         payload,
         allowlist=ALLOWLIST,
         bot_login=BOT,
-        pr_review_label_allowlist=frozenset({"robo-review"}),
+        pr_review_label_allowlist=frozenset({"robo-review", "hoa", "mail"}),
     )
     assert decision.should_queue
     assert decision.task == "review_pr"
 
+
+    payload["label"] = {"name": "hoa"}
+    payload["pull_request"]["labels"] = [{"name": "hoa"}]  # type: ignore[index]
+    hoa = route(
+        "pull_request",
+        payload,
+        allowlist=ALLOWLIST,
+        bot_login=BOT,
+        pr_review_label_allowlist=frozenset({"robo-review", "hoa", "mail"}),
+    )
+    assert hoa.should_queue
+
+    payload["label"] = {"name": "mail"}
+    payload["pull_request"]["labels"] = [{"name": "mail"}]  # type: ignore[index]
+    mail = route(
+        "pull_request",
+        payload,
+        allowlist=ALLOWLIST,
+        bot_login=BOT,
+        pr_review_label_allowlist=frozenset({"robo-review", "hoa", "mail"}),
+    )
+    assert mail.should_queue
     payload["label"] = {"name": "backend"}
     payload["pull_request"]["labels"] = [{"name": "backend"}]  # type: ignore[index]
     skipped = route(
@@ -290,6 +320,34 @@ def test_route_issues_labeled_on_pr_queues_matching_label() -> None:
     assert decision.should_queue
     assert decision.task == "review_pr"
     assert decision.reason == "issues.labeled on PR"
+
+    hoa = route(
+        "issues",
+        {
+            "action": "labeled",
+            "label": {"name": "hoa"},
+            "issue": {"number": 10, "pull_request": {}, "user": {"login": "alice"}},
+            "repository": {"full_name": "octo/widget"},
+        },
+        allowlist=ALLOWLIST,
+        bot_login=BOT,
+        pr_review_label_allowlist=frozenset({"robo-review", "hoa", "mail"}),
+    )
+    assert hoa.should_queue
+
+    mail = route(
+        "issues",
+        {
+            "action": "labeled",
+            "label": {"name": "mail"},
+            "issue": {"number": 11, "pull_request": {}, "user": {"login": "alice"}},
+            "repository": {"full_name": "octo/widget"},
+        },
+        allowlist=ALLOWLIST,
+        bot_login=BOT,
+        pr_review_label_allowlist=frozenset({"robo-review", "hoa", "mail"}),
+    )
+    assert mail.should_queue
 
 
 def test_route_incoming_pr_opened_skips_draft_bot_and_disabled() -> None:
