@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import platform
 import signal
@@ -38,9 +39,15 @@ from robomp.sandbox import (
     _slot_pids,
     _slot_subprocess_kwargs,
     make_branch,
+    pr_review_workspace_key,
     rename_workspace_branch,
     workspace_key,
 )
+
+
+def test_pr_review_workspace_key_includes_full_head_sha() -> None:
+    assert workspace_key("oven-sh/bun", 30654) == "oven-sh__bun__30654"
+    assert pr_review_workspace_key("oven-sh/bun", 30654, "A" * 40) == "oven-sh__bun__30654__" + ("a" * 40)
 
 
 def _git(args: list[str], cwd: Path) -> None:
@@ -446,6 +453,7 @@ def test_ensure_workspace_pr_head_uses_detached_pr_ref(tmp_path: Path, upstream_
         pr_head=9,
         pr_base_ref="main",
         pr_changed_paths=("README.md",),
+        pr_head_sha=pr_head,
         author_name="robomp-bot",
         author_email="robomp-bot@example.invalid",
     )
@@ -475,6 +483,133 @@ def test_ensure_workspace_pr_head_uses_detached_pr_ref(tmp_path: Path, upstream_
     assert symbolic.returncode != 0
     assert ws.branch == "review/pr-9"
     assert pushurl.returncode != 0
+    assert ws.review_head_sha == pr_head
+
+
+
+def _publish_pr_readme(upstream: Path, tmp_path: Path, *, ref: str, content: str, clone_name: str) -> str:
+    contributor = tmp_path / clone_name
+    _git(["clone", str(upstream), str(contributor)], cwd=tmp_path)
+    (contributor / "README.md").write_text(content, encoding="utf-8")
+    _git(["-C", str(contributor), "add", "README.md"], cwd=tmp_path)
+    subprocess.run(
+        ["git", "commit", "-m", "pr change"],
+        cwd=str(contributor),
+        check=True,
+        capture_output=True,
+        text=True,
+        env=os.environ
+        | {
+            "GIT_AUTHOR_NAME": "c",
+            "GIT_AUTHOR_EMAIL": "c@t",
+            "GIT_COMMITTER_NAME": "c",
+            "GIT_COMMITTER_EMAIL": "c@t",
+        },
+    )
+    sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=str(contributor),
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    _git(["-C", str(contributor), "push", "--force", "origin", f"HEAD:{ref}"], cwd=tmp_path)
+    return sha
+
+
+def test_ensure_workspace_pr_head_scopes_session_by_head(tmp_path: Path, upstream_repo: Path) -> None:
+    sha1 = _publish_pr_readme(upstream_repo, tmp_path, ref="refs/pull/7/head", content="head one\n", clone_name="pr-one")
+    mgr = SandboxManager(tmp_path / "workspaces")
+    ws1 = mgr.ensure_workspace(
+        repo="octo/widget",
+        number=7,
+        title="incoming PR",
+        clone_url=str(upstream_repo),
+        default_branch="main",
+        pr_head=7,
+        pr_head_sha=sha1,
+        pr_base_ref="main",
+        pr_changed_paths=("README.md",),
+        author_name="robomp-bot",
+        author_email="robomp-bot@example.invalid",
+    )
+    dummy = ws1.session_dir / "turn.jsonl"
+    dummy.write_text("{}\n", encoding="utf-8")
+
+    sha2 = _publish_pr_readme(upstream_repo, tmp_path, ref="refs/pull/7/head", content="head two\n", clone_name="pr-two")
+    ws2 = mgr.ensure_workspace(
+        repo="octo/widget",
+        number=7,
+        title="incoming PR",
+        clone_url=str(upstream_repo),
+        default_branch="main",
+        pr_head=7,
+        pr_head_sha=sha2,
+        pr_base_ref="main",
+        pr_changed_paths=("README.md",),
+        author_name="robomp-bot",
+        author_email="robomp-bot@example.invalid",
+    )
+    head2 = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=str(ws2.repo_dir),
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert ws2.root != ws1.root
+    assert ws2.session_dir != ws1.session_dir
+    assert ws2.review_head_sha == sha2
+    assert head2 == sha2
+    assert dummy.is_file()
+    assert not (ws2.session_dir / "turn.jsonl").exists()
+
+
+def test_ensure_workspace_recreates_corrupt_same_head_pr_workspace(tmp_path: Path, upstream_repo: Path) -> None:
+    sha = _publish_pr_readme(upstream_repo, tmp_path, ref="refs/pull/7/head", content="head one\n", clone_name="pr-corrupt")
+    mgr = SandboxManager(tmp_path / "workspaces")
+    ws1 = mgr.ensure_workspace(
+        repo="octo/widget",
+        number=7,
+        title="incoming PR",
+        clone_url=str(upstream_repo),
+        default_branch="main",
+        pr_head=7,
+        pr_head_sha=sha,
+        pr_base_ref="main",
+        pr_changed_paths=("README.md",),
+        author_name="robomp-bot",
+        author_email="robomp-bot@example.invalid",
+    )
+    manifest_path = ws1.session_dir / "pr-review-workspace.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["head_sha"] = "0" * 40
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    ws2 = mgr.ensure_workspace(
+        repo="octo/widget",
+        number=7,
+        title="incoming PR",
+        clone_url=str(upstream_repo),
+        default_branch="main",
+        pr_head=7,
+        pr_head_sha=sha,
+        pr_base_ref="main",
+        pr_changed_paths=("README.md",),
+        author_name="robomp-bot",
+        author_email="robomp-bot@example.invalid",
+    )
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=str(ws2.repo_dir),
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    rewritten = json.loads((ws2.session_dir / "pr-review-workspace.json").read_text(encoding="utf-8"))
+    assert ws2.root == ws1.root
+    assert head == sha
+    assert rewritten["head_sha"] == sha
 
 
 def test_chown_workspace_noops_when_not_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1401,7 +1536,7 @@ def _partial_clone_upstream(tmp_path: Path) -> Path:
 
 def _commit_new_blob_upstream(upstream: Path, tmp_path: Path, *, path: str, content: str, ref: str = "main") -> str:
     """Add a fresh blob upstream and return the new commit SHA."""
-    contrib = tmp_path / f"contrib-{path.replace('/', '_')}"
+    contrib = tmp_path / f"contrib-{path.replace('/', '_')}-{ref.replace('/', '_')}"
     _git(["clone", f"file://{upstream}", str(contrib)], cwd=tmp_path)
     (contrib / path).parent.mkdir(parents=True, exist_ok=True)
     (contrib / path).write_text(content, encoding="utf-8")
@@ -1599,6 +1734,12 @@ def test_prepare_pr_worktree_sparse_hydrates_changed_paths_only(tmp_path: Path) 
             "GIT_COMMITTER_EMAIL": "t@t",
         },
     )
+    pr_sha = subprocess.run(
+        ["git", "-C", str(pr_seed), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
     _git(["-C", str(pr_seed), "push", "origin", "HEAD:refs/pull/7/head"], cwd=tmp_path)
 
     ws_dir = tmp_path / "pr-sparse-ws"
@@ -1606,6 +1747,7 @@ def test_prepare_pr_worktree_sparse_hydrates_changed_paths_only(tmp_path: Path) 
         pool,
         ws_dir,
         pr_number=7,
+        expected_head_sha=pr_sha,
         base_ref="main",
         changed_paths=("src/changed.txt",),
         token=None,
@@ -1649,11 +1791,41 @@ def test_prepare_pr_worktree_rejects_unsafe_sparse_paths(tmp_path: Path, bad_pat
             pool,
             tmp_path / "unsafe-ws",
             pr_number=7,
+            expected_head_sha="0" * 40,
             base_ref="main",
             changed_paths=(bad_path,),
             token=None,
         )
 
+
+def test_prepare_pr_worktree_rejects_unexpected_head(tmp_path: Path) -> None:
+    upstream = _partial_clone_upstream(tmp_path)
+    pool = tmp_path / "pool"
+    _git(
+        [
+            "clone",
+            "--filter=blob:none",
+            "--no-tags",
+            "--branch",
+            "main",
+            f"file://{upstream}",
+            str(pool),
+        ],
+        cwd=tmp_path,
+    )
+    _commit_new_blob_upstream(upstream, tmp_path, path="src/changed.txt", content="base payload\n")
+    _commit_new_blob_upstream(upstream, tmp_path, path="src/changed.txt", content="changed payload\n", ref="refs/pull/7/head")
+
+    with pytest.raises(GitCommandError, match="PR head mismatch"):
+        git_prepare_pr_worktree(
+            pool,
+            tmp_path / "mismatch-ws",
+            pr_number=7,
+            expected_head_sha="0" * 40,
+            base_ref="main",
+            changed_paths=("src/changed.txt",),
+            token=None,
+        )
 
 # ---------------------------------------------------------------------------
 # NativesCache integration into ensure_workspace

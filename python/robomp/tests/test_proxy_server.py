@@ -99,7 +99,7 @@ def _partial_clone_upstream(tmp_path: Path) -> Path:
     return repo
 
 
-def _publish_pr_with_files(upstream: Path, tmp_path: Path) -> None:
+def _publish_pr_with_files(upstream: Path, tmp_path: Path) -> str:
     pr_seed = tmp_path / "proxy-pr-seed"
     _git(["clone", f"file://{upstream}", str(pr_seed)], tmp_path)
     (pr_seed / "src").mkdir()
@@ -108,7 +108,9 @@ def _publish_pr_with_files(upstream: Path, tmp_path: Path) -> None:
     (pr_seed / "docs" / "untouched.txt").write_text("untouched payload\n", encoding="utf-8")
     _git(["-C", str(pr_seed), "add", "src/changed.txt", "docs/untouched.txt"], tmp_path)
     _git(["-C", str(pr_seed), "commit", "-m", "add pr files"], tmp_path)
+    pr_sha = subprocess.run(["git", "-C", str(pr_seed), "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
     _git(["-C", str(pr_seed), "push", "origin", "HEAD:refs/pull/7/head"], tmp_path)
+    return pr_sha
 
 
 def _partial_pool(proxy_settings: ProxySettings, upstream: Path, tmp_path: Path) -> Path:
@@ -990,12 +992,15 @@ async def test_git_fetch_repairs_missing_alternate_and_bad_ref(proxy_settings: P
 
 async def test_git_prepare_pr_worktree_sparse_endpoint(proxy_settings: ProxySettings, tmp_path: Path) -> None:
     upstream = _partial_clone_upstream(tmp_path)
-    _publish_pr_with_files(upstream, tmp_path)
+    pr_sha = _publish_pr_with_files(upstream, tmp_path)
     _partial_pool(proxy_settings, upstream, tmp_path)
     app = _build_app(proxy_settings)
     body = (
-        b'{"repo":"test/widget","workspace_key":"test__widget__7","pr_number":7,'
-        b'"base_ref":"main","changed_paths":["src/changed.txt"]}'
+        b'{"repo":"test/widget","workspace_key":"test__widget__7__'
+        + pr_sha.encode()
+        + b'","pr_number":7,"expected_head_sha":"'
+        + pr_sha.encode()
+        + b'","base_ref":"main","changed_paths":["src/changed.txt"]}'
     )
     async with await _async_client(app) as client:
         resp = await client.post(
@@ -1006,6 +1011,7 @@ async def test_git_prepare_pr_worktree_sparse_endpoint(proxy_settings: ProxySett
 
     assert resp.status_code == 200, resp.text
     data = resp.json()
+    assert data["head"] == pr_sha
     repo_dir = Path(data["repo_dir"])
     assert repo_dir.exists()
     assert data["hydrated_paths"] == ["src/changed.txt"]
@@ -1017,12 +1023,14 @@ async def test_git_prepare_pr_worktree_rejects_bad_workspace_key(
     proxy_settings: ProxySettings, tmp_path: Path
 ) -> None:
     upstream = _partial_clone_upstream(tmp_path)
-    _publish_pr_with_files(upstream, tmp_path)
+    pr_sha = _publish_pr_with_files(upstream, tmp_path)
     _partial_pool(proxy_settings, upstream, tmp_path)
     app = _build_app(proxy_settings)
     body = (
         b'{"repo":"test/widget","workspace_key":"other__repo__7","pr_number":7,'
-        b'"base_ref":"main","changed_paths":["src/changed.txt"]}'
+        b'"expected_head_sha":"'
+        + pr_sha.encode()
+        + b'","base_ref":"main","changed_paths":["src/changed.txt"]}'
     )
     async with await _async_client(app) as client:
         resp = await client.post(
@@ -1048,6 +1056,7 @@ async def test_git_prepare_pr_worktree_uses_proxy_timeout_setting(
         repo_dir: Path,
         *,
         pr_number: int,
+        expected_head_sha: str,
         base_ref: str,
         changed_paths: list[str],
         token: str | None,
@@ -1058,18 +1067,19 @@ async def test_git_prepare_pr_worktree_uses_proxy_timeout_setting(
         captured["pr_number"] = pr_number
         captured["base_ref"] = base_ref
         captured["changed_paths"] = changed_paths
+        captured["expected_head_sha"] = expected_head_sha
         captured["token"] = token
         captured["timeout"] = timeout
         from robomp.git_ops import PrWorktreeResult
 
-        return PrWorktreeResult(head="abc", hydrated_paths=("src/changed.txt",))
+        return PrWorktreeResult(head=expected_head_sha, hydrated_paths=("src/changed.txt",))
 
     monkeypatch.setattr(proxy_server, "git_prepare_pr_worktree", fake_prepare_pr_worktree)
     monkeypatch.setattr(proxy_server, "_assert_origin_safe_for_repo", lambda *args, **kwargs: None)
     app = _build_app(proxy_settings)
     body = (
-        b'{"repo":"test/widget","workspace_key":"test__widget__7","pr_number":7,'
-        b'"base_ref":"main","changed_paths":["src/changed.txt"]}'
+        b'{"repo":"test/widget","workspace_key":"test__widget__7__1111111111111111111111111111111111111111","pr_number":7,'
+        b'"expected_head_sha":"1111111111111111111111111111111111111111","base_ref":"main","changed_paths":["src/changed.txt"]}'
     )
     async with await _async_client(app) as client:
         resp = await client.post(
@@ -1081,6 +1091,31 @@ async def test_git_prepare_pr_worktree_uses_proxy_timeout_setting(
     assert resp.status_code == 200, resp.text
     assert captured["timeout"] == 37.0
     assert captured["changed_paths"] == ["src/changed.txt"]
+    assert captured["expected_head_sha"] == "1" * 40
+
+
+async def test_git_prepare_pr_worktree_rejects_missing_expected_head_sha(proxy_settings: ProxySettings) -> None:
+    app = _build_app(proxy_settings)
+    body = b'{"repo":"test/widget","workspace_key":"test__widget__7","pr_number":7,"base_ref":"main","changed_paths":["src/changed.txt"]}'
+    async with await _async_client(app) as client:
+        resp = await client.post(
+            "/gh/v1/git/prepare_pr_worktree",
+            content=body,
+            headers={**_signed("POST", "/gh/v1/git/prepare_pr_worktree", body), "Content-Type": "application/json"},
+        )
+    assert resp.status_code == 400
+
+
+async def test_git_prepare_pr_worktree_rejects_invalid_expected_head_sha(proxy_settings: ProxySettings) -> None:
+    app = _build_app(proxy_settings)
+    body = b'{"repo":"test/widget","workspace_key":"test__widget__7","pr_number":7,"expected_head_sha":"abc123","base_ref":"main","changed_paths":["src/changed.txt"]}'
+    async with await _async_client(app) as client:
+        resp = await client.post(
+            "/gh/v1/git/prepare_pr_worktree",
+            content=body,
+            headers={**_signed("POST", "/gh/v1/git/prepare_pr_worktree", body), "Content-Type": "application/json"},
+        )
+    assert resp.status_code == 400
 
 
 async def test_git_fetch_pr_head_uses_proxy_timeout_setting(

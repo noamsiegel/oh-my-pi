@@ -13,9 +13,8 @@ Run two phases in order. Phase 1 is cheap and always happens; Phase 2 is the rea
 <critical>
 - **Read-only.** No `gh_push_branch`, no `gh_open_pr`, no commits, no edits, no `git push`.
   The only side effects are `classify_pr`, `prepare_pr_review`, `delegate_pr_review`,
-  `validate_pr_review`, `submit_pr_review`, `pr_review_comment` only when PR review helper is
-  unavailable and the final event is `COMMENT`, and one `gh_post_comment` only for
-  explicit non-terminal environment limitations.
+  `validate_pr_review`, `submit_pr_review`, and `pr_review_comment` only when PR
+  review helper is unavailable and the final event is `COMMENT`.
 - **Fetch, helper, classify, then review.** Call `fetch_pr`, run `prepare_pr_review` when
   available, then call `classify_pr` before collecting candidate findings.
 - **Delegate when the helper requires it.** If `prepare_pr_review` reports
@@ -32,7 +31,7 @@ Run two phases in order. Phase 1 is cheap and always happens; Phase 2 is the rea
 - **Terminal policy.** Submit `REQUEST_CHANGES` for any remaining critical/required finding.
   Submit `APPROVE` when clean. On self-authored PRs, GitHub cannot accept author terminal
   reviews, so submit `COMMENT` with the would-approve/would-request-changes result.
-  Use `COMMENT` otherwise only when an explicit environment limitation prevents judging the PR.
+  Use `submit_pr_review(event="COMMENT")` otherwise only when an explicit environment limitation prevents judging the PR.
 - **No false clean.** Never use `review:clean`, `APPROVE`, or “clean review” if any required
   local verification could not run, failed, or has unclear status; if prior external inline
   review comments exist on the current head, either independently find/carry the issue or
@@ -148,8 +147,8 @@ submit_pr_review(body="<summary>", event="APPROVE|REQUEST_CHANGES|COMMENT")
   `APPROVE` when clean, `COMMENT` only for advisory/no-review-request or explicit environment/
   self-authored limitations.
 - Do not submit REQUEST_CHANGES unless at least one validated inline finding will be posted; resolve stale verify-status body concerns or add a concrete anchored finding first.
-- Failed, unavailable, or unrun local verification means **not clean**. Use `COMMENT` with the
-  limitation, or carry a finding, but do not summarize as clean.
+- Failed, unavailable, or unrun local verification means **not clean**. Use
+  `submit_pr_review(event="COMMENT")` with the limitation, or carry a finding, but do not summarize as clean.
 - Self-authored PRs cannot accept terminal reviews from the author; use `COMMENT` and say it
   would otherwise approve/request changes.
 - The body summary must be 2–5 terse lines above the automatically appended Review process details.

@@ -15,7 +15,7 @@ import pytest
 from pydantic import SecretStr
 
 from robomp.config import ProxySettings
-from robomp.git_ops import HeadDriftError
+from robomp.git_ops import GitCommandError, HeadDriftError
 from robomp.github_client import GitHubClient
 from robomp.github_types import (
     CommentInfo,
@@ -118,7 +118,7 @@ def _partial_clone_upstream(tmp_path: Path) -> Path:
     return repo
 
 
-def _publish_pr_with_files(upstream: Path, tmp_path: Path) -> None:
+def _publish_pr_with_files(upstream: Path, tmp_path: Path) -> str:
     pr_seed = tmp_path / "client-pr-seed"
     _git(["clone", f"file://{upstream}", str(pr_seed)], tmp_path)
     (pr_seed / "src").mkdir()
@@ -127,7 +127,9 @@ def _publish_pr_with_files(upstream: Path, tmp_path: Path) -> None:
     (pr_seed / "docs" / "untouched.txt").write_text("untouched payload\n", encoding="utf-8")
     _git(["-C", str(pr_seed), "add", "src/changed.txt", "docs/untouched.txt"], tmp_path)
     _git(["-C", str(pr_seed), "commit", "-m", "add pr files"], tmp_path)
+    pr_sha = subprocess.run(["git", "-C", str(pr_seed), "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
     _git(["-C", str(pr_seed), "push", "origin", "HEAD:refs/pull/7/head"], tmp_path)
+    return pr_sha
 
 
 def _partial_pool(proxy_settings: ProxySettings, upstream: Path, tmp_path: Path) -> Path:
@@ -529,6 +531,7 @@ async def test_round_trip_all_endpoints(round_trip_app) -> None:
         body="summary",
         event="COMMENT",
         comments=[{"path": "src/app.py", "line": 12, "side": "RIGHT", "body": "finding"}],
+        commit_id="1" * 40,
     )
     assert submitted.id == 55
 
@@ -670,7 +673,7 @@ async def test_error_decode_github_422() -> None:
 
 def test_proxy_git_transport_prepare_pr_worktree_sparse_e2e(proxy_settings: ProxySettings, tmp_path: Path) -> None:
     upstream = _partial_clone_upstream(tmp_path)
-    _publish_pr_with_files(upstream, tmp_path)
+    pr_sha = _publish_pr_with_files(upstream, tmp_path)
     pool = _partial_pool(proxy_settings, upstream, tmp_path)
     app = create_proxy_app(proxy_settings)
     app.state.settings = proxy_settings
@@ -687,11 +690,13 @@ def test_proxy_git_transport_prepare_pr_worktree_sparse_e2e(proxy_settings: Prox
         pool_dir=pool,
         repo_dir=repo_dir,
         pr_number=7,
+        expected_head_sha=pr_sha,
         base_ref="main",
         changed_paths=("src/changed.txt",),
     )
 
     assert result.hydrated_paths == ("src/changed.txt",)
+    assert result.head == pr_sha
     assert (repo_dir / "src/changed.txt").read_text(encoding="utf-8") == "changed payload\n"
     assert not (repo_dir / "docs" / "untouched.txt").exists()
     _git(["-C", str(pool), "remote", "set-url", "origin", "https://example.invalid/missing.git"], tmp_path)
@@ -703,6 +708,33 @@ def test_proxy_git_transport_prepare_pr_worktree_sparse_e2e(proxy_settings: Prox
         env=os.environ | {"GIT_TERMINAL_PROMPT": "0"},
     )
     assert "src/changed.txt" in diff_proc.stdout.splitlines()
+
+
+
+def test_proxy_git_transport_prepare_pr_worktree_rejects_head_mismatch(proxy_settings: ProxySettings, tmp_path: Path) -> None:
+    upstream = _partial_clone_upstream(tmp_path)
+    _publish_pr_with_files(upstream, tmp_path)
+    pool = _partial_pool(proxy_settings, upstream, tmp_path)
+    app = create_proxy_app(proxy_settings)
+    app.state.settings = proxy_settings
+    _attach_gh(app, lambda _: httpx.Response(500, json={"message": "should not be hit"}))
+    transport = ProxyGitTransport(
+        base_url="http://proxy.test",
+        hmac_key=_HMAC,
+        transport=_SyncASGIBridge(app),
+    )
+    repo_dir = Path(proxy_settings.workspace_root) / ("test__widget__7__" + ("0" * 40)) / "repo"
+    with pytest.raises(GitCommandError, match="PR head mismatch"):
+        transport.prepare_pr_worktree(
+            repo="test/widget",
+            pool_dir=pool,
+            repo_dir=repo_dir,
+            pr_number=7,
+            expected_head_sha="0" * 40,
+            base_ref="main",
+            changed_paths=("src/changed.txt",),
+        )
+    assert not repo_dir.exists()
 
 
 def test_proxy_git_transport_push_happy(proxy_settings: ProxySettings, upstream_repo: Path) -> None:

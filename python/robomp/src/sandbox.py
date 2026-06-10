@@ -38,6 +38,7 @@ chmod/utimes its own cache root, which breaks any shared-cache scheme.
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import os
 import platform
@@ -48,6 +49,7 @@ import signal
 import stat
 import subprocess
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Iterable, Protocol
 
@@ -84,13 +86,15 @@ class Workspace:
     branch: str
     repo_full_name: str
     issue_number: int
-
+    review_head_sha: str | None = None
     @property
     def repro_dir(self) -> Path:
         return self.context_dir / "repro"
 
     @property
     def workspace_key(self) -> str:
+        if self.review_head_sha:
+            return pr_review_workspace_key(self.repo_full_name, self.issue_number, self.review_head_sha)
         return workspace_key(self.repo_full_name, self.issue_number)
 
 
@@ -109,6 +113,15 @@ def _short_hex(seed: str | None = None) -> str:
 
 def workspace_key(repo: str, number: int) -> str:
     return f"{repo.replace('/', '__')}__{number}"
+
+def _validate_pr_head_sha(head_sha: str) -> str:
+    if re.fullmatch(r"[0-9a-fA-F]{40}", head_sha):
+        return head_sha.lower()
+    raise ValueError(f"invalid PR head sha: {head_sha!r}")
+
+
+def pr_review_workspace_key(repo: str, number: int, head_sha: str) -> str:
+    return f"{workspace_key(repo, number)}__{_validate_pr_head_sha(head_sha)}"
 
 
 def _safe_directory_env(repo_dir: Path) -> dict[str, str]:
@@ -241,6 +254,7 @@ class GitTransport(Protocol):
         pool_dir: Path,
         repo_dir: Path,
         pr_number: int,
+        expected_head_sha: str,
         base_ref: str,
         changed_paths: Iterable[str],
     ) -> PrWorktreeResult:
@@ -297,6 +311,7 @@ class LocalGitTransport:
         pool_dir: Path,
         repo_dir: Path,
         pr_number: int,
+        expected_head_sha: str,
         base_ref: str,
         changed_paths: Iterable[str],
     ) -> PrWorktreeResult:
@@ -305,6 +320,7 @@ class LocalGitTransport:
             pool_dir,
             repo_dir,
             pr_number=pr_number,
+            expected_head_sha=expected_head_sha,
             base_ref=base_ref,
             changed_paths=changed_paths,
             token=self._token,
@@ -771,8 +787,56 @@ class SandboxManager:
         _safe_run(["git", "remote", "set-url", "origin", clone_url], cwd=repo_dir, timeout=_DEFAULT_SUBPROCESS_TIMEOUT_SECONDS)
 
     # ---- per-issue workspace ----
-    def workspace_root(self, repo: str, number: int) -> Path:
-        return self.root / workspace_key(repo, number)
+    def workspace_root(self, repo: str, number: int, head_sha: str | None = None) -> Path:
+        if head_sha is None:
+            key = workspace_key(repo, number)
+        else:
+            key = pr_review_workspace_key(repo, number, head_sha)
+        return self.root / key
+
+    def _remove_workspace_root(self, repo: str, ws_root: Path) -> None:
+        repo_dir = ws_root / "repo"
+        if repo_dir.exists():
+            pool = self.pool_path(repo)
+            _safe_run(["git", "worktree", "remove", "--force", str(repo_dir)], cwd=pool, timeout=_DEFAULT_SUBPROCESS_TIMEOUT_SECONDS)
+            if repo_dir.exists():
+                shutil.rmtree(repo_dir, ignore_errors=True)
+        if ws_root.exists():
+            shutil.rmtree(ws_root, ignore_errors=True)
+
+    @staticmethod
+    def _read_pr_review_manifest(session_dir: Path) -> dict[str, Any] | None:
+        path = session_dir / "pr-review-workspace.json"
+        try:
+            data = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            return None
+        return data if isinstance(data, dict) else None
+
+    @staticmethod
+    def _write_pr_review_manifest(
+        session_dir: Path,
+        *,
+        repo: str,
+        number: int,
+        head_sha: str,
+        base_ref: str,
+        changed_paths: tuple[str, ...],
+    ) -> None:
+        (session_dir / "pr-review-workspace.json").write_text(
+            json.dumps(
+                {
+                    "repo": repo,
+                    "pr_number": number,
+                    "head_sha": head_sha,
+                    "base_ref": base_ref,
+                    "changed_paths": list(changed_paths),
+                    "prepared_at": datetime.now(UTC).isoformat(),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
 
     def ensure_workspace(
         self,
@@ -784,6 +848,7 @@ class SandboxManager:
         default_branch: str,
         existing_branch: str | None = None,
         pr_head: int | None = None,
+        pr_head_sha: str | None = None,
         pr_base_ref: str | None = None,
         pr_changed_paths: Iterable[str] | None = None,
         author_name: str,
@@ -793,18 +858,28 @@ class SandboxManager:
         """Create or resume a per-issue worktree."""
         if pr_head is not None and existing_branch is not None:
             raise ValueError("ensure_workspace accepts either pr_head or existing_branch, not both")
+        if pr_head is None and pr_head_sha is not None:
+            raise ValueError("pr_head_sha is only valid for PR review workspaces")
+        requested_head_sha = _validate_pr_head_sha(pr_head_sha) if pr_head_sha is not None else None
+        if pr_head is not None and requested_head_sha is None:
+            raise ValueError("PR review workspace requires pr_head_sha")
+        requested_changed_paths = tuple(pr_changed_paths or ())
         pool = self.ensure_clone(repo=repo, clone_url=clone_url, default_branch=default_branch)
-        ws_root = self.workspace_root(repo, number)
+        ws_root = self.workspace_root(repo, number, head_sha=requested_head_sha)
         repo_dir = ws_root / "repo"
         session_dir = _safe_workspace_child(ws_root, ".omp-session")
         context_dir = _safe_workspace_child(ws_root, "context")
         artifacts_root = _safe_workspace_child(ws_root, "artifacts")
         artifacts_dir = artifacts_root / "agent"
-        ws_root.mkdir(parents=True, exist_ok=True)
-        for path in (session_dir, context_dir, artifacts_root, ws_root / ".omp-tmp", ws_root / ".omp-xdg"):
-            _ensure_root_control_dir(path)
-        _ensure_real_dir(context_dir / "repro", mode=0o755)
-        _ensure_real_dir(artifacts_dir, mode=0o755)
+
+        def prepare_control_dirs() -> None:
+            ws_root.mkdir(parents=True, exist_ok=True)
+            for path in (session_dir, context_dir, artifacts_root, ws_root / ".omp-tmp", ws_root / ".omp-xdg"):
+                _ensure_root_control_dir(path)
+            _ensure_real_dir(context_dir / "repro", mode=0o755)
+            _ensure_real_dir(artifacts_dir, mode=0o755)
+
+        prepare_control_dirs()
 
         branch = (
             f"review/pr-{pr_head}"
@@ -830,17 +905,53 @@ class SandboxManager:
             _provision_runtime_dirs(ws_root)
             _chown_workspace(ws_root, slot_uid)
             workspace_prepared = True
+            if requested_head_sha is not None:
+                manifest = self._read_pr_review_manifest(session_dir)
+                slot_git_env = _git_env_for_repo(repo_dir)
+                local_head = _safe_run(
+                    ["git", "rev-parse", "HEAD"],
+                    cwd=repo_dir,
+                    timeout=_DEFAULT_SUBPROCESS_TIMEOUT_SECONDS,
+                    env=slot_git_env,
+                    **slot_git_kwargs,
+                )
+                manifest_matches = (
+                    manifest is not None
+                    and manifest.get("head_sha") == requested_head_sha
+                    and manifest.get("base_ref") == pr_base_ref
+                    and tuple(manifest.get("changed_paths") or ()) == requested_changed_paths
+                )
+                head_matches = local_head.returncode == 0 and local_head.stdout.strip().lower() == requested_head_sha
+                if not manifest_matches or not head_matches:
+                    self._remove_workspace_root(repo, ws_root)
+                    prepare_control_dirs()
+                    repo_exists = False
+                    workspace_prepared = False
+                    slot_git_env = None
         if not repo_exists:
             if pr_head is not None:
                 if pr_base_ref is None or pr_changed_paths is None:
                     raise ValueError("PR review workspace requires pr_base_ref and pr_changed_paths")
-                self.transport.prepare_pr_worktree(
+                assert requested_head_sha is not None
+                result = self.transport.prepare_pr_worktree(
                     repo=repo,
                     pool_dir=pool,
                     repo_dir=repo_dir,
                     pr_number=pr_head,
+                    expected_head_sha=requested_head_sha,
                     base_ref=pr_base_ref,
-                    changed_paths=pr_changed_paths,
+                    changed_paths=requested_changed_paths,
+                )
+                if result.head.lower() != requested_head_sha:
+                    self._remove_workspace_root(repo, ws_root)
+                    raise ValueError(f"prepared PR worktree head mismatch: expected {requested_head_sha}, got {result.head}")
+                self._write_pr_review_manifest(
+                    session_dir,
+                    repo=repo,
+                    number=pr_head,
+                    head_sha=requested_head_sha,
+                    base_ref=pr_base_ref,
+                    changed_paths=requested_changed_paths,
                 )
             else:
                 # Make sure the requested start point exists locally (best-effort).
@@ -878,7 +989,7 @@ class SandboxManager:
                         cwd=pool,
                         timeout=_DEFAULT_SUBPROCESS_TIMEOUT_SECONDS,
                     )
-        else:
+        elif requested_head_sha is None:
             slot_git_env = _git_env_for_repo(repo_dir)
             current = _safe_run(
                 ["git", "symbolic-ref", "--quiet", "--short", "HEAD"],
@@ -917,6 +1028,7 @@ class SandboxManager:
             branch=branch,
             repo_full_name=repo,
             issue_number=number,
+            review_head_sha=requested_head_sha,
         )
         # Best-effort: hardlink pre-built natives in if we've cached this
         # source state before. Runs AFTER the slot chown so the cache inode
@@ -1008,16 +1120,16 @@ class SandboxManager:
                     extra={"file": str(child), "err": str(exc)},
                 )
 
-    def remove_workspace(self, *, repo: str, number: int) -> None:
-        ws_root = self.workspace_root(repo, number)
-        repo_dir = ws_root / "repo"
-        if repo_dir.exists():
-            pool = self.pool_path(repo)
-            _safe_run(["git", "worktree", "remove", "--force", str(repo_dir)], cwd=pool, timeout=_DEFAULT_SUBPROCESS_TIMEOUT_SECONDS)
-            if repo_dir.exists():
-                shutil.rmtree(repo_dir, ignore_errors=True)
-        if ws_root.exists():
-            shutil.rmtree(ws_root, ignore_errors=True)
+    def remove_workspace(self, *, repo: str, number: int, head_sha: str | None = None) -> None:
+        if head_sha is not None:
+            self._remove_workspace_root(repo, self.workspace_root(repo, number, head_sha=head_sha))
+            return
+        legacy_root = self.workspace_root(repo, number)
+        self._remove_workspace_root(repo, legacy_root)
+        prefix = workspace_key(repo, number) + "__"
+        for child in tuple(self.root.iterdir()):
+            if child.is_dir() and child.name.startswith(prefix):
+                self._remove_workspace_root(repo, child)
 
 
 __all__ = [
@@ -1031,4 +1143,5 @@ __all__ = [
     "validate_branch_slug",
     "redact_credentials",
     "workspace_key",
+    "pr_review_workspace_key",
 ]

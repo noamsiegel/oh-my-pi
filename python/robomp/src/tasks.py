@@ -140,7 +140,7 @@ async def _post_pr_review_started_comment(
     head_sha: str,
     allowed_labels: frozenset[str],
 ) -> None:
-    operation_key = f"post_pr_review_started_comment:{key}"
+    operation_key = f"post_pr_review_started_comment:{key}:{head_sha}"
     if not db.reserve_side_effect(operation_key):
         succeeded = db.side_effect_succeeded(operation_key)
         message = "side effect already succeeded: %s" if succeeded else "side effect already pending: %s"
@@ -499,24 +499,22 @@ async def review_pr(
     ]
     latest_review = max(bot_reviews, key=lambda review: review.submitted_at) if bot_reviews else None
     if latest_review is None:
-        if db.has_successful_tool_call(key, "submit_pr_review"):
+        if db.has_completed_pr_review(repo_full, pr_number, pr.head_sha):
             log.info("skip: PR review already submitted", extra={"repo": repo_full, "pr": pr_number})
             return _skipped("skip: PR review already submitted")
     else:
         latest_state = latest_review.state.upper()
-        if latest_state == "APPROVED":
-            log.info("skip: PR already approved by bot", extra={"repo": repo_full, "pr": pr_number})
-            return _skipped("skip: PR already approved by bot")
-        if latest_state == "COMMENTED":
-            if _comment_review_retryable(latest_review.body):
-                log.info("retrying PR review after retryable comment-only failure", extra={"repo": repo_full, "pr": pr_number})
+        if latest_state in {"APPROVED", "COMMENTED"}:
+            if latest_review.commit_id == pr.head_sha:
+                if latest_state == "COMMENTED" and _comment_review_retryable(latest_review.body):
+                    log.info("retrying PR review after retryable comment-only failure", extra={"repo": repo_full, "pr": pr_number})
+                else:
+                    reason = "skip: PR already approved by bot" if latest_state == "APPROVED" else "skip: PR already commented by bot"
+                    log.info(reason, extra={"repo": repo_full, "pr": pr_number})
+                    return _skipped(reason)
             else:
-                log.info("skip: PR already commented by bot", extra={"repo": repo_full, "pr": pr_number})
-                return _skipped("skip: PR already commented by bot")
-        if latest_state == "CHANGES_REQUESTED":
-            if not latest_review.commit_id or not pr.head_sha or latest_review.commit_id == pr.head_sha:
                 log.info(
-                    "skip: PR changes already requested for current or unknown head",
+                    "reviewing PR after prior review on different or unknown head",
                     extra={
                         "repo": repo_full,
                         "pr": pr_number,
@@ -524,9 +522,20 @@ async def review_pr(
                         "head_sha": pr.head_sha,
                     },
                 )
-                return _skipped("skip: PR changes already requested for current or unknown head")
+        if latest_state == "CHANGES_REQUESTED":
+            if latest_review.commit_id == pr.head_sha:
+                log.info(
+                    "skip: PR changes already requested for current head",
+                    extra={
+                        "repo": repo_full,
+                        "pr": pr_number,
+                        "review_commit": latest_review.commit_id,
+                        "head_sha": pr.head_sha,
+                    },
+                )
+                return _skipped("skip: PR changes already requested for current head")
             log.info(
-                "reviewing PR after requested changes and new commits",
+                "reviewing PR after prior review on different or unknown head",
                 extra={
                     "repo": repo_full,
                     "pr": pr_number,
@@ -575,6 +584,7 @@ async def review_pr(
         pr_head=pr_number,
         pr_base_ref=pr.base_ref,
         pr_changed_paths=changed_paths,
+        pr_head_sha=pr.head_sha,
         author_name=settings.resolved_author_name,
         author_email=settings.git_author_email,
         slot_uid=slot_uid,
@@ -587,6 +597,7 @@ async def review_pr(
         branch=workspace.branch,
         session_dir=str(workspace.session_dir),
         pr_number=pr_number,
+        review_head_sha=pr.head_sha,
     )
     inputs = TaskInputs(
         settings=settings,

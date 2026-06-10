@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import subprocess
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -153,6 +154,12 @@ def _require_git_ref(value: Any, field: str) -> str:
     if proc.returncode != 0:
         raise HTTPException(400, f"invalid '{field}'")
     return ref
+
+def _require_commit_sha(value: Any, field: str) -> str:
+    if isinstance(value, str) and re.fullmatch(r"[0-9a-fA-F]{40}", value):
+        return value.lower()
+    raise HTTPException(400, f"invalid '{field}'")
+
 
 
 def _require_review_comments(value: Any) -> list[dict[str, Any]]:
@@ -596,6 +603,8 @@ def create_proxy_app(settings: ProxySettings) -> FastAPI:
         body = _require_str(data.get("body"), "body")
         event = str(data.get("event") or "COMMENT")
         comments = _require_review_comments(data.get("comments"))
+        raw_commit_id = data.get("commit_id")
+        commit_id = _require_commit_sha(raw_commit_id, "commit_id") if raw_commit_id else None
         github: GitHubClient = request.app.state.github
         try:
             review = await github.submit_pr_review(
@@ -604,6 +613,7 @@ def create_proxy_app(settings: ProxySettings) -> FastAPI:
                 body=body,
                 event=event,
                 comments=comments,
+                commit_id=commit_id,
             )
         except GitHubError as exc:
             return _gh_error_response(exc)
@@ -739,6 +749,7 @@ def create_proxy_app(settings: ProxySettings) -> FastAPI:
         pr_number = _require_int(data.get("pr_number"), "pr_number")
         base_ref = _require_git_ref(data.get("base_ref"), "base_ref")
         changed_paths = _require_changed_paths(data.get("changed_paths"))
+        expected_head_sha = _require_commit_sha(data.get("expected_head_sha"), "expected_head_sha")
         expected_prefix = repo.replace("/", "__") + "__"
         if not workspace_key.startswith(expected_prefix):
             raise HTTPException(400, "workspace_key does not match repo")
@@ -765,6 +776,7 @@ def create_proxy_app(settings: ProxySettings) -> FastAPI:
                 pool,
                 repo_dir,
                 pr_number=pr_number,
+                expected_head_sha=expected_head_sha,
                 base_ref=base_ref,
                 changed_paths=changed_paths,
                 token=_resolve_token(settings),

@@ -126,6 +126,7 @@ class ToolBindings:
     # True only for incoming-PR review tasks. Review tools require it; mutating
     # branch/PR publication tools reject when it is set.
     review_mode: bool = False
+    review_head_sha: str | None = None
     # Current task is driven by an allowlist/OWNER maintainer directive that
     # authorizes implementation. Gates first-PR creation on non-bug/doc issues.
     impl_authorized: bool = False
@@ -525,6 +526,10 @@ def _build_post_comment(bindings: ToolBindings) -> HostTool[Any, Any]:
         body = args.get("body")
         if not isinstance(body, str) or not body.strip():
             _raise_command("gh_post_comment requires a non-empty 'body'.")
+        if bindings.review_mode:
+            msg = "gh_post_comment is disabled during PR review; use submit_pr_review"
+            _audit(bindings, "gh_post_comment", args, error=msg)
+            _raise_command(msg)
         target_number = bindings.default_comment_number
         if isinstance(args.get("number"), int):
             target_number = int(args["number"])
@@ -1340,6 +1345,17 @@ def _build_prepare_pr_review(bindings: ToolBindings) -> HostTool[Any, Any]:
             _audit(bindings, "prepare_pr_review", args, result={"warning": f"conversation comments fetch failed: {exc}"})
 
         timeout = bindings.settings.request_timeout_seconds if bindings.settings is not None else None
+        local_head_proc = _run_repo_command(bindings, ("git", "rev-parse", "HEAD"), timeout=timeout)
+        if local_head_proc.returncode != 0:
+            output = _format_process_output(local_head_proc.stdout, local_head_proc.stderr)
+            _audit(bindings, "prepare_pr_review", args, error=output)
+            _raise_command(f"PR review workspace head check failed: {output}")
+        local_head = local_head_proc.stdout.strip()
+        for observed_head in (local_head, bindings.workspace.review_head_sha, bindings.review_head_sha):
+            if observed_head and observed_head != pr.head_sha:
+                msg = f"PR review workspace head mismatch: expected {pr.head_sha}, got {observed_head}; requeue after preparing a head-scoped workspace."
+                _audit(bindings, "prepare_pr_review", args, error=msg)
+                _raise_command(msg)
         diff_proc = _run_repo_command(bindings, ("git", "diff", "--no-color", f"origin/{pr.base_ref}...HEAD"), timeout=timeout)
         if diff_proc.returncode != 0:
             output = _format_process_output(diff_proc.stdout, diff_proc.stderr)
@@ -2660,6 +2676,10 @@ def _build_submit_pr_review(bindings: ToolBindings) -> HostTool[Any, Any]:
                 _audit(bindings, "submit_pr_review", args, error=msg)
                 _raise_command(msg)
 
+        payload_commit_id = ""
+        expected_commit_id = ""
+        final_commit_id = ""
+        evidence_head_sha = ""
         staged_count = 0
         if pr_review_payload_available:
             staged_count = len(bindings.db.list_staged_review_comments(bindings.issue_key))
@@ -2679,17 +2699,39 @@ def _build_submit_pr_review(bindings: ToolBindings) -> HostTool[Any, Any]:
             payload_comments = payload.get("comments")
             comments = list(payload_comments) if isinstance(payload_comments, list) else []
             raw_event = str(payload.get("event") or raw_event).upper()
+            payload_commit_id = str(payload.get("commit_id") or "")
+            evidence = _pr_review_load_mapping(paths.evidence)
+            evidence_head_sha = str(evidence.get("head_sha") or "")
+            final_commit_id = payload_commit_id
         else:
             staged = bindings.db.list_staged_review_comments(bindings.issue_key)
             staged_count = len(staged)
             comments = [_review_comment_to_payload(comment) for comment in staged]
             submit_body = body.strip()
+            expected_commit_id = bindings.review_head_sha or bindings.workspace.review_head_sha or ""
+            final_commit_id = expected_commit_id
         if raw_event == "REQUEST_CHANGES" and len(comments) == 0:
             msg = "REQUEST_CHANGES would post zero inline comments"
             _audit(bindings, "submit_pr_review", args, error=msg)
             _raise_command(msg)
+        timeout = bindings.settings.request_timeout_seconds if bindings.settings is not None else None
+        local_head_proc = _run_repo_command(bindings, ("git", "rev-parse", "HEAD"), timeout=timeout)
+        local_head = local_head_proc.stdout.strip() if local_head_proc.returncode == 0 else ""
+        try:
+            current_pr = _run_coro(bindings.loop, bindings.github.get_pull_request(bindings.repo.full_name, bindings.default_comment_number))
+        except GitHubError as exc:
+            _audit(bindings, "submit_pr_review", args, error=str(exc))
+            _raise_command(f"PR review submit refused: head changed from {final_commit_id or 'unknown'} to {local_head or 'unknown'}; rerun prepare_pr_review and validate_pr_review.")
+        if pr_review_payload_available:
+            head_ok = bool(payload_commit_id) and evidence_head_sha == payload_commit_id == local_head == current_pr.head_sha
+        else:
+            head_ok = bool(expected_commit_id) and expected_commit_id == local_head == current_pr.head_sha
+        if not head_ok:
+            msg = f"PR review submit refused: head changed from {final_commit_id or 'unknown'} to {current_pr.head_sha or local_head or 'unknown'}; rerun prepare_pr_review and validate_pr_review."
+            _audit(bindings, "submit_pr_review", args, error=msg)
+            _raise_command(msg)
         operation_body = requested_body if pr_review_payload_available else submit_body
-        operation_suffix = _side_effect_payload_suffix({"body": operation_body, "comments": comments, "event": raw_event})
+        operation_suffix = _side_effect_payload_suffix({"body": operation_body, "comments": comments, "event": raw_event, "commit_id": final_commit_id})
         operation_key = f"submit_pr_review:{bindings.issue_key}:{raw_event}:{operation_suffix}"
         if not bindings.db.reserve_side_effect(operation_key):
             if bindings.db.side_effect_succeeded(operation_key):
@@ -2708,13 +2750,14 @@ def _build_submit_pr_review(bindings: ToolBindings) -> HostTool[Any, Any]:
                     body=submit_body,
                     event=raw_event,
                     comments=comments,
+                    commit_id=final_commit_id or None,
                 ),
             )
         except GitHubError as exc:
             bindings.db.mark_side_effect_failed(operation_key, str(exc))
             _audit(bindings, "submit_pr_review", args, error=str(exc))
             _raise_command(f"GitHub rejected PR review: {exc.status} {exc.message}")
-        completed_head_sha: str | None = None
+        completed_head_sha: str | None = final_commit_id or None
         posted_findings_count = 0
         tracking_failure: str | None = None
         if pr_review_payload_available:

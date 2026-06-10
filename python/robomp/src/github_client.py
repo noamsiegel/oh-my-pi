@@ -467,11 +467,15 @@ class GitHubClient:
         body: str,
         event: str,
         comments: list[Mapping[str, Any]],
+        commit_id: str | None = None,
     ) -> PullRequestReviewInfo:
+        payload: dict[str, Any] = {"body": body, "event": event, "comments": comments}
+        if commit_id:
+            payload["commit_id"] = commit_id
         data = await self.request(
             "POST",
             f"/repos/{repo}/pulls/{pr_number}/reviews",
-            json={"body": body, "event": event, "comments": comments},
+            json=payload,
         )
         return _pr_review_from_payload(data)
 

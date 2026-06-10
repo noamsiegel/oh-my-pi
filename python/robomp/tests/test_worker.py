@@ -108,6 +108,7 @@ def _make_inputs(
         session_dir=session_dir,
         repo_dir=repo_dir,
         branch="robomp/issue-1",
+        review_head_sha=None,
     )
     repo = SimpleNamespace(full_name="acme/widgets", owner="acme", name="widgets")
     issue = SimpleNamespace(repo="acme/widgets", number=1, title="bug")
@@ -207,6 +208,41 @@ async def test_run_rpc_passes_continue_when_session_jsonl_present(tmp_path: Path
         loop.close()
     assert _FakeRpcClient.instances[0].kwargs["extra_args"] == ("--continue",)
 
+
+@pytest.mark.asyncio
+async def test_run_rpc_resume_is_scoped_to_head_session_dir(tmp_path: Path, settings: Settings) -> None:
+    head1_root = tmp_path / "head1"
+    head2_root = tmp_path / "head2"
+    head1_root.mkdir()
+    head2_root.mkdir()
+    inputs1, bindings1 = _make_inputs(head1_root, settings, session_has_jsonl=True)
+    inputs1.workspace.review_head_sha = "1" * 40
+    bindings1.workspace.review_head_sha = "1" * 40
+    inputs2, bindings2 = _make_inputs(head2_root, settings, session_has_jsonl=False)
+    inputs2.workspace.review_head_sha = "2" * 40
+    bindings2.workspace.review_head_sha = "2" * 40
+
+    loop = asyncio.new_event_loop()
+    try:
+        worker._run_rpc_blocking(
+            inputs1,
+            task_kind="review_pr",
+            prompt="x",
+            loop=loop,
+            bindings=bindings1,  # type: ignore[arg-type]
+        )
+        worker._run_rpc_blocking(
+            inputs2,
+            task_kind="review_pr",
+            prompt="x",
+            loop=loop,
+            bindings=bindings2,  # type: ignore[arg-type]
+        )
+    finally:
+        loop.close()
+
+    assert _FakeRpcClient.instances[0].kwargs["extra_args"] == ("--continue",)
+    assert _FakeRpcClient.instances[1].kwargs["extra_args"] == ()
 
 @pytest.mark.asyncio
 async def test_run_rpc_omits_continue_when_session_empty(

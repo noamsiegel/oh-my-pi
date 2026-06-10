@@ -691,6 +691,7 @@ async def run_task(
         inbound_thread_number=pr_number,
         inbound_is_pr=pr_number is not None,
         review_mode=review_mode,
+        review_head_sha=pr.head_sha if task_kind == "review_pr" and pr is not None else inputs.workspace.review_head_sha,
         impl_authorized=bool(directive is not None and directive.authorizes_impl),
         slot_uid=inputs.slot_uid,
         abort=AbortController(),

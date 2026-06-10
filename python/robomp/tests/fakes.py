@@ -49,6 +49,7 @@ class RecordingWorkspace:
     session_dir: Path
     context_dir: Path
     repo_dir: Path
+    review_head_sha: str | None = None
 
 
 class RecordingSandbox:
@@ -59,7 +60,7 @@ class RecordingSandbox:
     def __init__(self, tmp_root: Path | None = None) -> None:
         self.tmp_root = tmp_root or Path("/tmp/robomp-test-workspaces")
         self.ensure_calls: list[dict[str, Any]] = []
-        self.remove_calls: list[tuple[str, int]] = []
+        self.remove_calls: list[tuple[str, int, str | None]] = []
 
     def ensure_workspace(
         self,
@@ -71,6 +72,7 @@ class RecordingSandbox:
         default_branch: str,
         existing_branch: str | None = None,
         pr_head: int | None = None,
+        pr_head_sha: str | None = None,
         pr_base_ref: str | None = None,
         pr_changed_paths: Iterable[str] | None = None,
         author_name: str = "",
@@ -86,6 +88,7 @@ class RecordingSandbox:
                 "default_branch": default_branch,
                 "existing_branch": existing_branch,
                 "pr_head": pr_head,
+                "pr_head_sha": pr_head_sha,
                 "pr_base_ref": pr_base_ref,
                 "pr_changed_paths": tuple(pr_changed_paths or ()),
                 "author_name": author_name,
@@ -94,15 +97,18 @@ class RecordingSandbox:
             }
         )
         wid = f"{repo.replace('/', '__')}__{number}"
+        if pr_head_sha is not None:
+            wid = f"{wid}__{pr_head_sha}"
         return RecordingWorkspace(
             branch=existing_branch or (f"review/pr-{pr_head}" if pr_head is not None else f"farm/auto/{wid}"),
             session_dir=self.tmp_root / wid / "session",
             context_dir=self.tmp_root / wid / "context",
             repo_dir=self.tmp_root / wid / "repo",
+            review_head_sha=pr_head_sha,
         )
 
-    def remove_workspace(self, *, repo: str, number: int) -> None:
-        self.remove_calls.append((repo, number))
+    def remove_workspace(self, *, repo: str, number: int, head_sha: str | None = None) -> None:
+        self.remove_calls.append((repo, number, head_sha))
 
 
 class StubGitTransport:

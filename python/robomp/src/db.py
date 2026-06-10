@@ -67,6 +67,7 @@ CREATE TABLE IF NOT EXISTS issues (
   branch         TEXT,
   session_dir    TEXT,
   pr_number      INTEGER,
+  review_head_sha TEXT,
   state          TEXT NOT NULL,
   classification TEXT,         -- bug|enhancement|question|proposal|documentation|invalid|duplicate
   updated_at     TEXT NOT NULL
@@ -321,6 +322,7 @@ class IssueRow:
     state: IssueState
     updated_at: str
     classification: str | None = None
+    review_head_sha: str | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -496,7 +498,8 @@ def _issue_row_from_db_row(row: sqlite3.Row) -> IssueRow:
         number=int(row["number"]),
         branch=row["branch"],
         session_dir=row["session_dir"],
-        pr_number=row["pr_number"],
+        pr_number=int(row["pr_number"]) if row["pr_number"] is not None else None,
+        review_head_sha=row["review_head_sha"],
         state=row["state"],
         classification=row["classification"],
         updated_at=row["updated_at"],
@@ -563,6 +566,8 @@ class Database:
         issue_cols = {row[1] for row in self._conn.execute("PRAGMA table_info(issues)").fetchall()}
         if "classification" not in issue_cols:
             self._conn.execute("ALTER TABLE issues ADD COLUMN classification TEXT")
+        if "review_head_sha" not in issue_cols:
+            self._conn.execute("ALTER TABLE issues ADD COLUMN review_head_sha TEXT")
         event_cols = {row[1] for row in self._conn.execute("PRAGMA table_info(events)").fetchall()}
         if "model" not in event_cols:
             self._conn.execute("ALTER TABLE events ADD COLUMN model TEXT")
@@ -1023,21 +1028,23 @@ class Database:
         branch: str | None = None,
         session_dir: str | None = None,
         pr_number: int | None = None,
+        review_head_sha: str | None = None,
     ) -> IssueRow:
         now = _utcnow()
         with self._lock:
             self._conn.execute(
                 """
-                INSERT INTO issues (key, repo, number, branch, session_dir, pr_number, state, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO issues (key, repo, number, branch, session_dir, pr_number, review_head_sha, state, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(key) DO UPDATE SET
                   branch = COALESCE(excluded.branch, issues.branch),
                   session_dir = COALESCE(excluded.session_dir, issues.session_dir),
                   pr_number = COALESCE(excluded.pr_number, issues.pr_number),
+                  review_head_sha = COALESCE(excluded.review_head_sha, issues.review_head_sha),
                   state = excluded.state,
                   updated_at = excluded.updated_at
                 """,
-                (key, repo, number, branch, session_dir, pr_number, state, now),
+                (key, repo, number, branch, session_dir, pr_number, review_head_sha, state, now),
             )
         got = self.get_issue(key)
         assert got is not None
@@ -1074,48 +1081,28 @@ class Database:
     def get_issue(self, key: str) -> IssueRow | None:
         with self._lock:
             row = self._conn.execute(
-                "SELECT key, repo, number, branch, session_dir, pr_number, state, classification, updated_at FROM issues WHERE key=?",
+                "SELECT key, repo, number, branch, session_dir, pr_number, review_head_sha, state, classification, updated_at FROM issues WHERE key=?",
                 (key,),
             ).fetchone()
         if row is None:
             return None
-        return IssueRow(
-            key=row["key"],
-            repo=row["repo"],
-            number=int(row["number"]),
-            branch=row["branch"],
-            session_dir=row["session_dir"],
-            pr_number=int(row["pr_number"]) if row["pr_number"] is not None else None,
-            state=row["state"],
-            updated_at=row["updated_at"],
-            classification=row["classification"],
-        )
+        return _issue_row_from_db_row(row)
 
     def find_issue_by_pr(self, repo: str, pr_number: int) -> IssueRow | None:
         with self._lock:
             row = self._conn.execute(
-                "SELECT key, repo, number, branch, session_dir, pr_number, state, classification, updated_at FROM issues WHERE repo=? AND pr_number=?",
+                "SELECT key, repo, number, branch, session_dir, pr_number, review_head_sha, state, classification, updated_at FROM issues WHERE repo=? AND pr_number=?",
                 (repo, pr_number),
             ).fetchone()
         if row is None:
             return None
-        return IssueRow(
-            key=row["key"],
-            repo=row["repo"],
-            number=int(row["number"]),
-            branch=row["branch"],
-            session_dir=row["session_dir"],
-            pr_number=int(row["pr_number"]),
-            state=row["state"],
-            updated_at=row["updated_at"],
-            classification=row["classification"],
-        )
+        return _issue_row_from_db_row(row)
 
     def find_issue_by_branch(self, repo: str, branch: str) -> IssueRow | None:
         with self._lock:
             row = self._conn.execute(
                 """
-                SELECT key, repo, number, branch, session_dir, pr_number, state, classification, updated_at
+                SELECT key, repo, number, branch, session_dir, pr_number, review_head_sha, state, classification, updated_at
                 FROM issues
                 WHERE repo=? AND branch=?
                 ORDER BY updated_at DESC
@@ -1125,38 +1112,15 @@ class Database:
             ).fetchone()
         if row is None:
             return None
-        return IssueRow(
-            key=row["key"],
-            repo=row["repo"],
-            number=int(row["number"]),
-            branch=row["branch"],
-            session_dir=row["session_dir"],
-            pr_number=int(row["pr_number"]) if row["pr_number"] is not None else None,
-            state=row["state"],
-            updated_at=row["updated_at"],
-            classification=row["classification"],
-        )
+        return _issue_row_from_db_row(row)
 
     def list_issues(self, limit: int = 100) -> list[IssueRow]:
         with self._lock:
             rows = self._conn.execute(
-                "SELECT key, repo, number, branch, session_dir, pr_number, state, classification, updated_at FROM issues ORDER BY updated_at DESC LIMIT ?",
+                "SELECT key, repo, number, branch, session_dir, pr_number, review_head_sha, state, classification, updated_at FROM issues ORDER BY updated_at DESC LIMIT ?",
                 (limit,),
             ).fetchall()
-        return [
-            IssueRow(
-                key=r["key"],
-                repo=r["repo"],
-                number=int(r["number"]),
-                branch=r["branch"],
-                session_dir=r["session_dir"],
-                pr_number=int(r["pr_number"]) if r["pr_number"] is not None else None,
-                state=r["state"],
-                updated_at=r["updated_at"],
-                classification=r["classification"],
-            )
-            for r in rows
-        ]
+        return [_issue_row_from_db_row(r) for r in rows]
 
     def processed_issue_keys(self, keys: Iterable[str]) -> set[str]:
         """Return the subset of `keys` that have a row in the `issues` table.
@@ -1332,6 +1296,19 @@ class Database:
             start_line=int(row["start_line"]) if row["start_line"] is not None else None,
             start_side=row["start_side"],
         )
+
+    def has_completed_pr_review(self, repo: str, pr_number: int, head_sha: str) -> bool:
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT 1
+                FROM pr_review_completed_reviews
+                WHERE repo=? AND pr_number=? AND head_sha=? AND event IN ('APPROVE','REQUEST_CHANGES','COMMENT')
+                LIMIT 1
+                """,
+                (repo, pr_number, head_sha),
+            ).fetchone()
+        return row is not None
 
     def list_staged_review_comments(self, issue_key: str) -> list[StagedReviewComment]:
         with self._lock:
@@ -1928,7 +1905,7 @@ class Database:
         with self._lock:
             rows = self._conn.execute(
                 """
-                SELECT key, repo, number, branch, session_dir, pr_number, state, classification, updated_at
+                SELECT key, repo, number, branch, session_dir, pr_number, review_head_sha, state, classification, updated_at
                 FROM issues
                 WHERE pr_number IS NOT NULL AND session_dir IS NOT NULL AND updated_at BETWEEN ? AND ?
                 ORDER BY updated_at DESC LIMIT ?

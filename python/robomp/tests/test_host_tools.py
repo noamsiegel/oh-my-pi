@@ -8,6 +8,7 @@ import threading
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
+import shutil
 
 import httpx
 import pytest
@@ -33,6 +34,7 @@ from robomp.host_tools import AbortController, ToolBindings, build
 from robomp.pr_review_tools import PrReviewPaths, pr_review_paths, run_pr_review_helper, save_json_checked
 from robomp.sandbox import LocalGitTransport, Workspace
 
+_GIT_BIN = shutil.which("git") or "git"
 
 def _stub_workspace(tmp_path: Path) -> Workspace:
     root = tmp_path / "ws"
@@ -52,6 +54,30 @@ def _stub_workspace(tmp_path: Path) -> Workspace:
         repo_full_name="octo/widget",
         issue_number=42,
     )
+
+def _init_review_git_repo(repo_dir: Path) -> str:
+    subprocess_env = {
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@t",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@t",
+    }
+    import os
+    import subprocess
+
+    subprocess.run([_GIT_BIN, "init", "--initial-branch=main"], cwd=repo_dir, check=True, capture_output=True, text=True)
+    (repo_dir / "README.md").write_text("hello\n", encoding="utf-8")
+    subprocess.run([_GIT_BIN, "add", "README.md"], cwd=repo_dir, check=True, capture_output=True, text=True)
+    subprocess.run(
+        [_GIT_BIN, "commit", "-m", "init"],
+        cwd=repo_dir,
+        check=True,
+        capture_output=True,
+        text=True,
+        env=os.environ | subprocess_env,
+    )
+    return subprocess.run([_GIT_BIN, "rev-parse", "HEAD"], cwd=repo_dir, check=True, capture_output=True, text=True).stdout.strip()
+
 
 
 def _stub_issue() -> IssueInfo:
@@ -760,7 +786,36 @@ def _pr_bindings(
 def _review_bindings(
     db: Database, tmp_path: Path, transport: httpx.MockTransport
 ) -> tuple[ToolBindings, asyncio.AbstractEventLoop, threading.Thread]:
-    github = GitHubClient("token", transport=transport)
+    workspace = _stub_workspace(tmp_path)
+    workspace.issue_number = 99
+    head_sha = _init_review_git_repo(workspace.repo_dir)
+    workspace.review_head_sha = head_sha
+
+    def transport_with_default_pr(request: httpx.Request) -> httpx.Response:
+        try:
+            response = transport.handle_request(request)
+        except Exception:
+            if request.method == "GET" and request.url.path == "/repos/octo/widget/pulls/99":
+                response = httpx.Response(500)
+            else:
+                raise
+        if request.method != "GET" or request.url.path != "/repos/octo/widget/pulls/99" or response.status_code < 400:
+            return response
+        return httpx.Response(
+            200,
+            json={
+                "number": 99,
+                "html_url": "https://github.com/octo/widget/pull/99",
+                "title": "Contributor PR",
+                "body": "body",
+                "head": {"ref": "feature", "sha": head_sha, "repo": {"full_name": "octo/widget"}},
+                "base": {"ref": "main"},
+                "state": "open",
+                "user": {"login": "alice"},
+            },
+        )
+
+    github = GitHubClient("token", transport=httpx.MockTransport(transport_with_default_pr))
     loop, thread = _make_loop_in_background()
     issue = IssueInfo(
         repo="octo/widget",
@@ -772,8 +827,6 @@ def _review_bindings(
         labels=(),
         is_pull_request=True,
     )
-    workspace = _stub_workspace(tmp_path)
-    workspace.issue_number = 99
     bindings = ToolBindings(
         db=db,
         github=github,
@@ -787,6 +840,7 @@ def _review_bindings(
         inbound_thread_number=99,
         inbound_is_pr=True,
         review_mode=True,
+        review_head_sha=head_sha,
     )
     db.upsert_issue(
         key=bindings.issue_key,
@@ -796,6 +850,7 @@ def _review_bindings(
         branch=bindings.workspace.branch,
         session_dir=str(bindings.workspace.session_dir),
         pr_number=99,
+        review_head_sha=head_sha,
     )
     return bindings, loop, thread
 
@@ -833,6 +888,16 @@ def test_fetch_pr_returns_premise_and_changed_files(db: Database, tmp_path: Path
     assert "Fix crash" in result
     assert "#42" in result
     assert "`src/app.py` (modified, +5/-2)" in result
+
+
+def test_gh_post_comment_rejects_in_review_mode(db: Database, tmp_path: Path) -> None:
+    bindings, loop, t = _review_bindings(db, tmp_path, httpx.MockTransport(lambda _r: httpx.Response(500)))
+    try:
+        tool = next(x for x in build(bindings) if x.name == "gh_post_comment")
+        with pytest.raises(RpcCommandError, match="gh_post_comment is disabled during PR review; use submit_pr_review"):
+            tool.execute({"body": "fallback"}, _ctx())
+    finally:
+        _stop_loop(loop, t)
 
 
 def test_classify_pr_applies_review_labels_and_persists_label(db: Database, tmp_path: Path) -> None:
@@ -941,7 +1006,7 @@ def _seed_pr_review_payload_state(
     _write_pr_review_helper(helper)
     paths = pr_review_paths(bindings.workspace)
     payload_findings = findings if findings is not None else [{"path": "src/generated.py", "line": 7, "body": "payload finding"}]
-    default_evidence = {"head_sha": "payload-sha"}
+    default_evidence = {"head_sha": bindings.review_head_sha or bindings.workspace.review_head_sha}
     if evidence:
         default_evidence.update(evidence)
     save_json_checked(paths.evidence, default_evidence)
@@ -1017,6 +1082,54 @@ def test_run_pr_review_helper_invokes_bun_with_pr_paths_and_allowlisted_env(
     assert captured["kwargs"]["cwd"] == str(bindings.workspace.repo_dir)
     assert captured["kwargs"]["env"]["PATH"] == "/bin"
     assert "GITHUB_TOKEN" not in captured["kwargs"]["env"]
+
+
+def test_submit_pr_review_refuses_when_pr_head_changed(
+    db: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    old_head = "1" * 40
+    new_head = "2" * 40
+    posted = False
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal posted
+        if request.method == "GET" and request.url.path == "/repos/octo/widget/pulls/99":
+            return httpx.Response(
+                200,
+                json={
+                    "number": 99,
+                    "html_url": "https://github.com/octo/widget/pull/99",
+                    "title": "Contributor PR",
+                    "body": "body",
+                    "head": {"ref": "feature", "sha": new_head, "repo": {"full_name": "octo/widget"}},
+                    "base": {"ref": "main"},
+                    "state": "open",
+                    "user": {"login": "alice"},
+                },
+            )
+        if request.method == "POST" and request.url.path.endswith("/reviews"):
+            posted = True
+        return httpx.Response(404, json={"message": "unrouted"})
+
+    bindings, loop, t = _review_bindings(db, tmp_path, httpx.MockTransport(handler))
+    helper = tmp_path / "pr-review-helper.js"
+    _seed_pr_review_payload_state(bindings, helper, recommendation_event="COMMENT", blocking_count=0, findings=[], evidence={"head_sha": old_head})
+    bindings = replace(bindings, settings=Settings.model_construct(pr_review_terminal_events=True, pr_review_helper=helper))
+
+    def _rev_parse(_bindings: ToolBindings, cmd, *, timeout=None):
+        if cmd == ("git", "rev-parse", "HEAD"):
+            return host_tools.subprocess.CompletedProcess(list(cmd), 0, stdout=f"{old_head}\n", stderr="")
+        raise AssertionError(cmd)
+
+    monkeypatch.setattr(host_tools, "_run_repo_command", _rev_parse)
+    try:
+        tool = next(x for x in build(bindings) if x.name == "submit_pr_review")
+        with pytest.raises(RpcCommandError, match="PR review submit refused: head changed"):
+            tool.execute({"body": "summary", "event": "COMMENT"}, _ctx())
+    finally:
+        _stop_loop(loop, t)
+
+    assert posted is False
 
 
 def test_run_pr_review_helper_preserves_error_prefix(
@@ -1095,6 +1208,7 @@ def test_submit_pr_review_terminal_events_enabled_passes_event_and_clears(
 
     assert f"event={event}" in result
     assert captured["body"]["event"] == event
+    assert captured["body"]["commit_id"] == bindings.review_head_sha
     assert captured["body"]["comments"] == [{"path": "src/generated.py", "line": 7, "side": "RIGHT", "body": "payload finding"}]
     assert db.list_staged_review_comments(bindings.issue_key) == []
     posted = db.list_pr_review_posted_findings("octo/widget", 99)
@@ -1252,7 +1366,7 @@ def test_submit_pr_review_refuses_clean_with_current_head_external_inline_commen
         recommendation_reason="informational",
         findings=[],
         evidence={
-            "head_sha": "payload-sha",
+            "head_sha": bindings.review_head_sha,
             "reviewer_login": "noamsiegel",
             "prior_review_comments": [
                 {
@@ -1261,7 +1375,7 @@ def test_submit_pr_review_refuses_clean_with_current_head_external_inline_commen
                     "line": 479,
                     "body": "task_id contract can drift",
                     "user": {"login": "mainstay-claude[bot]"},
-                    "commit_id": "payload-sha",
+                    "commit_id": bindings.review_head_sha,
                 }
             ],
         },
@@ -1302,7 +1416,7 @@ def test_submit_pr_review_allows_clean_with_prior_external_disposition(db: Datab
         recommendation_reason="informational",
         findings=[],
         evidence={
-            "head_sha": "payload-sha",
+            "head_sha": bindings.review_head_sha,
             "reviewer_login": "noamsiegel",
             "prior_review_comments": [
                 {
@@ -1312,7 +1426,7 @@ def test_submit_pr_review_allows_clean_with_prior_external_disposition(db: Datab
                     "line": 479,
                     "body": "task_id contract can drift",
                     "user": {"login": "mainstay-claude[bot]"},
-                    "commit_id": "payload-sha",
+                    "commit_id": bindings.review_head_sha,
                     "thread_is_resolved": False,
                     "thread_is_outdated": False,
                 }
@@ -1456,7 +1570,7 @@ def test_submit_pr_review_process_report_lists_delegated_models_and_diff_evidenc
                 "deletions": 3,
                 "files": [{"path": "apps/hoa/api/actions/fundingrequest.py"}],
             },
-            "head_sha": "abcdef1234567890",
+            "head_sha": bindings.review_head_sha,
         },
     )
     paths = pr_review_paths(bindings.workspace)
@@ -1660,10 +1774,12 @@ if (cmd === "classify") {
     }
     return f.body;
   };
+  const evidence = JSON.parse(await Bun.file(arg("--evidence")).text());
   await Bun.write(out, JSON.stringify({
     body,
     event: arg("--event"),
-    comments: findings.map((f) => ({path: f.path, line: f.line, side: "RIGHT", body: render(f)}))
+    comments: findings.map((f) => ({path: f.path, line: f.line, side: "RIGHT", body: render(f)})),
+    commit_id: evidence.head_sha,
   }));
 } else {
   throw new Error(`unexpected cmd ${cmd}`);
@@ -1704,7 +1820,7 @@ def test_prepare_pr_review_writes_evidence_and_returns_classification(
         head_repo="alice/widget",
         title="Fix bug",
         body="body",
-        head_sha="abc",
+        head_sha=bindings.review_head_sha or "",
     )
 
     async def _get_pull_request(repo_full: str, number: int):
@@ -1745,6 +1861,8 @@ def test_prepare_pr_review_writes_evidence_and_returns_classification(
         return []
 
     def _diff(_bindings: ToolBindings, cmd, *, timeout=None):
+        if cmd == ("git", "rev-parse", "HEAD"):
+            return host_tools.subprocess.CompletedProcess(list(cmd), 0, stdout=f"{bindings.review_head_sha}\n", stderr="")
         assert cmd == ("git", "diff", "--no-color", "origin/main...HEAD")
         return host_tools.subprocess.CompletedProcess(list(cmd), 0, stdout="diff --git a/src/app.py b/src/app.py\n--- a/src/app.py\n+++ b/src/app.py\n@@ -10,2 +10,3 @@\n context\n+added\n", stderr="")
 
@@ -1765,7 +1883,7 @@ def test_prepare_pr_review_writes_evidence_and_returns_classification(
     evidence = json.loads((bindings.workspace.session_dir / "pr-review-evidence.json").read_text(encoding="utf-8"))
     assert evidence["diff"].startswith("diff --git")
     assert evidence["view"]["files"][0]["path"] == "src/app.py"
-    assert evidence["view"]["headRefOid"] == "abc"
+    assert evidence["view"]["headRefOid"] == bindings.review_head_sha
     assert evidence["view"]["commits"][0]["oid"] == "abc"
     assert evidence["mode"] == "fresh"
     assert evidence["anchors"][0]["validRightLines"] == [10, 11]
@@ -1773,6 +1891,59 @@ def test_prepare_pr_review_writes_evidence_and_returns_classification(
     assert evidence["prior_review_comments"][0]["thread_is_resolved"] is False
     assert "risk_level: medium" in result
     assert "reviewability.status: reviewable" in result
+
+def test_prepare_pr_review_refuses_stale_workspace_head(
+    db: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    old_head = "1" * 40
+    new_head = "2" * 40
+    helper = tmp_path / "pr-review-helper.js"
+    _write_pr_review_helper(helper)
+    bindings, loop, t = _review_bindings(db, tmp_path, httpx.MockTransport(lambda _r: httpx.Response(500)))
+    bindings.workspace.review_head_sha = old_head
+    bindings = replace(
+        bindings,
+        review_head_sha=old_head,
+        settings=Settings.model_construct(pr_review_helper=helper, request_timeout_seconds=30.0),
+    )
+
+    async def _get_pull_request(repo_full: str, number: int):
+        return PullRequestInfo(
+            repo="octo/widget",
+            number=99,
+            html_url="https://github.com/octo/widget/pull/99",
+            head_ref="alice/fix",
+            base_ref="main",
+            state="open",
+            author="alice",
+            head_repo="alice/widget",
+            title="Fix bug",
+            body="body",
+            head_sha=new_head,
+        )
+
+    async def _empty(*_args: object):
+        return []
+
+    def _rev_parse(_bindings: ToolBindings, cmd, *, timeout=None):
+        if cmd == ("git", "rev-parse", "HEAD"):
+            return host_tools.subprocess.CompletedProcess(list(cmd), 0, stdout=f"{old_head}\n", stderr="")
+        raise AssertionError(cmd)
+
+    monkeypatch.setattr(bindings.github, "get_pull_request", _get_pull_request)
+    monkeypatch.setattr(bindings.github, "list_pr_files", _empty)
+    monkeypatch.setattr(bindings.github, "list_pr_reviews", _empty)
+    monkeypatch.setattr(bindings.github, "list_review_threads", _empty)
+    monkeypatch.setattr(bindings.github, "list_pr_commits", _empty)
+    monkeypatch.setattr(bindings.github, "list_comments", _empty)
+    monkeypatch.setattr(host_tools, "_run_repo_command", _rev_parse)
+    try:
+        tool = next(x for x in build(bindings) if x.name == "prepare_pr_review")
+        with pytest.raises(RpcCommandError, match="PR review workspace head mismatch"):
+            tool.execute({}, _ctx())
+    finally:
+        _stop_loop(loop, t)
+
 
 
 def test_validate_pr_review_returns_anchor_summary(db: Database, tmp_path: Path) -> None:
@@ -1784,7 +1955,7 @@ def test_validate_pr_review_returns_anchor_summary(db: Database, tmp_path: Path)
         settings=Settings.model_construct(pr_review_helper=helper, request_timeout_seconds=30.0),
     )
     paths = pr_review_paths(bindings.workspace)
-    save_json_checked(paths.evidence, {})
+    save_json_checked(paths.evidence, {"head_sha": bindings.review_head_sha})
     save_json_checked(paths.classification, {"delegation_required": False, "domains_required": ["correctness"]})
     try:
         tool = next(x for x in build(bindings) if x.name == "validate_pr_review")
@@ -1852,7 +2023,7 @@ def test_pr_review_suggestion_reaches_submit_payload(db: Database, tmp_path: Pat
         ),
     )
     paths = pr_review_paths(bindings.workspace)
-    save_json_checked(paths.evidence, {})
+    save_json_checked(paths.evidence, {"head_sha": bindings.review_head_sha})
     save_json_checked(paths.classification, {"delegation_required": False, "domains_required": ["correctness"]})
     try:
         validate = next(x for x in build(bindings) if x.name == "validate_pr_review")
@@ -1900,7 +2071,7 @@ def test_validate_pr_review_requires_delegate_for_required_domains(db: Database,
         settings=Settings.model_construct(pr_review_helper=helper, request_timeout_seconds=30.0),
     )
     paths = pr_review_paths(bindings.workspace)
-    save_json_checked(paths.evidence, {})
+    save_json_checked(paths.evidence, {"head_sha": bindings.review_head_sha})
     save_json_checked(paths.classification, {"delegation_required": True, "domains_required": ["security", "correctness"]})
     try:
         tool = next(x for x in build(bindings) if x.name == "validate_pr_review")
@@ -1936,7 +2107,7 @@ def test_delegate_pr_review_writes_metadata_and_unblocks_validate(
         ),
     )
     paths = pr_review_paths(bindings.workspace)
-    save_json_checked(paths.evidence, {})
+    save_json_checked(paths.evidence, {"head_sha": bindings.review_head_sha})
     save_json_checked(paths.classification, {"delegation_required": True, "domains_required": ["security", "correctness"]})
 
     class _Turn:
@@ -2022,7 +2193,7 @@ def test_delegate_pr_review_metadata_model_renders_in_process_report(
         ),
     )
     paths = pr_review_paths(bindings.workspace)
-    save_json_checked(paths.evidence, {"head_sha": "payload-sha"})
+    save_json_checked(paths.evidence, {"head_sha": bindings.review_head_sha})
     save_json_checked(paths.classification, {"delegation_required": True, "domains_required": ["security", "correctness"]})
 
     class _Turn:
@@ -2058,7 +2229,7 @@ def test_delegate_pr_review_metadata_model_renders_in_process_report(
             recommendation_reason="clean",
             findings=[],
             metadata=metadata,
-            evidence={"head_sha": "payload-sha"},
+            evidence={"head_sha": bindings.review_head_sha},
         )
         submit.execute({"body": "clean", "event": "APPROVE"}, _ctx())
     finally:
@@ -2161,17 +2332,18 @@ def test_submit_pr_review_is_idempotent(db: Database, tmp_path: Path) -> None:
 
 
 def test_submit_pr_review_pending_side_effect_skips_github(db: Database, tmp_path: Path) -> None:
-    calls = 0
+    post_calls = 0
 
     def handler(request: httpx.Request) -> httpx.Response:
-        nonlocal calls
-        calls += 1
+        nonlocal post_calls
+        if request.method == "POST" and request.url.path.endswith("/reviews"):
+            post_calls += 1
         return httpx.Response(500, json={"message": "should not post"})
 
     bindings, loop, t = _review_bindings(db, tmp_path, httpx.MockTransport(handler))
     operation_key = (
         f"submit_pr_review:{bindings.issue_key}:COMMENT:"
-        f"{host_tools._side_effect_payload_suffix({'body': 'summary', 'comments': [], 'event': 'COMMENT'})}"
+        f"{host_tools._side_effect_payload_suffix({'body': 'summary', 'comments': [], 'event': 'COMMENT', 'commit_id': bindings.review_head_sha})}"
     )
     assert db.reserve_side_effect(operation_key)
     try:
@@ -2181,7 +2353,7 @@ def test_submit_pr_review_pending_side_effect_skips_github(db: Database, tmp_pat
         _stop_loop(loop, t)
 
     assert result == f"side effect already pending: {operation_key}"
-    assert calls == 0
+    assert post_calls == 0
 
 
 def test_submit_pr_review_failure_keeps_staged_comments(db: Database, tmp_path: Path) -> None:

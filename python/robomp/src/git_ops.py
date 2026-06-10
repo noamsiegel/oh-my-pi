@@ -40,6 +40,14 @@ _BAD_OBJECT_REF_RE = re.compile(
     r"(?:fatal: bad object (?P<bad>refs/[^\s]+)|error: (?P<invalid>refs/[^\s]+) does not point to a valid object!)"
 )
 _FETCH_PRUNE_REPAIR_ATTEMPTS = 8
+_COMMIT_SHA_RE = re.compile(r"[0-9a-fA-F]{40}")
+
+
+def _validate_commit_sha(value: str) -> str:
+    if _COMMIT_SHA_RE.fullmatch(value):
+        return value.lower()
+    raise ValueError(f"invalid commit sha: {value!r}")
+
 
 _SHARED_OMP_GID = 2000
 _AGENT_HOME = Path("/srv/agent-home")
@@ -689,6 +697,7 @@ def prepare_pr_worktree(
     repo_dir: Path,
     *,
     pr_number: int,
+    expected_head_sha: str,
     base_ref: str,
     changed_paths: Iterable[str],
     token: str | None,
@@ -697,6 +706,7 @@ def prepare_pr_worktree(
 ) -> PrWorktreeResult:
     if pr_number <= 0:
         raise ValueError(f"invalid PR number: {pr_number!r}")
+    expected_head_sha = _validate_commit_sha(expected_head_sha)
     paths = normalize_pr_sparse_paths(changed_paths)
     if not _is_safe_pr_base_ref(base_ref):
         raise ValueError(f"invalid PR base ref: {base_ref!r}")
@@ -718,6 +728,17 @@ def prepare_pr_worktree(
         _run_git(pr_fetch, cwd=pool_dir, token=token, safe_directory=safe_directory, timeout=timeout),
         ["git", *pr_fetch],
     )
+    fetched = _check(
+        _run_git(["rev-parse", "FETCH_HEAD"], cwd=pool_dir, token=token, safe_directory=safe_directory, timeout=timeout),
+        ["git", "rev-parse", "FETCH_HEAD"],
+    ).stdout.strip().lower()
+    if fetched != expected_head_sha:
+        raise GitCommandError(
+            ["git", "rev-parse", "FETCH_HEAD"],
+            128,
+            fetched,
+            f"PR head mismatch: expected {expected_head_sha}, got {fetched}",
+        )
     worktree_args = ["worktree", "add", "--detach", "--no-checkout", str(repo_dir), "FETCH_HEAD"]
     _check(
         _run_git(worktree_args, cwd=pool_dir, token=token, safe_directory=safe_directory, timeout=timeout),

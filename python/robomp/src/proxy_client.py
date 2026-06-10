@@ -334,6 +334,7 @@ class GitHubProxyClient:
         body: str,
         event: str,
         comments: list[Mapping[str, Any]],
+        commit_id: str | None = None,
     ) -> PullRequestReviewInfo:
         data = await self._request(
             "POST",
@@ -344,6 +345,7 @@ class GitHubProxyClient:
                 "body": body,
                 "event": event,
                 "comments": comments,
+                "commit_id": commit_id,
             },
         )
         return _pr_review_from(data)
@@ -446,6 +448,7 @@ class ProxyGitTransport:
         pool_dir: Path,
         repo_dir: Path,
         pr_number: int,
+        expected_head_sha: str,
         base_ref: str,
         changed_paths: Iterable[str],
     ) -> PrWorktreeResult:
@@ -456,6 +459,7 @@ class ProxyGitTransport:
                 "repo": repo,
                 "workspace_key": repo_dir.parent.name,
                 "pr_number": pr_number,
+                "expected_head_sha": expected_head_sha,
                 "base_ref": base_ref,
                 "changed_paths": list(changed_paths),
             },

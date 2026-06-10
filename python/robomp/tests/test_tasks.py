@@ -18,6 +18,10 @@ from robomp.github_types import (
 )
 
 
+HEAD_SHA = "a" * 40
+OLD_HEAD_SHA = "b" * 40
+
+
 def _now_iso() -> str:
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
@@ -41,11 +45,11 @@ def _payload() -> dict[str, object]:
 
 
 class _FakeGitHub:
-    def __init__(self, ci: PullRequestCiStatusInfo) -> None:
+    def __init__(self, ci: PullRequestCiStatusInfo, reviews: list[PullRequestReviewInfo] | None = None) -> None:
         self.ci = ci
+        self.reviews = reviews or []
         self.list_pr_reviews_called = False
         self.list_pr_files_called = False
-
     async def get_repo(self, repo: str) -> RepoInfo:
         return RepoInfo(full_name=repo, default_branch="main", clone_url="https://example/octo/widget.git", private=False)
 
@@ -70,7 +74,7 @@ class _FakeGitHub:
             base_ref="main",
             state="open",
             draft=False,
-            head_sha="abc123",
+            head_sha=HEAD_SHA,
             author="alice",
             author_type="User",
             head_repo=repo,
@@ -80,12 +84,12 @@ class _FakeGitHub:
 
     async def get_commit_ci_status(self, repo: str, head_sha: str) -> PullRequestCiStatusInfo:
         assert repo == "octo/widget"
-        assert head_sha == "abc123"
+        assert head_sha == HEAD_SHA
         return self.ci
 
     async def list_pr_reviews(self, repo: str, pr_number: int) -> list[PullRequestReviewInfo]:
         self.list_pr_reviews_called = True
-        return []
+        return self.reviews
 
     async def list_pr_files(self, repo: str, pr_number: int) -> list[PullRequestFileInfo]:
         self.list_pr_files_called = True
@@ -97,9 +101,16 @@ class _FakeGitHub:
 
 class _FakeDb:
     def __init__(self) -> None:
-        self.issues: list[tuple[str, str]] = []
+        self.issues: list[dict[str, object]] = []
+        self.completed_review_queries: list[tuple[str, int, str]] = []
+        self.successful_tool_call_queries: list[tuple[str, str]] = []
 
     def has_successful_tool_call(self, key: str, tool: str) -> bool:
+        self.successful_tool_call_queries.append((key, tool))
+        return True
+
+    def has_completed_pr_review(self, repo: str, pr_number: int, head_sha: str) -> bool:
+        self.completed_review_queries.append((repo, pr_number, head_sha))
         return False
 
     def reserve_side_effect(self, operation_key: str) -> bool:
@@ -118,14 +129,18 @@ class _FakeDb:
         pass
 
     def upsert_issue(self, *, key: str, repo: str, number: int, state: str, **kwargs: object) -> None:
-        self.issues.append((key, state))
+        self.issues.append({"key": key, "repo": repo, "number": number, "state": state, **kwargs})
 
 
 class _FakeSandbox:
     natives_cache = None
 
+    def __init__(self) -> None:
+        self.kwargs: dict[str, object] = {}
+
     def ensure_workspace(self, **kwargs: object) -> SimpleNamespace:
-        return SimpleNamespace(branch="review", session_dir=Path("/tmp/session"))
+        self.kwargs = kwargs
+        return SimpleNamespace(branch="review", session_dir=Path("/tmp/session"), review_head_sha=kwargs.get("pr_head_sha"))
 
 
 class _FakeGitTransport:
@@ -134,12 +149,24 @@ class _FakeGitTransport:
 
 def _ci(state: str, *, total: int = 1, pending: int = 0, failed: int = 0) -> PullRequestCiStatusInfo:
     return PullRequestCiStatusInfo(
-        head_sha="abc123",
+        head_sha=HEAD_SHA,
         state=state,  # type: ignore[arg-type]
         total_count=total,
         pending_count=pending,
         failed_count=failed,
     )
+
+def _bot_review(state: str, commit_id: str) -> PullRequestReviewInfo:
+    return PullRequestReviewInfo(
+        id=100,
+        author="robomp-bot",
+        body="review body",
+        state=state,
+        submitted_at=_now_iso(),
+        commit_id=commit_id,
+    )
+
+
 
 
 async def _call_review(settings, github: _FakeGitHub, *, received_at: str | None) -> object:
@@ -200,6 +227,69 @@ async def test_review_pr_continues_when_ci_passed(settings, monkeypatch: pytest.
     assert calls == ["review_pr"]
     assert github.list_pr_reviews_called is True
     assert github.list_pr_files_called is True
+
+
+@pytest.mark.asyncio
+async def test_review_pr_passes_head_sha_to_workspace_and_records_issue(settings, monkeypatch: pytest.MonkeyPatch) -> None:
+    settings.pr_review_ci_gate_enabled = True
+    github = _FakeGitHub(_ci("passed", total=1))
+    db = _FakeDb()
+    sandbox = _FakeSandbox()
+    calls: list[str] = []
+
+    async def _run_task(**kwargs: object) -> None:
+        calls.append(str(kwargs["task_kind"]))
+
+    monkeypatch.setattr(tasks, "run_task", _run_task)
+
+    outcome = await tasks.review_pr(
+        settings=settings,
+        db=db,  # type: ignore[arg-type]
+        github=github,  # type: ignore[arg-type]
+        sandbox=sandbox,  # type: ignore[arg-type]
+        git_transport=_FakeGitTransport(),  # type: ignore[arg-type]
+        payload=_payload(),
+        delivery_id="delivery",
+        received_at=_now_iso(),
+    )
+
+    assert outcome is None
+    assert calls == ["review_pr"]
+    assert sandbox.kwargs["pr_head_sha"] == HEAD_SHA
+    assert any(row.get("review_head_sha") == HEAD_SHA and row.get("session_dir") for row in db.issues)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", ["APPROVED", "COMMENTED", "CHANGES_REQUESTED"])
+async def test_review_pr_does_not_skip_new_head_for_old_completed_review(
+    settings, monkeypatch: pytest.MonkeyPatch, state: str
+) -> None:
+    settings.pr_review_ci_gate_enabled = True
+    github = _FakeGitHub(_ci("passed", total=1), reviews=[_bot_review(state, OLD_HEAD_SHA)])
+    db = _FakeDb()
+    sandbox = _FakeSandbox()
+    calls: list[str] = []
+
+    async def _run_task(**kwargs: object) -> None:
+        calls.append(str(kwargs["task_kind"]))
+
+    monkeypatch.setattr(tasks, "run_task", _run_task)
+
+    outcome = await tasks.review_pr(
+        settings=settings,
+        db=db,  # type: ignore[arg-type]
+        github=github,  # type: ignore[arg-type]
+        sandbox=sandbox,  # type: ignore[arg-type]
+        git_transport=_FakeGitTransport(),  # type: ignore[arg-type]
+        payload=_payload(),
+        delivery_id="delivery",
+        received_at=_now_iso(),
+    )
+
+    assert outcome is None
+    assert calls == ["review_pr"]
+    assert sandbox.kwargs["pr_head_sha"] == HEAD_SHA
+    assert db.successful_tool_call_queries == []
 
 
 @pytest.mark.asyncio
