@@ -2434,11 +2434,12 @@ def test_set_issue_labels_appends(db: Database, tmp_path: Path) -> None:
     bindings, loop, t = _bindings(db, tmp_path, httpx.MockTransport(handler))
     try:
         tool = next(x for x in build(bindings) if x.name == "set_issue_labels")
-        result = tool.execute({"labels": ["wontfix"]}, _ctx())
+        result = tool.execute({"labels": ["question", "provider:openai"]}, _ctx())
     finally:
         _stop_loop(loop, t)
-    assert "wontfix" in result
-    assert captured["body"]["labels"] == ["wontfix"]
+    assert "question" in result
+    assert "provider:openai" in result
+    assert captured["body"]["labels"] == ["question", "provider:openai"]
 
 
 def test_set_issue_labels_rejects_empty(db: Database, tmp_path: Path) -> None:
@@ -2451,6 +2452,25 @@ def test_set_issue_labels_rejects_empty(db: Database, tmp_path: Path) -> None:
             tool.execute({"labels": ["   ", ""]}, _ctx())
     finally:
         _stop_loop(loop, t)
+
+
+def test_set_issue_labels_rejects_unknown_labels(db: Database, tmp_path: Path) -> None:
+    called = False
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal called
+        called = True
+        return httpx.Response(200, json=[])
+
+    bindings, loop, t = _bindings(db, tmp_path, httpx.MockTransport(handler))
+    try:
+        tool = next(x for x in build(bindings) if x.name == "set_issue_labels")
+        with pytest.raises(RpcCommandError, match="unknown label"):
+            tool.execute({"labels": ["wontfix"]}, _ctx())
+    finally:
+        _stop_loop(loop, t)
+
+    assert called is False
 
 
 def test_gh_push_branch_rejects_wrong_identity(db: Database, tmp_path: Path) -> None:

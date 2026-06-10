@@ -13,7 +13,7 @@ import os
 import re
 import subprocess
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
@@ -1042,6 +1042,31 @@ _FUNCTIONAL = ("agent", "tool", "tui", "cli", "prompting", "sdk", "auth", "setup
 _PLATFORMS = ("platform:linux", "platform:macos", "platform:windows", "platform:wsl")
 _PR_REVIEW_LABELS = ("review:clean", "review:minor", "review:maintainer-call", "review:deprioritized")
 _PR_TYPES = ("feat", "fix", "docs", "refactor", "perf", "test", "chore", "ci", "build")
+_TRIGGER_LABELS = ("robo-review", "hoa", "mail")
+_STATIC_LABEL_ALLOWLIST = frozenset(
+    (
+        *_PRIMARY_TYPES,
+        *_PRIORITIES,
+        *_FUNCTIONAL,
+        *_PLATFORMS,
+        *_PR_REVIEW_LABELS,
+        *_PR_TYPES,
+        *_TRIGGER_LABELS,
+        "providers",
+        "triaged",
+    )
+)
+
+
+def _reject_unknown_labels(labels: Sequence[str]) -> None:
+    unknown = [
+        label
+        for label in labels
+        if label not in _STATIC_LABEL_ALLOWLIST and not label.startswith("provider:")
+    ]
+    if unknown:
+        allowed = ", ".join(sorted(_STATIC_LABEL_ALLOWLIST)) + ", provider:*"
+        _raise_command(f"unknown label(s): {', '.join(unknown)}. Allowed labels: {allowed}")
 _CLOSING_ISSUE_RE = re.compile(r"\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+#(\d+)", re.IGNORECASE)
 
 
@@ -2509,6 +2534,11 @@ def _build_set_issue_labels(bindings: ToolBindings) -> HostTool[Any, Any]:
         cleaned = [str(lbl).strip() for lbl in labels if isinstance(lbl, str) and lbl.strip()]
         if not cleaned:
             _raise_command("set_issue_labels requires at least one non-empty label.")
+        try:
+            _reject_unknown_labels(cleaned)
+        except RpcCommandError as exc:
+            _audit(bindings, "set_issue_labels", args, error=str(exc))
+            raise
         target_number = bindings.issue.number
         if isinstance(args.get("number"), int):
             target_number = int(args["number"])
