@@ -1344,6 +1344,9 @@ def _build_prepare_pr_review(bindings: ToolBindings) -> HostTool[Any, Any]:
                 "body": comment.body,
                 "html_url": comment.html_url,
                 "user": {"login": comment.author},
+                "review_id": comment.review_id,
+                "commit_id": comment.commit_id,
+                "in_reply_to_id": comment.in_reply_to_id,
             }
             for comment in comments
         ]
@@ -1604,7 +1607,7 @@ def _build_delegate_pr_review(bindings: ToolBindings) -> HostTool[Any, Any]:
                         no_title=True,
                         model=candidate_model,
                         provider=None,
-                        thinking="low",
+                        thinking="high",
                         tools=("read", "search"),
                         startup_timeout=60.0,
                         request_timeout=request_timeout,
@@ -1784,6 +1787,15 @@ def _build_validate_pr_review(bindings: ToolBindings) -> HostTool[Any, Any]:
                 timeout,
                 "PR review helper verify-status failed",
             )
+            verification = args.get("verification")
+            if verification is not None:
+                if not isinstance(verification, Mapping):
+                    msg = "validate_pr_review verification must be an object."
+                    _audit(bindings, "validate_pr_review", args, error=msg)
+                    _raise_command(msg)
+                verify_status = dict(_pr_review_load_mapping(verify_status_path))
+                verify_status["local_verification"] = dict(verification)
+                _write_control_json(bindings, verify_status_path, verify_status)
             run_pr_review_helper(
                 bindings,
                 helper,
@@ -1868,6 +1880,14 @@ def _build_validate_pr_review(bindings: ToolBindings) -> HostTool[Any, Any]:
                         "required": ["path", "line", "body", "severity", "intent"],
                         "additionalProperties": False,
                     },
+                },
+                "verification": {
+                    "type": "object",
+                    "description": (
+                        "Optional structured local verification ledger. Include commands/checks run and "
+                        "status values; failed/error entries block clean PR review verdicts."
+                    ),
+                    "additionalProperties": True,
                 }
             },
             "required": ["findings"],
@@ -2179,7 +2199,7 @@ def _pr_review_process_report(
 
     settings = bindings.settings
     primary_model = getattr(settings, "model", None) or "unknown"
-    thinking_level = getattr(settings, "thinking_level", None) or "unknown"
+    thinking_level = "high"
 
     agent_lines = [f"- Primary reviewer: `robomp` — `{primary_model}` (`thinking={thinking_level}`)"]
     reviewers = metadata.get("delegated_reviewers")
@@ -2192,9 +2212,10 @@ def _pr_review_process_report(
             model_family = reviewer.get("model_family") or "unknown"
             domains = reviewer.get("domains_covered") or reviewer.get("domains") or []
             completed = _pr_review_bool(reviewer.get("completed"))
+            thinking = reviewer.get("thinking") or "high"
             agent_lines.append(
                 f"- Delegated reviewer: `{reviewer_id}` — `{model}` "
-                f"(`family={model_family}`, domains=`{_pr_review_join_values(domains)}`, completed=`{completed}`)"
+                f"(`family={model_family}`, thinking=`{thinking}`, domains=`{_pr_review_join_values(domains)}`, completed=`{completed}`)"
             )
     else:
         agent_lines.append("- Delegated reviewer: none recorded")
@@ -2281,6 +2302,126 @@ def _with_pr_review_process_report(
         self_authored=self_authored,
         staged_count=staged_count,
     )
+
+
+_PR_REVIEW_CLEAN_BODY_MARKERS = ("review:clean", "clean review")
+_PR_REVIEW_FAILED_VERIFICATION_BODY_MARKERS = (
+    "could not run",
+    "failed to run",
+    "verification failed",
+    "verification unavailable",
+    "package unavailable",
+    "missing dependency",
+)
+_PR_REVIEW_FAILED_STATES = {"fail", "failed", "failure", "error", "errored", "cancelled", "timed_out", "timeout"}
+_PR_REVIEW_BLOCKING_SEVERITIES = {"critical", "required", "blocking", "blocker"}
+_PR_REVIEW_OPTIONAL_SEVERITIES = {"optional", "advisory", "minor", "nit", "nits"}
+
+
+def _pr_review_is_clean_verdict(event: str, body: str, recommendation: Mapping[str, Any]) -> bool:
+    if event == "APPROVE":
+        return True
+    if str(recommendation.get("event") or "").upper() == "APPROVE":
+        return True
+    body_lower = body.lower()
+    return any(marker in body_lower for marker in _PR_REVIEW_CLEAN_BODY_MARKERS)
+
+
+def _pr_review_value_failed(value: Any) -> bool:
+    if isinstance(value, Mapping):
+        if value.get("ok") is False:
+            return True
+        for key in ("status", "state", "result", "conclusion", "outcome"):
+            raw = value.get(key)
+            if isinstance(raw, str) and raw.lower() in _PR_REVIEW_FAILED_STATES:
+                return True
+        return any(_pr_review_value_failed(child) for child in value.values())
+    if isinstance(value, list):
+        return any(_pr_review_value_failed(item) for item in value)
+    return False
+
+
+def _pr_review_non_empty_count_or_list(value: Any) -> bool:
+    if isinstance(value, int):
+        return value > 0
+    if isinstance(value, list):
+        return len(value) > 0
+    return bool(value)
+
+
+def _pr_review_prior_external_current_head_comments(evidence: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    comments = evidence.get("prior_review_comments")
+    if not isinstance(comments, list):
+        return []
+    reviewer_login = str(evidence.get("reviewer_login") or "").lower()
+    head_sha = str(evidence.get("head_sha") or "")
+    out: list[Mapping[str, Any]] = []
+    for item in comments:
+        if not isinstance(item, Mapping):
+            continue
+        user = item.get("user")
+        author = str(user.get("login") if isinstance(user, Mapping) else "").lower()
+        if reviewer_login and author == reviewer_login:
+            continue
+        commit_id = str(item.get("commit_id") or "")
+        if head_sha and commit_id and commit_id != head_sha:
+            continue
+        out.append(item)
+    return out
+
+
+def _pr_review_recommendation_count_errors(paths: PrReviewPaths, recommendation: Mapping[str, Any]) -> list[str]:
+    findings_data = _pr_review_load_mapping(paths.findings)
+    findings = findings_data.get("findings")
+    if not isinstance(findings, list):
+        return []
+    blocking = 0
+    optional = 0
+    saw_severity = False
+    for finding in findings:
+        if not isinstance(finding, Mapping):
+            continue
+        severity = str(finding.get("severity") or "").lower()
+        if not severity:
+            continue
+        saw_severity = True
+        if severity in _PR_REVIEW_BLOCKING_SEVERITIES:
+            blocking += 1
+        elif severity in _PR_REVIEW_OPTIONAL_SEVERITIES:
+            optional += 1
+    if not saw_severity:
+        return []
+    errors: list[str] = []
+    if isinstance(recommendation.get("blocking_count"), int) and recommendation["blocking_count"] != blocking:
+        errors.append(f"blocking finding count mismatch ({recommendation['blocking_count']} != {blocking})")
+    if isinstance(recommendation.get("optional_count"), int) and recommendation["optional_count"] != optional:
+        errors.append(f"optional finding count mismatch ({recommendation['optional_count']} != {optional})")
+    return errors
+
+
+def _pr_review_clean_invariant_errors(paths: PrReviewPaths, *, event: str, body: str, recommendation: Mapping[str, Any]) -> list[str]:
+    if not _pr_review_is_clean_verdict(event, body, recommendation):
+        return []
+    errors: list[str] = []
+    body_lower = body.lower()
+    if any(marker in body_lower for marker in _PR_REVIEW_FAILED_VERIFICATION_BODY_MARKERS):
+        errors.append("clean verdict body reports failed or unavailable verification")
+    verify_status = _pr_review_load_mapping(paths.verify_status)
+    if verify_status:
+        if verify_status.get("ok") is False:
+            errors.append("verify-status failed")
+        for key in ("unresolved_prior", "unresolved_prior_count", "prior_external_inline_findings_count"):
+            if _pr_review_non_empty_count_or_list(verify_status.get(key)):
+                errors.append(f"verify-status reports {key}")
+        local_verification = verify_status.get("local_verification") or verify_status.get("verification")
+        if _pr_review_value_failed(local_verification):
+            errors.append("local verification failed")
+    evidence = _pr_review_load_mapping(paths.evidence)
+    prior_external = _pr_review_prior_external_current_head_comments(evidence)
+    if prior_external:
+        errors.append(f"{len(prior_external)} prior external inline review comment(s) on the current head")
+    errors.extend(_pr_review_recommendation_count_errors(paths, recommendation))
+    return errors
 
 
 def _pr_review_build_payload(bindings: ToolBindings, *, event: str, body: str, args: Mapping[str, Any]) -> dict[str, Any]:
@@ -2370,6 +2511,18 @@ def _build_submit_pr_review(bindings: ToolBindings) -> HostTool[Any, Any]:
         )
         if self_authored:
             raw_event = "COMMENT"
+
+        if pr_review_payload_available:
+            clean_errors = _pr_review_clean_invariant_errors(
+                paths,
+                event=raw_event,
+                body=requested_body,
+                recommendation=recommendation,
+            )
+            if clean_errors:
+                msg = "Clean PR review refused: " + "; ".join(clean_errors)
+                _audit(bindings, "submit_pr_review", args, error=msg)
+                _raise_command(msg)
 
         staged_count = 0
         if pr_review_payload_available:

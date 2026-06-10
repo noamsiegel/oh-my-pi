@@ -503,7 +503,7 @@ def _run_rpc_blocking(
     )
     model_override, thinking_override = _resolve_pragma_overrides(directive, settings)
     chosen_model = model_override or settings.pick_model()
-    chosen_thinking = thinking_override or settings.thinking_level
+    chosen_thinking = "high" if task_kind == "review_pr" else (thinking_override or settings.thinking_level)
     log.info(
         "rpc_model_pick",
         extra={

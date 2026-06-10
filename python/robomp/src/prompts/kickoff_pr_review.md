@@ -33,6 +33,10 @@ Run two phases in order. Phase 1 is cheap and always happens; Phase 2 is the rea
   Submit `APPROVE` when clean. On self-authored PRs, GitHub cannot accept author terminal
   reviews, so submit `COMMENT` with the would-approve/would-request-changes result.
   Use `COMMENT` otherwise only when an explicit environment limitation prevents judging the PR.
+- **No false clean.** Never use `review:clean`, `APPROVE`, or “clean review” if any required
+  local verification could not run, failed, or has unclear status; if prior external inline
+  review comments exist on the current head, either independently find/carry the issue or
+  explicitly explain why each is obsolete/non-blocking before any clean verdict.
 </critical>
 
 # Phase 0 — orient
@@ -101,10 +105,12 @@ touch. Review with the lens of someone who will own this code:
 - **Silent contract violations** — does it advertise behavior (validation, caching,
   isolation) it doesn't actually implement?
 
-For each concrete finding, add it to a candidate findings array:
+For each concrete finding, add it to a candidate findings array. Include a structured
+`verification` ledger when calling `validate_pr_review`; failed/error/unavailable checks
+block clean verdicts.
 
 ```
-validate_pr_review(findings=[{"path":"src/foo.ts","line":42,"body":"...","severity":"required","intent":"required_change","suggestion":{"kind":"github_suggestion","replacement":"exact replacement lines"}}])
+validate_pr_review(findings=[{"path":"src/foo.ts","line":42,"body":"...","severity":"required","intent":"required_change","suggestion":{"kind":"github_suggestion","replacement":"exact replacement lines"}}], verification={"checks":[{"name":"targeted tests","status":"passed","command":"..."}]})
 ```
 
 - `line` is the line in the diff you're commenting on. Critical/required findings require a
@@ -117,6 +123,9 @@ validate_pr_review(findings=[{"path":"src/foo.ts","line":42,"body":"...","severi
   design concerns, missing-test requests, or comments that need explanation instead of a
   patch.
 - Ask, don't assume: if intent is unclear, phrase it as a question on the line.
+- If the diff introduces normalized/resolved identifiers, polymorphic foreign keys, aggregate
+  counts, public response fields, or links, trace every downstream use of the raw value. Search
+  for remaining raw IDs in payload/count/link paths and test mixed old/new-key scenarios.
 - After `validate_pr_review`, drop or revise invalid anchors and likely duplicates,
   then rerun `validate_pr_review`.
 - Do not call `pr_review_comment` after successful `prepare_pr_review`; `submit_pr_review`
@@ -134,6 +143,8 @@ submit_pr_review(body="<summary>", event="APPROVE|REQUEST_CHANGES|COMMENT")
   `APPROVE` when clean, `COMMENT` only for advisory/no-review-request or explicit environment/
   self-authored limitations.
 - Do not submit REQUEST_CHANGES unless at least one validated inline finding will be posted; resolve stale verify-status body concerns or add a concrete anchored finding first.
+- Failed, unavailable, or unrun local verification means **not clean**. Use `COMMENT` with the
+  limitation, or carry a finding, but do not summarize as clean.
 - Self-authored PRs cannot accept terminal reviews from the author; use `COMMENT` and say it
   would otherwise approve/request changes.
 - The body summary must be 2–5 terse lines above the automatically appended Review process details.

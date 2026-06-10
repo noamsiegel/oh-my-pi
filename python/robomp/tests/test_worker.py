@@ -716,6 +716,29 @@ async def test_run_rpc_review_pr_reminds_until_submit_pr_review(tmp_path: Path, 
 
 
 @pytest.mark.asyncio
+async def test_run_rpc_review_pr_forces_high_thinking(tmp_path: Path, settings: Settings) -> None:
+    review_settings = settings.model_copy(update={"thinking_level": "low"})
+    inputs, bindings = _make_inputs(tmp_path, review_settings, session_has_jsonl=False)
+    loop = asyncio.new_event_loop()
+    try:
+        worker._run_rpc_blocking(
+            inputs,
+            task_kind="review_pr",
+            prompt="kickoff",
+            loop=loop,
+            bindings=bindings,  # type: ignore[arg-type]
+            directive=worker.DirectiveInfo(
+                body="/thinking low",
+                author="can1357",
+                pragmas=(("thinking", "low"),),
+            ),
+        )
+    finally:
+        loop.close()
+    assert _FakeRpcClient.instances[0].kwargs["thinking"] == "high"
+
+
+@pytest.mark.asyncio
 async def test_run_rpc_review_pr_stops_after_submit_without_dirty_probe(
     tmp_path: Path, settings: Settings, monkeypatch: pytest.MonkeyPatch
 ) -> None:

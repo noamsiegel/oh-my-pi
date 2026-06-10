@@ -1225,6 +1225,91 @@ def test_submit_pr_review_refuses_request_changes_without_inline_comments(
     assert len(staged) == 1
     assert staged[0].body == "staged"
 
+
+
+def test_submit_pr_review_refuses_clean_with_current_head_external_inline_comment(
+    db: Database, tmp_path: Path
+) -> None:
+    called = False
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal called
+        if request.method == "POST" and request.url.path.endswith("/reviews"):
+            called = True
+            return httpx.Response(200, json={"id": 50, "user": {"login": "robomp-bot"}, "body": "", "state": "COMMENTED"})
+        return httpx.Response(404, json={"message": "unrouted"})
+
+    bindings, loop, t = _review_bindings(db, tmp_path, httpx.MockTransport(handler))
+    helper = tmp_path / "pr-review-helper.js"
+    _seed_pr_review_payload_state(
+        bindings,
+        helper,
+        recommendation_event="COMMENT",
+        blocking_count=0,
+        optional_count=0,
+        recommendation_reason="informational",
+        findings=[],
+        evidence={
+            "head_sha": "payload-sha",
+            "reviewer_login": "noamsiegel",
+            "prior_review_comments": [
+                {
+                    "id": 3384770503,
+                    "path": "apps/hoa/api/admin_api/viewsets/customer_tasks.py",
+                    "line": 479,
+                    "body": "task_id contract can drift",
+                    "user": {"login": "mainstay-claude[bot]"},
+                    "commit_id": "payload-sha",
+                }
+            ],
+        },
+    )
+    bindings = replace(bindings, settings=Settings.model_construct(pr_review_terminal_events=True, pr_review_helper=helper))
+    try:
+        submit_tool = next(x for x in build(bindings) if x.name == "submit_pr_review")
+        with pytest.raises(RpcCommandError, match="prior external inline review comment"):
+            submit_tool.execute({"body": "Clean review: no findings.", "event": "COMMENT"}, _ctx())
+    finally:
+        _stop_loop(loop, t)
+
+    assert called is False
+
+
+def test_submit_pr_review_refuses_clean_when_local_verification_failed(db: Database, tmp_path: Path) -> None:
+    called = False
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal called
+        if request.method == "POST" and request.url.path.endswith("/reviews"):
+            called = True
+            return httpx.Response(200, json={"id": 50, "user": {"login": "robomp-bot"}, "body": "", "state": "COMMENTED"})
+        return httpx.Response(404, json={"message": "unrouted"})
+
+    bindings, loop, t = _review_bindings(db, tmp_path, httpx.MockTransport(handler))
+    helper = tmp_path / "pr-review-helper.js"
+    _seed_pr_review_payload_state(
+        bindings,
+        helper,
+        recommendation_event="COMMENT",
+        blocking_count=0,
+        optional_count=0,
+        recommendation_reason="informational",
+        findings=[],
+    )
+    paths = pr_review_paths(bindings.workspace)
+    save_json_checked(
+        paths.verify_status,
+        {"ok": True, "local_verification": {"checks": [{"name": "targeted tests", "status": "failed"}]}},
+    )
+    bindings = replace(bindings, settings=Settings.model_construct(pr_review_terminal_events=True, pr_review_helper=helper))
+    try:
+        submit_tool = next(x for x in build(bindings) if x.name == "submit_pr_review")
+        with pytest.raises(RpcCommandError, match="local verification failed"):
+            submit_tool.execute({"body": "review:clean — scoped fix.", "event": "COMMENT"}, _ctx())
+    finally:
+        _stop_loop(loop, t)
+
+    assert called is False
 def test_submit_pr_review_keeps_comment_for_advisory_recommendation(db: Database, tmp_path: Path) -> None:
     captured: dict[str, Any] = {}
 
@@ -1332,6 +1417,7 @@ def test_submit_pr_review_process_report_lists_delegated_models_and_diff_evidenc
     assert "SecurityReviewer" in body
     assert "anthropic/claude-opus-4-8" in body
     assert "domains=`security`" in body
+    assert "thinking=`high`" in body
     assert "apps/hoa/api/actions/fundingrequest.py" in body
     assert "+12/-3" in body
     assert "Dependency/callsite review" in body
@@ -1816,6 +1902,7 @@ def test_delegate_pr_review_writes_metadata_and_unblocks_validate(
     assert "model=anthropic/claude-opus-4-8" in delegated
     assert _Rpc.attempts[:1] == ["anthropic/claude-opus-4-8"]
     assert _Rpc.kwargs_seen[0]["tools"] == ("read", "search")
+    assert _Rpc.kwargs_seen[0]["thinking"] == "high"
     assert metadata["delegated_reviewers"][0]["model_family"] == "anthropic"
     assert metadata["delegated_reviewers"][0]["model"] == "anthropic/claude-opus-4-8"
     assert "SecurityReviewer" in delegated
@@ -1905,6 +1992,7 @@ def test_delegate_pr_review_metadata_model_renders_in_process_report(
     body = captured["body"]["body"]
     assert "(unknown model)" not in body
     assert "anthropic/claude-opus-4-8" in body
+    assert "thinking=`high`" in body
 
 
 
