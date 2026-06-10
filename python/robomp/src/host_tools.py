@@ -1651,9 +1651,10 @@ def _build_delegate_pr_review(bindings: ToolBindings) -> HostTool[Any, Any]:
                 f"{domain!r} risk surface and changed code.\n"
                 "Return only YAML with top-level keys: overall, summary, model_family, findings.\n"
                 "Each finding must include severity, intent, path, line, body, and evidence. "
-                "Include suggestion.kind=github_suggestion plus suggestion.replacement only when "
-                "you can provide an exact contiguous GitHub suggested-change replacement; "
-                "otherwise leave suggestion out and use prose.\n"
+                "For critical/required required_change findings on a valid diff line, include "
+                "suggestion.kind=github_suggestion plus suggestion.replacement whenever the "
+                "replacement is exact, contiguous, and safe to accept. If you omit suggestion "
+                "for that kind of finding, include no_suggestion_reason explaining why prose is safer.\n"
             )
             text = ""
             selected_model: str | None = None
@@ -1953,6 +1954,7 @@ def _build_validate_pr_review(bindings: ToolBindings) -> HostTool[Any, Any]:
                                 "required": ["kind", "replacement"],
                                 "additionalProperties": False,
                             },
+                            "no_suggestion_reason": {"type": "string"},
                         },
                         "required": ["path", "line", "body", "severity", "intent"],
                         "additionalProperties": False,

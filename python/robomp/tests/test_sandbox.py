@@ -1579,15 +1579,15 @@ def test_prepare_pr_worktree_sparse_hydrates_changed_paths_only(tmp_path: Path) 
         ],
         cwd=tmp_path,
     )
+    _commit_new_blob_upstream(upstream, tmp_path, path="src/changed.txt", content="base payload\n")
+    _commit_new_blob_upstream(upstream, tmp_path, path="docs/untouched.txt", content="untouched payload\n")
+
     pr_seed = tmp_path / "pr-seed"
     _git(["clone", f"file://{upstream}", str(pr_seed)], cwd=tmp_path)
-    (pr_seed / "src").mkdir()
-    (pr_seed / "docs").mkdir()
     (pr_seed / "src" / "changed.txt").write_text("changed payload\n", encoding="utf-8")
-    (pr_seed / "docs" / "untouched.txt").write_text("untouched payload\n", encoding="utf-8")
-    _git(["-C", str(pr_seed), "add", "src/changed.txt", "docs/untouched.txt"], cwd=tmp_path)
+    _git(["-C", str(pr_seed), "add", "src/changed.txt"], cwd=tmp_path)
     subprocess.run(
-        ["git", "-C", str(pr_seed), "commit", "-m", "add pr files"],
+        ["git", "-C", str(pr_seed), "commit", "-m", "modify pr file"],
         check=True,
         capture_output=True,
         text=True,
@@ -1617,13 +1617,14 @@ def test_prepare_pr_worktree_sparse_hydrates_changed_paths_only(tmp_path: Path) 
 
     _git(["-C", str(pool), "remote", "set-url", "origin", "https://example.invalid/missing.git"], cwd=tmp_path)
     diff_proc = subprocess.run(
-        ["git", "-C", str(ws_dir), "diff", "--name-only", "origin/main...HEAD", "--"],
+        ["git", "-C", str(ws_dir), "diff", "--no-color", "origin/main...HEAD", "--", "src/changed.txt"],
         check=True,
         capture_output=True,
         text=True,
         env=os.environ | {"GIT_TERMINAL_PROMPT": "0"},
     )
-    assert "src/changed.txt" in diff_proc.stdout.splitlines()
+    assert "-base payload" in diff_proc.stdout
+    assert "+changed payload" in diff_proc.stdout
 
 
 @pytest.mark.parametrize("bad_path", ["../x", "/x", ".git/config", "dir/.git/config", "", "a\0b"])

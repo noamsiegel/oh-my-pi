@@ -116,12 +116,14 @@ validate_pr_review(findings=[{"path":"src/foo.ts","line":42,"body":"...","severi
 - `line` is the line in the diff you're commenting on. Critical/required findings require a
   concrete risk, specific fix/question, valid diff anchor, and observed evidence caused
   by changed code/behavior.
-- Use a GitHub suggested change only when the fix is an exact contiguous replacement for
-  `start_line..line` on the PR diff, small enough to review, and safe for the author to
-  click “Accept suggestion”. Otherwise omit `suggestion` and leave a normal prose
-  comment. Suggestions augment code-editable findings; they must not replace questions,
-  design concerns, missing-test requests, or comments that need explanation instead of a
-  patch.
+- For critical/required `required_change` findings on a valid diff line, default to
+  a GitHub suggested change. Include `suggestion` when the fix is an exact contiguous
+  replacement for `start_line..line`, small enough to review, and safe for the author
+  to click “Accept suggestion”. If you omit `suggestion` for that kind of finding,
+  include `no_suggestion_reason` and state why prose is safer (multi-file fix,
+  uncertain semantics, generated code, migration, test-only policy choice, or broader
+  refactor). Suggestions must not replace questions, design concerns, missing-test
+  requests, or comments that need explanation instead of a patch.
 - Ask, don't assume: if intent is unclear, phrase it as a question on the line.
 - If the diff introduces normalized/resolved identifiers, polymorphic foreign keys, aggregate
   counts, public response fields, or links, trace every downstream use of the raw value. Search

@@ -704,12 +704,16 @@ def prepare_pr_worktree(
         raise GitCommandError(["git", "worktree", "add"], 128, "", f"worktree already exists: {repo_dir}")
     repo_dir.parent.mkdir(parents=True, exist_ok=True)
 
-    base_fetch = ["fetch", "--prune", "origin", base_ref]
+    # Backfill blobs for both sides of the review diff. The pool is a partial
+    # clone, and prepare_pr_review later runs `git diff origin/<base>...HEAD`
+    # inside the credential-free orchestrator worktree; leaving base/head blobs
+    # promisor-deferred makes that diff attempt an unauthenticated lazy fetch.
+    base_fetch = ["fetch", "--refetch", "--no-filter", "origin", base_ref]
     _check(
         _run_git(base_fetch, cwd=pool_dir, token=token, safe_directory=safe_directory, timeout=timeout),
         ["git", *base_fetch],
     )
-    pr_fetch = ["fetch", "origin", f"pull/{pr_number}/head"]
+    pr_fetch = ["fetch", "--refetch", "--no-filter", "origin", f"pull/{pr_number}/head"]
     _check(
         _run_git(pr_fetch, cwd=pool_dir, token=token, safe_directory=safe_directory, timeout=timeout),
         ["git", *pr_fetch],
