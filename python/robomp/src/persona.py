@@ -133,20 +133,42 @@ def classify_next_step(primary: str) -> str:
     )
 
 
+def _default_pr_review_focus() -> Mapping[str, Any]:
+    return {
+        "mode": "fresh",
+        "reason": "fresh PR review",
+        "prior_review_state": "",
+        "prior_review_commit_id": "",
+        "prior_review_id": "",
+        "prior_review_submitted_at": "",
+    }
+
+
+
 def system_append(*, repo: RepoInfo, issue: IssueInfo, workspace: Workspace) -> str:
     return render(_load("system_append.md"), {"repo": repo, "issue": issue, "workspace": workspace})
 
 
-def system_append_pr_review(*, repo: RepoInfo, issue: IssueInfo, workspace: Workspace) -> str:
-    return render(_load("system_append_pr_review.md"), {"repo": repo, "issue": issue, "workspace": workspace})
+def system_append_pr_review(
+    *, repo: RepoInfo, issue: IssueInfo, workspace: Workspace, review_focus: Any | None = None
+) -> str:
+    return render(
+        _load("system_append_pr_review.md"),
+        {"repo": repo, "issue": issue, "workspace": workspace, "review_focus": review_focus or _default_pr_review_focus()},
+    )
 
 
 def kickoff(*, repo: RepoInfo, issue: IssueInfo, workspace: Workspace) -> str:
     return render(_load("kickoff_issue.md"), {"repo": repo, "issue": issue, "workspace": workspace})
 
 
-def kickoff_pr_review(*, repo: RepoInfo, pr: PullRequestInfo, workspace: Workspace) -> str:
-    return render(_load("kickoff_pr_review.md"), {"repo": repo, "pr": pr, "workspace": workspace})
+def kickoff_pr_review(
+    *, repo: RepoInfo, pr: PullRequestInfo, workspace: Workspace, review_focus: Any | None = None
+) -> str:
+    return render(
+        _load("kickoff_pr_review.md"),
+        {"repo": repo, "pr": pr, "workspace": workspace, "review_focus": review_focus or _default_pr_review_focus()},
+    )
 
 
 def resume_triage(*, repo: RepoInfo, issue: IssueInfo, workspace: Workspace) -> str:

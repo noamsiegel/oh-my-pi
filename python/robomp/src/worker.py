@@ -49,6 +49,17 @@ from robomp.sandbox import GitTransport, Workspace, _prepare_slot_runtime_env, _
 log = logging.getLogger(__name__)
 
 
+
+@dataclass(slots=True, frozen=True)
+class PrReviewFocus:
+    mode: str = "fresh"
+    reason: str = "fresh PR review"
+    prior_review_state: str = ""
+    prior_review_commit_id: str = ""
+    prior_review_id: int | None = None
+    prior_review_submitted_at: str = ""
+
+
 @dataclass(slots=True)
 class TaskInputs:
     """Common context shared by every task type."""
@@ -64,6 +75,7 @@ class TaskInputs:
     attempts: int = 0
     slot_uid: int | None = None
     natives_cache: NativesCache | None = None
+    pr_review_focus: PrReviewFocus | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -395,7 +407,12 @@ def _build_prompt(
         return persona.kickoff(repo=inputs.repo, issue=inputs.issue, workspace=inputs.workspace)
     if task_kind == "review_pr":
         assert pr is not None
-        return persona.kickoff_pr_review(repo=inputs.repo, pr=pr, workspace=inputs.workspace)
+        return persona.kickoff_pr_review(
+            repo=inputs.repo,
+            pr=pr,
+            workspace=inputs.workspace,
+            review_focus=inputs.pr_review_focus or PrReviewFocus(),
+        )
     if task_kind == "handle_comment":
         assert comment is not None
         issue_row = inputs.db.get_issue(issue_key(inputs.repo.full_name, inputs.issue.number))
@@ -517,7 +534,12 @@ def _run_rpc_blocking(
     )
     inputs.db.set_event_model(inputs.delivery_id, chosen_model)
     append_system_prompt = (
-        persona.system_append_pr_review(repo=inputs.repo, issue=inputs.issue, workspace=inputs.workspace)
+        persona.system_append_pr_review(
+            repo=inputs.repo,
+            issue=inputs.issue,
+            workspace=inputs.workspace,
+            review_focus=inputs.pr_review_focus or PrReviewFocus(),
+        )
         if task_kind == "review_pr"
         else persona.system_append(repo=inputs.repo, issue=inputs.issue, workspace=inputs.workspace)
     )
@@ -773,4 +795,4 @@ def _capture_natives_cache(inputs: TaskInputs) -> None:
     )
 
 
-__all__ = ["DirectiveInfo", "TaskInputs", "ThreadMessage", "run_task"]
+__all__ = ["DirectiveInfo", "PrReviewFocus", "TaskInputs", "ThreadMessage", "run_task"]

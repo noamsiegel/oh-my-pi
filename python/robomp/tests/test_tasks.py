@@ -50,6 +50,7 @@ class _FakeGitHub:
         self.reviews = reviews or []
         self.list_pr_reviews_called = False
         self.list_pr_files_called = False
+        self.posted_comments: list[str] = []
     async def get_repo(self, repo: str) -> RepoInfo:
         return RepoInfo(full_name=repo, default_branch="main", clone_url="https://example/octo/widget.git", private=False)
 
@@ -96,6 +97,7 @@ class _FakeGitHub:
         return [PullRequestFileInfo(path="src/app.py", status="modified", additions=1, deletions=0)]
 
     async def post_comment(self, repo: str, number: int, body: str) -> CommentInfo:
+        self.posted_comments.append(body)
         return CommentInfo(id=1, author="robomp-bot", body=body, created_at=_now_iso())
 
 
@@ -291,6 +293,115 @@ async def test_review_pr_does_not_skip_new_head_for_old_completed_review(
     assert sandbox.kwargs["pr_head_sha"] == HEAD_SHA
     assert db.successful_tool_call_queries == []
 
+
+@pytest.mark.asyncio
+async def test_review_pr_sets_verify_fixes_focus_for_old_changes_requested(
+    settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings.pr_review_ci_gate_enabled = True
+    github = _FakeGitHub(_ci("passed", total=1), reviews=[_bot_review("CHANGES_REQUESTED", OLD_HEAD_SHA)])
+    captured = {}
+
+    async def _run_task(**kwargs: object) -> None:
+        captured["inputs"] = kwargs["inputs"]
+
+    monkeypatch.setattr(tasks, "run_task", _run_task)
+
+    outcome = await tasks.review_pr(
+        settings=settings,
+        db=_FakeDb(),  # type: ignore[arg-type]
+        github=github,  # type: ignore[arg-type]
+        sandbox=_FakeSandbox(),  # type: ignore[arg-type]
+        git_transport=_FakeGitTransport(),  # type: ignore[arg-type]
+        payload=_payload(),
+        delivery_id="delivery",
+        received_at=_now_iso(),
+    )
+
+    assert outcome is None
+    focus = captured["inputs"].pr_review_focus
+    assert focus.mode == "verify-fixes"
+    assert focus.prior_review_commit_id == OLD_HEAD_SHA
+    assert focus.prior_review_id == 100
+    assert focus.prior_review_submitted_at
+    assert "verifying fixes" in github.posted_comments[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", ["APPROVED", "COMMENTED"])
+async def test_review_pr_keeps_fresh_focus_for_old_commented_or_approved(
+    settings, monkeypatch: pytest.MonkeyPatch, state: str
+) -> None:
+    settings.pr_review_ci_gate_enabled = True
+    github = _FakeGitHub(_ci("passed", total=1), reviews=[_bot_review(state, OLD_HEAD_SHA)])
+    captured = {}
+
+    async def _run_task(**kwargs: object) -> None:
+        captured["inputs"] = kwargs["inputs"]
+
+    monkeypatch.setattr(tasks, "run_task", _run_task)
+
+    outcome = await tasks.review_pr(
+        settings=settings,
+        db=_FakeDb(),  # type: ignore[arg-type]
+        github=github,  # type: ignore[arg-type]
+        sandbox=_FakeSandbox(),  # type: ignore[arg-type]
+        git_transport=_FakeGitTransport(),  # type: ignore[arg-type]
+        payload=_payload(),
+        delivery_id="delivery",
+        received_at=_now_iso(),
+    )
+
+    assert outcome is None
+    assert captured["inputs"].pr_review_focus.mode == "fresh"
+
+
+@pytest.mark.asyncio
+async def test_review_pr_verify_fixes_focus_handles_missing_commit_id(
+    settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings.pr_review_ci_gate_enabled = True
+    github = _FakeGitHub(_ci("passed", total=1), reviews=[_bot_review("CHANGES_REQUESTED", "")])
+    captured = {}
+
+    async def _run_task(**kwargs: object) -> None:
+        captured["inputs"] = kwargs["inputs"]
+
+    monkeypatch.setattr(tasks, "run_task", _run_task)
+
+    outcome = await tasks.review_pr(
+        settings=settings,
+        db=_FakeDb(),  # type: ignore[arg-type]
+        github=github,  # type: ignore[arg-type]
+        sandbox=_FakeSandbox(),  # type: ignore[arg-type]
+        git_transport=_FakeGitTransport(),  # type: ignore[arg-type]
+        payload=_payload(),
+        delivery_id="delivery",
+        received_at=_now_iso(),
+    )
+
+    assert outcome is None
+    focus = captured["inputs"].pr_review_focus
+    assert focus.mode == "verify-fixes"
+    assert focus.prior_review_commit_id == ""
+
+
+@pytest.mark.asyncio
+async def test_review_pr_skips_same_head_changes_requested(settings, monkeypatch: pytest.MonkeyPatch) -> None:
+    settings.pr_review_ci_gate_enabled = True
+    github = _FakeGitHub(_ci("passed", total=1), reviews=[_bot_review("CHANGES_REQUESTED", HEAD_SHA)])
+    calls: list[str] = []
+
+    async def _run_task(**kwargs: object) -> None:
+        calls.append(str(kwargs["task_kind"]))
+
+    monkeypatch.setattr(tasks, "run_task", _run_task)
+
+    outcome = await _call_review(settings, github, received_at=_now_iso())
+
+    assert outcome is not None
+    assert outcome.state == "skipped"
+    assert calls == []
 
 @pytest.mark.asyncio
 async def test_review_pr_skips_when_ci_pending_timeout_elapsed(settings) -> None:

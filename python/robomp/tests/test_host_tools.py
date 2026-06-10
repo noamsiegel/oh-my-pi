@@ -1892,6 +1892,249 @@ def test_prepare_pr_review_writes_evidence_and_returns_classification(
     assert "risk_level: medium" in result
     assert "reviewability.status: reviewable" in result
 
+def test_prepare_pr_review_writes_verify_fixes_evidence_for_old_changes_requested(
+    db: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    helper = tmp_path / "pr-review-helper.js"
+    _write_pr_review_helper(helper)
+    bindings, loop, t = _review_bindings(db, tmp_path, httpx.MockTransport(lambda _r: httpx.Response(500)))
+    head_sha = bindings.review_head_sha or ""
+    old_sha = "b" * 40
+    bindings = replace(bindings, settings=Settings.model_construct(pr_review_helper=helper, request_timeout_seconds=30.0, bot_login="robomp-bot"))
+    pr = PullRequestInfo(
+        repo="octo/widget",
+        number=99,
+        html_url="https://github.com/octo/widget/pull/99",
+        head_ref="alice/fix",
+        base_ref="main",
+        state="open",
+        author="alice",
+        head_repo="alice/widget",
+        title="Fix bug",
+        body="body",
+        head_sha=head_sha,
+    )
+    commands = []
+
+    async def _get_pull_request(repo_full: str, number: int):
+        return pr
+
+    async def _list_pr_files(repo_full: str, number: int):
+        return [PullRequestFileInfo("src/app.py", "modified", 1, 1)]
+
+    async def _list_pr_reviews(repo_full: str, number: int):
+        return [PullRequestReviewInfo(100, "robomp-bot", "body", "CHANGES_REQUESTED", "t", commit_id=old_sha)]
+
+    async def _empty(repo_full: str, number: int):
+        return []
+
+    async def _get_authenticated_login():
+        return "robomp-bot"
+
+    def _diff(_bindings: ToolBindings, cmd, *, timeout=None):
+        commands.append(cmd)
+        if cmd == ("git", "rev-parse", "HEAD"):
+            return host_tools.subprocess.CompletedProcess(list(cmd), 0, stdout=f"{head_sha}\n", stderr="")
+        if cmd == ("git", "diff", "--no-color", "origin/main...HEAD"):
+            return host_tools.subprocess.CompletedProcess(list(cmd), 0, stdout="diff --git a/src/app.py b/src/app.py\n--- a/src/app.py\n+++ b/src/app.py\n@@ -1,1 +1,2 @@\n old\n+new\n", stderr="")
+        if cmd == ("git", "rev-parse", "--verify", "--quiet", old_sha):
+            return host_tools.subprocess.CompletedProcess(list(cmd), 0, stdout=f"{old_sha}\n", stderr="")
+        assert cmd == ("git", "diff", "--no-color", f"{old_sha}..{head_sha}", "--", "src/app.py")
+        return host_tools.subprocess.CompletedProcess(list(cmd), 0, stdout="diff --git a/src/app.py b/src/app.py\n--- a/src/app.py\n+++ b/src/app.py\n@@ -2,1 +2,2 @@\n old\n+fix\n", stderr="")
+
+    monkeypatch.setattr(bindings.github, "get_pull_request", _get_pull_request)
+    monkeypatch.setattr(bindings.github, "list_pr_files", _list_pr_files)
+    monkeypatch.setattr(bindings.github, "list_pr_reviews", _list_pr_reviews)
+    monkeypatch.setattr(bindings.github, "list_review_threads", _empty)
+    monkeypatch.setattr(bindings.github, "list_pr_commits", _empty)
+    monkeypatch.setattr(bindings.github, "get_authenticated_login", _get_authenticated_login)
+    monkeypatch.setattr(bindings.github, "list_comments", _empty)
+    monkeypatch.setattr(host_tools, "_run_repo_command", _diff)
+    try:
+        tool = next(x for x in build(bindings) if x.name == "prepare_pr_review")
+        result = tool.execute({}, _ctx())
+    finally:
+        _stop_loop(loop, t)
+
+    evidence = json.loads((bindings.workspace.session_dir / "pr-review-evidence.json").read_text(encoding="utf-8"))
+    assert evidence["mode"] == "verify-fixes"
+    assert evidence["prior_review"]["sha"] == old_sha
+    assert evidence["delta_diff"].startswith("diff --git")
+    assert evidence["delta_anchors"][0]["validRightLines"] == [2, 3]
+    assert evidence["delta_unavailable_reason"] is None
+    assert "mode: verify-fixes" in result
+    assert commands[:4] == [
+        ("git", "rev-parse", "HEAD"),
+        ("git", "diff", "--no-color", "origin/main...HEAD"),
+        ("git", "rev-parse", "--verify", "--quiet", old_sha),
+        ("git", "diff", "--no-color", f"{old_sha}..{head_sha}", "--", "src/app.py"),
+    ]
+
+
+def test_prepare_pr_review_verify_fixes_unions_prior_comments_with_latest_author_reply(
+    db: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    helper = tmp_path / "pr-review-helper.js"
+    _write_pr_review_helper(helper)
+    bindings, loop, t = _review_bindings(db, tmp_path, httpx.MockTransport(lambda _r: httpx.Response(500)))
+    head_sha = bindings.review_head_sha or ""
+    bindings = replace(bindings, settings=Settings.model_construct(pr_review_helper=helper, request_timeout_seconds=30.0, bot_login="robomp-bot"))
+
+    async def _get_pull_request(repo_full: str, number: int):
+        return PullRequestInfo(repo="octo/widget", number=99, html_url="u", head_ref="h", base_ref="main", state="open", author="alice", head_repo="octo/widget", title="t", body="b", head_sha=head_sha)
+
+    async def _list_pr_files(repo_full: str, number: int):
+        return [PullRequestFileInfo("src/app.py", "modified", 1, 1)]
+
+    async def _list_pr_reviews(repo_full: str, number: int):
+        return [PullRequestReviewInfo(100, "robomp-bot", "body", "CHANGES_REQUESTED", "t", commit_id="")]
+
+    async def _list_review_threads(repo_full: str, number: int):
+        return [ReviewThreadInfo("thread-1", False, False, comments=(ReviewThreadCommentInfo(1, "robomp-bot", "fix this", "src/app.py", 2, "t1", review_id=100, commit_id="old"), ReviewThreadCommentInfo(2, "alice", "done", "src/app.py", 2, "t2", in_reply_to_id=1)))]
+
+    async def _empty(repo_full: str, number: int):
+        return []
+
+    async def _get_authenticated_login():
+        return "robomp-bot"
+
+    def _diff(_bindings: ToolBindings, cmd, *, timeout=None):
+        if cmd == ("git", "rev-parse", "HEAD"):
+            return host_tools.subprocess.CompletedProcess(list(cmd), 0, stdout=f"{head_sha}\n", stderr="")
+        assert cmd == ("git", "diff", "--no-color", "origin/main...HEAD")
+        return host_tools.subprocess.CompletedProcess(list(cmd), 0, stdout="diff --git a/src/app.py b/src/app.py\n--- a/src/app.py\n+++ b/src/app.py\n@@ -1,1 +1,2 @@\n old\n+new\n", stderr="")
+
+    monkeypatch.setattr(bindings.github, "get_pull_request", _get_pull_request)
+    monkeypatch.setattr(bindings.github, "list_pr_files", _list_pr_files)
+    monkeypatch.setattr(bindings.github, "list_pr_reviews", _list_pr_reviews)
+    monkeypatch.setattr(bindings.github, "list_review_threads", _list_review_threads)
+    monkeypatch.setattr(bindings.github, "list_pr_commits", _empty)
+    monkeypatch.setattr(bindings.github, "get_authenticated_login", _get_authenticated_login)
+    monkeypatch.setattr(bindings.github, "list_comments", _empty)
+    monkeypatch.setattr(host_tools, "_run_repo_command", _diff)
+    try:
+        tool = next(x for x in build(bindings) if x.name == "prepare_pr_review")
+        tool.execute({}, _ctx())
+    finally:
+        _stop_loop(loop, t)
+
+    evidence = json.loads((bindings.workspace.session_dir / "pr-review-evidence.json").read_text(encoding="utf-8"))
+    prior = evidence["reviewer_prior_inline_comments_unioned"][0]
+    assert prior["latest_author_reply"]["author"] == "alice"
+    assert prior["review_id"] == 100
+    assert prior["commit_id"] == "old"
+
+
+def test_prepare_pr_review_verify_fixes_missing_prior_commit_keeps_mode_without_delta(
+    db: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    helper = tmp_path / "pr-review-helper.js"
+    _write_pr_review_helper(helper)
+    bindings, loop, t = _review_bindings(db, tmp_path, httpx.MockTransport(lambda _r: httpx.Response(500)))
+    head_sha = bindings.review_head_sha or ""
+    bindings = replace(bindings, settings=Settings.model_construct(pr_review_helper=helper, request_timeout_seconds=30.0, bot_login="robomp-bot"))
+    commands = []
+
+    async def _get_pull_request(repo_full: str, number: int):
+        return PullRequestInfo(repo="octo/widget", number=99, html_url="u", head_ref="h", base_ref="main", state="open", author="alice", head_repo="octo/widget", title="t", body="b", head_sha=head_sha)
+
+    async def _list_pr_files(repo_full: str, number: int):
+        return [PullRequestFileInfo("src/app.py", "modified", 1, 1)]
+
+    async def _list_pr_reviews(repo_full: str, number: int):
+        return [PullRequestReviewInfo(100, "robomp-bot", "body", "CHANGES_REQUESTED", "t", commit_id="")]
+
+    async def _empty(repo_full: str, number: int):
+        return []
+
+    async def _get_authenticated_login():
+        return "robomp-bot"
+
+    def _diff(_bindings: ToolBindings, cmd, *, timeout=None):
+        commands.append(cmd)
+        if cmd == ("git", "rev-parse", "HEAD"):
+            return host_tools.subprocess.CompletedProcess(list(cmd), 0, stdout=f"{head_sha}\n", stderr="")
+        assert cmd == ("git", "diff", "--no-color", "origin/main...HEAD")
+        return host_tools.subprocess.CompletedProcess(list(cmd), 0, stdout="diff --git a/src/app.py b/src/app.py\n--- a/src/app.py\n+++ b/src/app.py\n@@ -1,1 +1,2 @@\n old\n+new\n", stderr="")
+
+    monkeypatch.setattr(bindings.github, "get_pull_request", _get_pull_request)
+    monkeypatch.setattr(bindings.github, "list_pr_files", _list_pr_files)
+    monkeypatch.setattr(bindings.github, "list_pr_reviews", _list_pr_reviews)
+    monkeypatch.setattr(bindings.github, "list_review_threads", _empty)
+    monkeypatch.setattr(bindings.github, "list_pr_commits", _empty)
+    monkeypatch.setattr(bindings.github, "get_authenticated_login", _get_authenticated_login)
+    monkeypatch.setattr(bindings.github, "list_comments", _empty)
+    monkeypatch.setattr(host_tools, "_run_repo_command", _diff)
+    try:
+        tool = next(x for x in build(bindings) if x.name == "prepare_pr_review")
+        tool.execute({}, _ctx())
+    finally:
+        _stop_loop(loop, t)
+
+    evidence = json.loads((bindings.workspace.session_dir / "pr-review-evidence.json").read_text(encoding="utf-8"))
+    assert evidence["mode"] == "verify-fixes"
+    assert evidence["delta_diff"] is None
+    assert evidence["delta_unavailable_reason"] == "missing_prior_commit_id"
+    assert not any(len(cmd) > 3 and f"..{head_sha}" in cmd[3] for cmd in commands)
+
+
+def test_prepare_pr_review_verify_fixes_fetches_unreachable_prior_sha(
+    db: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    helper = tmp_path / "pr-review-helper.js"
+    _write_pr_review_helper(helper)
+    bindings, loop, t = _review_bindings(db, tmp_path, httpx.MockTransport(lambda _r: httpx.Response(500)))
+    head_sha = bindings.review_head_sha or ""
+    old_sha = "b" * 40
+    bindings = replace(bindings, settings=Settings.model_construct(pr_review_helper=helper, request_timeout_seconds=30.0, bot_login="robomp-bot"))
+    commands = []
+
+    async def _get_pull_request(repo_full: str, number: int):
+        return PullRequestInfo(repo="octo/widget", number=99, html_url="u", head_ref="h", base_ref="main", state="open", author="alice", head_repo="octo/widget", title="t", body="b", head_sha=head_sha)
+
+    async def _list_pr_files(repo_full: str, number: int):
+        return [PullRequestFileInfo("src/app.py", "modified", 1, 1)]
+
+    async def _list_pr_reviews(repo_full: str, number: int):
+        return [PullRequestReviewInfo(100, "robomp-bot", "body", "CHANGES_REQUESTED", "t", commit_id=old_sha)]
+
+    async def _empty(repo_full: str, number: int):
+        return []
+
+    async def _get_authenticated_login():
+        return "robomp-bot"
+
+    def _diff(_bindings: ToolBindings, cmd, *, timeout=None):
+        commands.append(cmd)
+        if cmd == ("git", "rev-parse", "HEAD"):
+            return host_tools.subprocess.CompletedProcess(list(cmd), 0, stdout=f"{head_sha}\n", stderr="")
+        if cmd == ("git", "diff", "--no-color", "origin/main...HEAD"):
+            return host_tools.subprocess.CompletedProcess(list(cmd), 0, stdout="diff --git a/src/app.py b/src/app.py\n--- a/src/app.py\n+++ b/src/app.py\n@@ -1,1 +1,2 @@\n old\n+new\n", stderr="")
+        if cmd == ("git", "fetch", "origin", old_sha):
+            return host_tools.subprocess.CompletedProcess(list(cmd), 0, stdout="", stderr="")
+        if cmd == ("git", "rev-parse", "--verify", "--quiet", old_sha):
+            hits = sum(1 for seen in commands if seen == cmd)
+            return host_tools.subprocess.CompletedProcess(list(cmd), 0 if hits > 1 else 1, stdout=f"{old_sha}\n" if hits > 1 else "", stderr="")
+        assert cmd == ("git", "diff", "--no-color", f"{old_sha}..{head_sha}", "--", "src/app.py")
+        return host_tools.subprocess.CompletedProcess(list(cmd), 0, stdout="diff --git a/src/app.py b/src/app.py\n--- a/src/app.py\n+++ b/src/app.py\n@@ -2,1 +2,2 @@\n old\n+fix\n", stderr="")
+
+    monkeypatch.setattr(bindings.github, "get_pull_request", _get_pull_request)
+    monkeypatch.setattr(bindings.github, "list_pr_files", _list_pr_files)
+    monkeypatch.setattr(bindings.github, "list_pr_reviews", _list_pr_reviews)
+    monkeypatch.setattr(bindings.github, "list_review_threads", _empty)
+    monkeypatch.setattr(bindings.github, "list_pr_commits", _empty)
+    monkeypatch.setattr(bindings.github, "get_authenticated_login", _get_authenticated_login)
+    monkeypatch.setattr(bindings.github, "list_comments", _empty)
+    monkeypatch.setattr(host_tools, "_run_repo_command", _diff)
+    try:
+        tool = next(x for x in build(bindings) if x.name == "prepare_pr_review")
+        tool.execute({}, _ctx())
+    finally:
+        _stop_loop(loop, t)
+
+    assert ("git", "fetch", "origin", old_sha) in commands
+    assert ("git", "diff", "--no-color", f"{old_sha}..{head_sha}", "--", "src/app.py") in commands
+
 def test_prepare_pr_review_refuses_stale_workspace_head(
     db: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1978,6 +2221,67 @@ def test_validate_pr_review_returns_anchor_summary(db: Database, tmp_path: Path)
 
     assert "anchor_valid=true" in result
     assert "duplicate_suspected=false" in result
+
+
+def test_validate_pr_review_reports_suggestion_omission_blockers(db: Database, tmp_path: Path) -> None:
+    helper = tmp_path / "pr-review-helper.js"
+    helper.write_text(
+        """
+const cmd = process.argv[2];
+function arg(name) {
+  const index = process.argv.indexOf(name);
+  return index === -1 ? null : process.argv[index + 1];
+}
+const out = arg("--out");
+if (cmd === "gate") {
+  await Bun.write(out, JSON.stringify({passed: true, reason: "ok", missing_domains: []}));
+} else if (cmd === "verify-status") {
+  await Bun.write(out, JSON.stringify({ok: true, unresolved_prior: []}));
+} else if (cmd === "validate") {
+  await Bun.write(out, JSON.stringify({
+    recommendation: {event: "COMMENT", blocking_count: 0, optional_count: 0, reason: "omitted"},
+    findings: [{
+      anchor_valid: true,
+      duplicate_suspected: false,
+      suggestion_expected: true,
+      suggestion_valid: false,
+      suggestion_omission_blocking: true,
+      no_suggestion_reason: null,
+      omit_reason: "missing_github_suggestion"
+    }]
+  }));
+} else {
+  throw new Error(`unexpected cmd ${cmd}`);
+}
+""",
+        encoding="utf-8",
+    )
+    bindings, loop, t = _review_bindings(db, tmp_path, httpx.MockTransport(lambda _r: httpx.Response(500)))
+    bindings = replace(bindings, settings=Settings.model_construct(pr_review_helper=helper, request_timeout_seconds=30.0))
+    paths = pr_review_paths(bindings.workspace)
+    save_json_checked(paths.evidence, {"head_sha": bindings.review_head_sha})
+    save_json_checked(paths.classification, {"delegation_required": False, "domains_required": ["correctness"]})
+    try:
+        tool = next(x for x in build(bindings) if x.name == "validate_pr_review")
+        result = tool.execute(
+            {
+                "findings": [
+                    {
+                        "path": "src/app.py",
+                        "line": 12,
+                        "body": "finding",
+                        "severity": "required",
+                        "intent": "required_change",
+                    }
+                ]
+            },
+            _ctx(),
+        )
+    finally:
+        _stop_loop(loop, t)
+
+    assert "suggestion_omission_blocking=true" in result
+    assert 'omit_reason="missing_github_suggestion"' in result
 
 
 

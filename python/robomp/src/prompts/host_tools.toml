@@ -2,7 +2,7 @@
 description = "Fetch the inbound PR premise and changed-file list for review. Review-mode only."
 
 [prepare_pr_review]
-description = "Build PR review evidence from gh-proxy/backing workspace and run the vendored classifier. Review-mode only; nonfatal when helper is unavailable."
+description = "Build PR review evidence from gh-proxy/backing workspace and run the vendored classifier. Review-mode only; returns/writes mode=fresh|verify-fixes, prior_review, and delta_diff evidence when applicable; nonfatal when helper is unavailable."
 
 [delegate_pr_review]
 description = "Run required delegated reviewer subagents for high-risk domains and write review metadata. Review-mode only; call before validate_pr_review when PR review classification says delegation_required=true."
@@ -15,7 +15,7 @@ reviewer = "Optional reviewer id override for a single-domain run."
 description = "Validate candidate PR findings against PR review evidence and write the submit-ready findings/validation state consumed by submit_pr_review. Review-mode only; invalid/duplicate findings must be revised and validate_pr_review rerun before submit."
 
 [validate_pr_review.parameters]
-findings = "Array of candidate findings with path, line, body, severity, intent, and optional suggestion {kind='github_suggestion', replacement='exact replacement lines'} when the finding has a safe contiguous GitHub suggested change. Critical/required required_change findings on a valid diff line should include suggestion or no_suggestion_reason."
+findings = "Array of candidate findings with path, line, body, severity, intent, and optional suggestion {kind='github_suggestion', replacement='exact replacement lines'} when the finding has a safe contiguous GitHub suggested change. Critical/required required_change findings on a valid diff line must include suggestion or no_suggestion_reason enum: multi_file_fix, uncertain_semantics, design_decision, architecture_decision, generated_code, migration_or_schema, test_policy_choice, broader_refactor, non_contiguous_change, explanation_only."
 
 [classify_pr]
 description = "Classify an incoming PR, apply triaged/review labels, and persist the review label. Review-mode only."

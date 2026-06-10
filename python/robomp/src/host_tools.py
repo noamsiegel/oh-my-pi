@@ -1293,6 +1293,49 @@ def _pr_review_flatten_thread_comments(threads: Sequence[ReviewThreadInfo]) -> l
             )
     return out
 
+def _pr_review_reviewer_inline_comments_unioned(
+    threads: Sequence[ReviewThreadInfo],
+    review_login: str,
+) -> list[dict[str, Any]]:
+    review_login_lower = review_login.lower()
+    out: list[dict[str, Any]] = []
+    if not review_login_lower:
+        return out
+    for thread in threads:
+        comments = thread.comments
+        for index, comment in enumerate(comments):
+            if comment.author.lower() != review_login_lower:
+                continue
+            latest_author_reply = None
+            for reply in comments[index + 1 :]:
+                if reply.author.lower() != review_login_lower:
+                    latest_author_reply = {
+                        "author": reply.author,
+                        "body": reply.body,
+                        "created_at": reply.created_at,
+                    }
+            out.append(
+                {
+                    "comment_id": comment.id,
+                    "thread_id": thread.id,
+                    "review_id": comment.review_id,
+                    "path": comment.path,
+                    "line": comment.line,
+                    "original_line": comment.original_line,
+                    "start_line": comment.start_line,
+                    "body": comment.body,
+                    "html_url": comment.html_url,
+                    "commit_id": comment.commit_id,
+                    "thread_is_resolved": thread.is_resolved,
+                    "thread_is_outdated": thread.is_outdated,
+                    "is_outdated": comment.is_outdated,
+                    "latest_author_reply": latest_author_reply,
+                }
+            )
+    return out
+
+
+
 
 
 def _build_prepare_pr_review(bindings: ToolBindings) -> HostTool[Any, Any]:
@@ -1373,62 +1416,77 @@ def _build_prepare_pr_review(bindings: ToolBindings) -> HostTool[Any, Any]:
             and review.state.upper() == "CHANGES_REQUESTED"
         ]
         latest_cr_review = max(reviewer_cr_reviews, key=lambda review: review.submitted_at) if reviewer_cr_reviews else None
-        verify_fixes = bool(latest_cr_review and latest_cr_review.commit_id and latest_cr_review.commit_id != pr.head_sha)
+        verify_fixes = bool(latest_cr_review and latest_cr_review.commit_id != pr.head_sha)
         mode = "verify-fixes" if verify_fixes else "fresh"
         delta_diff: str | None = None
         delta_anchors: list[dict[str, Any]] | None = None
+        delta_unavailable_reason: str | None = None
         prior_review: dict[str, Any] | None = None
         reviewer_prior_review_bodies: list[dict[str, Any]] = []
         reviewer_prior_inline_comments_unioned: list[dict[str, Any]] | None = None
 
         if latest_cr_review is not None and verify_fixes:
-            prior_sha = latest_cr_review.commit_id
-            delta_cmd: list[str] = ["git", "diff", "--no-color", f"{prior_sha}..HEAD"]
-            delta_proc = _run_repo_command(bindings, tuple(delta_cmd), timeout=timeout)
-            if delta_proc.returncode != 0:
-                output = _format_process_output(delta_proc.stdout, delta_proc.stderr)
-                _audit(bindings, "prepare_pr_review", args, error=output)
-                _raise_command(f"PR review helper verify-fixes delta diff failed: {output}")
-            delta_diff = delta_proc.stdout
-            delta_anchors = pr_review_parse_diff_anchors(delta_diff)
-            prior_review = {
-                "state": "CHANGES_REQUESTED",
-                "review_id": latest_cr_review.id,
-                "sha": latest_cr_review.commit_id,
-                "submitted_at": latest_cr_review.submitted_at,
-                "dismissed": False,
-                "is_latest_by_submitted_at": True,
-                "is_outdated": False,
-                "all_reviewer_cr_review_ids": [review.id for review in reviewer_cr_reviews],
-                "reviewer_inline_comment_count": sum(1 for comment in prior_review_comments if str((comment.get("user") or {}).get("login") or "").lower() == review_login_lower),
-                "reviewer_review_body_present": bool(latest_cr_review.body.strip()),
-            }
+            prior_sha = latest_cr_review.commit_id or ""
             reviewer_prior_review_bodies = [
                 {
                     "review_id": review.id,
                     "state": review.state,
                     "body": review.body,
                     "sha": review.commit_id,
+                    "submitted_at": review.submitted_at,
                 }
                 for review in reviewer_cr_reviews
             ]
-            reviewer_prior_inline_comments_unioned = [
-                {
-                    "comment_id": comment["id"],
-                    "path": comment["path"],
-                    "line": comment["line"],
-                    "start_line": comment["start_line"],
-                    "original_line": comment["original_line"],
-                    "body": comment["body"],
-                    "html_url": comment["html_url"],
-                    "is_outdated": comment["is_outdated"],
-                    "thread_id": comment["thread_id"],
-                    "thread_is_resolved": comment["thread_is_resolved"],
-                    "thread_is_outdated": comment["thread_is_outdated"],
-                }
-                for comment in prior_review_comments
-                if str((comment.get("user") or {}).get("login") or "").lower() == review_login_lower
-            ]
+            reviewer_prior_inline_comments_unioned = _pr_review_reviewer_inline_comments_unioned(
+                review_threads,
+                review_login,
+            )
+            prior_review = {
+                "state": "CHANGES_REQUESTED",
+                "review_id": latest_cr_review.id,
+                "sha": prior_sha,
+                "submitted_at": latest_cr_review.submitted_at,
+                "dismissed": False,
+                "is_latest_by_submitted_at": True,
+                "is_outdated": False,
+                "all_reviewer_cr_review_ids": [review.id for review in reviewer_cr_reviews],
+                "reviewer_inline_comment_count": len(reviewer_prior_inline_comments_unioned),
+                "reviewer_review_body_present": bool(latest_cr_review.body.strip()),
+            }
+            if not prior_sha:
+                prior_review["is_outdated"] = True
+                delta_unavailable_reason = "missing_prior_commit_id"
+            else:
+                verify_proc = _run_repo_command(
+                    bindings,
+                    ("git", "rev-parse", "--verify", "--quiet", prior_sha),
+                    timeout=timeout,
+                )
+                if verify_proc.returncode != 0:
+                    _run_repo_command(bindings, ("git", "fetch", "origin", prior_sha), timeout=timeout)
+                    verify_proc = _run_repo_command(
+                        bindings,
+                        ("git", "rev-parse", "--verify", "--quiet", prior_sha),
+                        timeout=timeout,
+                    )
+                if verify_proc.returncode != 0:
+                    prior_review["is_outdated"] = True
+                    delta_unavailable_reason = "prior_sha_unreachable"
+                else:
+                    pr_file_paths = tuple(file.path for file in files if file.path)
+                    delta_cmd: list[str] = [
+                        "git",
+                        "diff",
+                        "--no-color",
+                        f"{prior_sha}..{pr.head_sha}",
+                        *(["--", *pr_file_paths] if pr_file_paths else []),
+                    ]
+                    delta_proc = _run_repo_command(bindings, tuple(delta_cmd), timeout=timeout)
+                    if delta_proc.returncode != 0:
+                        delta_unavailable_reason = "delta_diff_failed"
+                    else:
+                        delta_diff = delta_proc.stdout
+                        delta_anchors = pr_review_parse_diff_anchors(delta_diff)
 
         paths = pr_review_paths(bindings.workspace)
         evidence_path = paths.evidence
@@ -1456,6 +1514,7 @@ def _build_prepare_pr_review(bindings: ToolBindings) -> HostTool[Any, Any]:
             "prior_review": prior_review,
             "delta_diff": delta_diff,
             "delta_anchors": delta_anchors,
+            "delta_unavailable_reason": delta_unavailable_reason,
             "prior_review_comments": prior_review_comments,
             "review_threads": [_pr_review_thread_evidence(thread) for thread in review_threads],
             "prior_reviews": prior_reviews,
@@ -1926,7 +1985,12 @@ def _build_validate_pr_review(bindings: ToolBindings) -> HostTool[Any, Any]:
                 if isinstance(item, Mapping):
                     lines.append(
                         f"- finding {index}: anchor_valid={json.dumps(item.get('anchor_valid', '(unknown)'))}; "
-                        f"duplicate_suspected={json.dumps(item.get('duplicate_suspected', '(unknown)'))}"
+                        f"duplicate_suspected={json.dumps(item.get('duplicate_suspected', '(unknown)'))}; "
+                        f"suggestion_expected={json.dumps(item.get('suggestion_expected', '(unknown)'))}; "
+                        f"suggestion_valid={json.dumps(item.get('suggestion_valid', '(unknown)'))}; "
+                        f"suggestion_omission_blocking={json.dumps(item.get('suggestion_omission_blocking', '(unknown)'))}; "
+                        f"no_suggestion_reason={json.dumps(item.get('no_suggestion_reason'))}; "
+                        f"omit_reason={json.dumps(item.get('omit_reason'))}"
                     )
         _audit(
             bindings,
@@ -1970,7 +2034,21 @@ def _build_validate_pr_review(bindings: ToolBindings) -> HostTool[Any, Any]:
                                 "required": ["kind", "replacement"],
                                 "additionalProperties": False,
                             },
-                            "no_suggestion_reason": {"type": "string"},
+                            "no_suggestion_reason": {
+                                "type": "string",
+                                "enum": [
+                                    "multi_file_fix",
+                                    "uncertain_semantics",
+                                    "design_decision",
+                                    "architecture_decision",
+                                    "generated_code",
+                                    "migration_or_schema",
+                                    "test_policy_choice",
+                                    "broader_refactor",
+                                    "non_contiguous_change",
+                                    "explanation_only",
+                                ],
+                            },
                         },
                         "required": ["path", "line", "body", "severity", "intent"],
                         "additionalProperties": False,
@@ -2001,7 +2079,7 @@ def _build_validate_pr_review(bindings: ToolBindings) -> HostTool[Any, Any]:
                         "required": ["disposition", "rationale"],
                         "additionalProperties": False,
                     },
-                }
+                },
             },
             "required": ["findings"],
             "additionalProperties": False,

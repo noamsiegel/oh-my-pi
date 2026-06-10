@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from robomp import persona
-from robomp.worker import DirectiveInfo, ThreadMessage
+from robomp.worker import DirectiveInfo, PrReviewFocus, ThreadMessage
 
 
 @dataclass(slots=True, frozen=True)
@@ -172,6 +172,25 @@ def test_kickoff_pr_review_formats_head_repo_and_origin_base() -> None:
     assert "`fix-crash` from `alice/widget`" in out
     assert "git diff origin/main...HEAD" in out
     assert "automatically appended Review process details" in out
+    assert "Orchestrator focus: `fresh`" in out
+    assert "{{" not in out
+
+
+def test_kickoff_pr_review_verify_fixes_focus_renders_prior_review() -> None:
+    out = persona.kickoff_pr_review(
+        repo=_Repo(),
+        pr=_Pr(),
+        workspace=_Workspace(),
+        review_focus=PrReviewFocus(
+            mode="verify-fixes",
+            reason="verify fixes",
+            prior_review_commit_id="1" * 40,
+            prior_review_id=100,
+            prior_review_submitted_at="t",
+        ),
+    )
+    assert "Orchestrator focus: `verify-fixes`" in out
+    assert "1" * 40 in out
 
 
 def test_review_completion_reminder_mentions_submit_only() -> None:

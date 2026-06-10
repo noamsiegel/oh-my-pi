@@ -751,6 +751,63 @@ async def test_run_rpc_review_pr_reminds_until_submit_pr_review(tmp_path: Path, 
     assert all("gh_open_pr" not in p for p in fake.prompts[1:])
 
 
+def test_review_pr_prompt_includes_verify_fixes_focus(tmp_path: Path, settings: Settings) -> None:
+    inputs, _bindings = _make_inputs(tmp_path, settings, session_has_jsonl=False)
+    inputs.pr_review_focus = worker.PrReviewFocus(
+        mode="verify-fixes",
+        reason="verify fixes",
+        prior_review_commit_id="1" * 40,
+        prior_review_id=100,
+        prior_review_submitted_at="t",
+    )
+    pr = SimpleNamespace(
+        number=99,
+        author="alice",
+        head_ref="feature",
+        head_repo="octo/widget",
+        base_ref="main",
+        html_url="https://example/pr/99",
+    )
+
+    prompt = worker._build_prompt(
+        "review_pr",
+        inputs,
+        comment=None,
+        pr_number=99,
+        review_payload=None,
+        pr=pr,  # type: ignore[arg-type]
+    )
+
+    assert "Orchestrator focus: `verify-fixes`" in prompt
+    assert "1" * 40 in prompt
+
+
+@pytest.mark.asyncio
+async def test_run_rpc_system_append_includes_verify_fixes_focus(tmp_path: Path, settings: Settings) -> None:
+    inputs, bindings = _make_inputs(tmp_path, settings, session_has_jsonl=False)
+    inputs.pr_review_focus = worker.PrReviewFocus(
+        mode="verify-fixes",
+        reason="verify fixes",
+        prior_review_commit_id="1" * 40,
+        prior_review_id=100,
+        prior_review_submitted_at="t",
+    )
+    loop = asyncio.new_event_loop()
+    try:
+        worker._run_rpc_blocking(
+            inputs,
+            task_kind="review_pr",
+            prompt="kickoff",
+            loop=loop,
+            bindings=bindings,  # type: ignore[arg-type]
+        )
+    finally:
+        loop.close()
+
+    append_prompt = _FakeRpcClient.instances[0].kwargs["append_system_prompt"]
+    assert "focus is verify-fixes" in append_prompt
+
+
 @pytest.mark.asyncio
 async def test_run_rpc_review_pr_forces_high_thinking(tmp_path: Path, settings: Settings) -> None:
     review_settings = settings.model_copy(update={"thinking_level": "low"})

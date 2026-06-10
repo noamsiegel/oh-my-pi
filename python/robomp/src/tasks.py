@@ -20,12 +20,13 @@ from robomp.github_types import (
     IssueInfo,
     PullRequestCiStatusInfo,
     PullRequestInfo,
+    PullRequestReviewInfo,
     RepoInfo,
 )
 from robomp.pr_review_policy import matching_review_labels, normalize_label_names
 from robomp.sandbox import GitTransport, SandboxManager
 from robomp.task_outcome import DeferredTask, TaskOutcome, TransientTaskError
-from robomp.worker import DirectiveInfo, TaskInputs, ThreadMessage, run_task
+from robomp.worker import DirectiveInfo, PrReviewFocus, TaskInputs, ThreadMessage, run_task
 
 log = logging.getLogger(__name__)
 
@@ -139,6 +140,7 @@ async def _post_pr_review_started_comment(
     labels: frozenset[str],
     head_sha: str,
     allowed_labels: frozenset[str],
+    review_focus: PrReviewFocus,
 ) -> None:
     operation_key = f"post_pr_review_started_comment:{key}:{head_sha}"
     if not db.reserve_side_effect(operation_key):
@@ -148,10 +150,16 @@ async def _post_pr_review_started_comment(
         return
     trigger = sorted(matching_review_labels(labels, allowed_labels))
     trigger_text = f" triggered by `{trigger[0]}`" if trigger else ""
-    body = (
-        f"Robo-MS is reviewing this PR now{trigger_text}. "
-        "I’ll post an `APPROVE` or `REQUEST_CHANGES` review when the eval finishes."
-    )
+    if review_focus.mode == "verify-fixes":
+        body = (
+            f"Robo-MS is verifying fixes for my prior requested changes on this PR now{trigger_text}. "
+            "I’ll post an `APPROVE` or `REQUEST_CHANGES` review when the eval finishes."
+        )
+    else:
+        body = (
+            f"Robo-MS is reviewing this PR now{trigger_text}. "
+            "I’ll post an `APPROVE` or `REQUEST_CHANGES` review when the eval finishes."
+        )
     try:
         comment = await github.post_comment(repo_full, pr_number, body)
     except GitHubError as exc:
@@ -159,7 +167,14 @@ async def _post_pr_review_started_comment(
         db.log_tool_call(
             issue_key=key,
             tool=operation_key,
-            args={"repo": repo_full, "pr": pr_number, "head_sha": head_sha},
+            args={
+                "repo": repo_full,
+                "pr": pr_number,
+                "head_sha": head_sha,
+                "review_focus_mode": review_focus.mode,
+                "prior_review_commit_id": review_focus.prior_review_commit_id,
+                "prior_review_id": review_focus.prior_review_id,
+            },
             error=str(exc),
         )
         log.warning("review-start comment failed", extra={"repo": repo_full, "pr": pr_number, "err": str(exc)})
@@ -168,7 +183,14 @@ async def _post_pr_review_started_comment(
     db.log_tool_call(
         issue_key=key,
         tool=operation_key,
-        args={"repo": repo_full, "pr": pr_number, "head_sha": head_sha},
+        args={
+            "repo": repo_full,
+            "pr": pr_number,
+            "head_sha": head_sha,
+            "review_focus_mode": review_focus.mode,
+            "prior_review_commit_id": review_focus.prior_review_commit_id,
+            "prior_review_id": review_focus.prior_review_id,
+        },
         result={"comment_id": comment.id},
     )
 
@@ -420,6 +442,28 @@ def _comment_review_retryable(review_body: str) -> bool:
     )
     return any(marker in body for marker in retryable_markers)
 
+def _pr_review_focus(latest_review: PullRequestReviewInfo | None, head_sha: str) -> PrReviewFocus:
+    if (
+        latest_review is not None
+        and latest_review.state.upper() == "CHANGES_REQUESTED"
+        and latest_review.commit_id != head_sha
+    ):
+        prior = latest_review.commit_id or ""
+        reason = (
+            "verify fixes for prior bot CHANGES_REQUESTED review"
+            if prior
+            else "verify fixes for prior bot CHANGES_REQUESTED review with unknown commit"
+        )
+        return PrReviewFocus(
+            mode="verify-fixes",
+            reason=reason,
+            prior_review_state="CHANGES_REQUESTED",
+            prior_review_commit_id=prior,
+            prior_review_id=latest_review.id,
+            prior_review_submitted_at=latest_review.submitted_at,
+        )
+    return PrReviewFocus()
+
 
 async def review_pr(
     *,
@@ -543,6 +587,7 @@ async def review_pr(
                     "head_sha": pr.head_sha,
                 },
             )
+    review_focus = _pr_review_focus(latest_review, pr.head_sha)
     if review_labeled:
         log.info(
             "review labels present without submitted review; retrying",
@@ -572,8 +617,8 @@ async def review_pr(
         labels=labels,
         head_sha=pr.head_sha,
         allowed_labels=allowed_labels,
+        review_focus=review_focus,
     )
-
     db.upsert_issue(key=key, repo=repo.full_name, number=pr_number, state="reviewing", pr_number=pr_number)
     workspace = sandbox.ensure_workspace(
         repo=repo.full_name,
@@ -611,6 +656,7 @@ async def review_pr(
         attempts=attempts,
         slot_uid=slot_uid,
         natives_cache=sandbox.natives_cache,
+        pr_review_focus=review_focus,
     )
     await run_task(task_kind="review_pr", inputs=inputs, pr_number=pr_number, pr=pr)
 
