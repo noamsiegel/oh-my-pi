@@ -1906,7 +1906,7 @@ async def test_handle_pr_conversation_unmapped_bot_pr_uses_pr_branch(
         assert number == 900
         return [CommentInfo(id=77, author="can1357", body="prior PR context", created_at="2026-05-14T00:00:00Z")]
 
-    async def _list_review_comments(self, repo_full: str, number: int):
+    async def _list_review_threads(self, repo_full: str, number: int):
         assert repo_full == "octo/widget"
         assert number == 900
         return []
@@ -1920,7 +1920,7 @@ async def test_handle_pr_conversation_unmapped_bot_pr_uses_pr_branch(
     monkeypatch.setattr(GitHubClient, "get_repo", _get_repo)
     monkeypatch.setattr(GitHubClient, "get_issue", _get_issue)
     monkeypatch.setattr(GitHubClient, "list_comments", _list_comments)
-    monkeypatch.setattr(GitHubClient, "list_review_comments", _list_review_comments)
+    monkeypatch.setattr(GitHubClient, "list_review_threads", _list_review_threads)
     monkeypatch.setattr(GitHubClient, "list_pr_reviews", _list_pr_reviews)
 
     payload = {
@@ -2028,7 +2028,7 @@ async def test_handle_pr_conversation_repairs_missing_pr_mapping_from_branch(
         assert number == 900
         return [CommentInfo(id=78, author="can1357", body="prior PR context", created_at="2026-05-14T00:00:00Z")]
 
-    async def _list_review_comments(self, repo_full: str, number: int):
+    async def _list_review_threads(self, repo_full: str, number: int):
         assert repo_full == "octo/widget"
         assert number == 900
         return []
@@ -2042,7 +2042,7 @@ async def test_handle_pr_conversation_repairs_missing_pr_mapping_from_branch(
     monkeypatch.setattr(GitHubClient, "get_repo", _get_repo)
     monkeypatch.setattr(GitHubClient, "get_issue", _get_issue)
     monkeypatch.setattr(GitHubClient, "list_comments", _list_comments)
-    monkeypatch.setattr(GitHubClient, "list_review_comments", _list_review_comments)
+    monkeypatch.setattr(GitHubClient, "list_review_threads", _list_review_threads)
     monkeypatch.setattr(GitHubClient, "list_pr_reviews", _list_pr_reviews)
 
     payload = {

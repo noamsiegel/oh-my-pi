@@ -21,6 +21,8 @@ from robomp.pr_review_self_improver import (
 
 
 class FakeRpc:
+    prompts: list[str] = []
+
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         self.text = json.dumps(
             {
@@ -52,6 +54,7 @@ class FakeRpc:
         return None
 
     def prompt_and_wait(self, prompt: str, timeout: float) -> Any:
+        self.prompts.append(prompt)
         assert "Robo-MS PR-review self-improvement agent" in prompt
         return SimpleNamespace(require_assistant_text=lambda: self.text)
 
@@ -223,6 +226,46 @@ async def test_self_improver_runs_after_ten_reviews_and_pushes_only_after_gates(
     assert latest["commit_id"] == "abc1234"
     assert latest["pushed_bookmark"] == "main"
 
+
+
+@pytest.mark.asyncio
+async def test_self_improver_prompt_includes_missed_by_agent_gaps(db: Database, tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    settings.pr_review_self_improve_repo_root.mkdir(parents=True)
+    _seed_reviews(db, 10)
+    db.record_pr_review_gap_event(
+        gap_kind="missed_by_agent",
+        repo="octo/widget",
+        pr_number=42,
+        head_sha="sha-42",
+        source_label="human",
+        source_object_kind="review_comment",
+        source_object_id="9001",
+        severity_hint="required",
+        confidence=0.95,
+        reason="external reviewer caught normalized id drift",
+        path="apps/api/view.py",
+        line=123,
+        body="task_id should use canonical task.id",
+        event_delivery_id="delivery-1",
+    )
+    calls: list[list[str]] = []
+
+    def runner(args: Sequence[str], cwd: Path, timeout: float | None, env: Mapping[str, str] | None):
+        cmd = list(args)
+        calls.append(cmd)
+        if cmd[:3] == ["jj", "-R", str(settings.pr_review_self_improve_repo_root)] and cmd[3] == "status":
+            return subprocess.CompletedProcess(cmd, 0, "The working copy has no changes.", "")
+        return subprocess.CompletedProcess(cmd, 0, "ok", "")
+
+    FakeRpc.prompts = []
+    sched = PrReviewSelfImprovementScheduler(settings=settings, db=db, command_runner=runner, rpc_client_factory=FakeRpc)
+    await sched.tick()
+    packet = json.loads("{" + FakeRpc.prompts[-1].rsplit("\n{", 1)[1])
+    gap = packet["missed_by_agent_gaps"][0]
+    assert gap["event_delivery_id"] == "delivery-1"
+    assert gap["path"] == "apps/api/view.py"
+    assert gap["severity_hint"] == "required"
 
 @pytest.mark.asyncio
 async def test_self_improver_dirty_checkout_skips(db: Database, tmp_path: Path) -> None:

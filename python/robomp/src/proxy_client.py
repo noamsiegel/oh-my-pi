@@ -35,6 +35,8 @@ from robomp.github_types import (
     ReactionInfo,
     RepoInfo,
     ReviewCommentInfo,
+    ReviewThreadCommentInfo,
+    ReviewThreadInfo,
 )
 from robomp.proxy_hmac import HEADER_SIGNATURE, HEADER_TIMESTAMP, sign
 
@@ -223,6 +225,15 @@ class GitHubProxyClient:
             params={"repo": repo, "pr_number": pr_number},
         )
         return [_review_comment_from(item) for item in (data.get("items") if isinstance(data, dict) else None) or []]
+
+    async def list_review_threads(self, repo: str, pr_number: int) -> list[ReviewThreadInfo]:
+        data = await self._request(
+            "GET",
+            "/gh/v1/review_threads",
+            params={"repo": repo, "pr_number": pr_number},
+        )
+        return [_review_thread_from(item) for item in (data.get("items") if isinstance(data, dict) else None) or []]
+
 
     async def list_review_comments_for_review(
         self,
@@ -567,6 +578,48 @@ def _review_comment_from(data: Any) -> ReviewCommentInfo:
         commit_id=str(data.get("commit_id") or ""),
         diff_hunk=str(data.get("diff_hunk") or ""),
         in_reply_to_id=in_reply_to_id if isinstance(in_reply_to_id, int) else None,
+    )
+
+
+def _review_thread_comment_from(data: Any) -> ReviewThreadCommentInfo:
+    if not isinstance(data, dict):
+        raise GitHubError(500, "proxy returned malformed review_thread_comment payload")
+    line = data.get("line")
+    start_line = data.get("start_line")
+    original_line = data.get("original_line")
+    original_start_line = data.get("original_start_line")
+    review_id = data.get("review_id")
+    in_reply_to_id = data.get("in_reply_to_id")
+    return ReviewThreadCommentInfo(
+        id=int(data.get("id") or 0),
+        author=str(data.get("author") or ""),
+        body=str(data.get("body") or ""),
+        path=str(data.get("path") or ""),
+        line=line if isinstance(line, int) else None,
+        created_at=str(data.get("created_at") or ""),
+        start_line=start_line if isinstance(start_line, int) else None,
+        original_line=original_line if isinstance(original_line, int) else None,
+        original_start_line=original_start_line if isinstance(original_start_line, int) else None,
+        html_url=str(data.get("html_url") or ""),
+        review_id=review_id if isinstance(review_id, int) else None,
+        commit_id=str(data.get("commit_id") or ""),
+        diff_hunk=str(data.get("diff_hunk") or ""),
+        in_reply_to_id=in_reply_to_id if isinstance(in_reply_to_id, int) else None,
+        is_outdated=bool(data.get("is_outdated")),
+        state=str(data.get("state") or ""),
+    )
+
+
+def _review_thread_from(data: Any) -> ReviewThreadInfo:
+    if not isinstance(data, dict):
+        raise GitHubError(500, "proxy returned malformed review_thread payload")
+    comments = data.get("comments")
+    return ReviewThreadInfo(
+        id=str(data.get("id") or ""),
+        is_resolved=bool(data.get("is_resolved")),
+        is_outdated=bool(data.get("is_outdated")),
+        resolved_by=str(data.get("resolved_by") or ""),
+        comments=tuple(_review_thread_comment_from(item) for item in (comments if isinstance(comments, list) else [])),
     )
 
 

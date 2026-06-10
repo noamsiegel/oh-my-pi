@@ -477,6 +477,16 @@ def create_proxy_app(settings: ProxySettings) -> FastAPI:
             return _gh_error_response(exc)
         return JSONResponse({"items": [_serialize(c) for c in items]})
 
+    @app.get("/gh/v1/review_threads")
+    async def list_review_threads(request: Request, repo: str, pr_number: int) -> JSONResponse:
+        await _authenticate(request)
+        github: GitHubClient = request.app.state.github
+        try:
+            items = await github.list_review_threads(repo, pr_number)
+        except GitHubError as exc:
+            return _gh_error_response(exc)
+        return JSONResponse({"items": [_serialize(t) for t in items]})
+
     @app.get("/gh/v1/review_comments_for_review")
     async def list_review_comments_for_review(request: Request, repo: str, pr_number: int, review_id: int) -> JSONResponse:
         await _authenticate(request)

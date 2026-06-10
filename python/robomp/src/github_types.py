@@ -126,6 +126,39 @@ class ReviewCommentInfo:
 
 
 @dataclass(slots=True, frozen=True)
+class ReviewThreadCommentInfo:
+    """Inline PR review comment with GraphQL thread state attached."""
+
+    id: int
+    author: str
+    body: str
+    path: str
+    line: int | None
+    created_at: str
+    start_line: int | None = None
+    original_line: int | None = None
+    original_start_line: int | None = None
+    html_url: str = ""
+    review_id: int | None = None
+    commit_id: str = ""
+    diff_hunk: str = ""
+    in_reply_to_id: int | None = None
+    is_outdated: bool = False
+    state: str = ""
+
+
+@dataclass(slots=True, frozen=True)
+class ReviewThreadInfo:
+    """GraphQL PR review thread, including resolution/outdated state."""
+
+    id: str
+    is_resolved: bool
+    is_outdated: bool
+    resolved_by: str = ""
+    comments: tuple[ReviewThreadCommentInfo, ...] = ()
+
+
+@dataclass(slots=True, frozen=True)
 class PullRequestReviewInfo:
     """Top-level PR review (the summary block, not the inline comments)."""
 
@@ -183,4 +216,6 @@ __all__ = [
     "ReactionInfo",
     "RepoInfo",
     "ReviewCommentInfo",
+    "ReviewThreadCommentInfo",
+    "ReviewThreadInfo",
 ]

@@ -395,6 +395,66 @@ def test_list_review_comments_for_review_parses_ids_and_hunk() -> None:
     assert comments[0].diff_hunk == "@@ -1 +1 @@"
     assert comments[0].in_reply_to_id == 54
 
+
+
+def test_list_review_threads_uses_graphql_thread_state() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/graphql"
+        return httpx.Response(
+            200,
+            json={
+                "data": {
+                    "repository": {
+                        "pullRequest": {
+                            "reviewThreads": {
+                                "pageInfo": {"hasNextPage": False, "endCursor": None},
+                                "nodes": [
+                                    {
+                                        "id": "PRRT_kwDOAA",
+                                        "isResolved": False,
+                                        "isOutdated": True,
+                                        "resolvedBy": {"login": "maintainer"},
+                                        "comments": {
+                                            "nodes": [
+                                                {
+                                                    "databaseId": 55,
+                                                    "author": {"login": "claude"},
+                                                    "body": "finding",
+                                                    "path": "src/app.py",
+                                                    "line": 12,
+                                                    "originalLine": 11,
+                                                    "startLine": 10,
+                                                    "originalStartLine": 9,
+                                                    "url": "https://github.test/c/55",
+                                                    "diffHunk": "@@ -1 +1 @@",
+                                                    "outdated": False,
+                                                    "state": "SUBMITTED",
+                                                    "replyTo": {"databaseId": 54},
+                                                    "commit": {"oid": "abc"},
+                                                    "pullRequestReview": {"databaseId": 44},
+                                                    "createdAt": "2026-01-01T00:00:00Z",
+                                                }
+                                            ]
+                                        },
+                                    }
+                                ],
+                            }
+                        }
+                    }
+                }
+            },
+        )
+
+    client = GitHubClient("tok", transport=httpx.MockTransport(handler))
+    threads = _run_async(client.list_review_threads("octo/widget", 9))
+    assert threads[0].id == "PRRT_kwDOAA"
+    assert threads[0].is_outdated is True
+    assert threads[0].resolved_by == "maintainer"
+    assert threads[0].comments[0].review_id == 44
+    assert threads[0].comments[0].in_reply_to_id == 54
+    assert threads[0].comments[0].commit_id == "abc"
+    assert threads[0].comments[0].is_outdated is True
+
 def test_submit_pr_review_posts_comment_event_and_inline_comments() -> None:
     captured: dict[str, object] = {}
 

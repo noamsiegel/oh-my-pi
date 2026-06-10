@@ -32,6 +32,8 @@ from robomp.github_types import (
     IssueInfo,
     PullRequestFileInfo,
     RepoInfo,
+    ReviewCommentInfo,
+    ReviewThreadInfo,
 )
 from robomp.pr_review_tools import (
     PrReviewPaths,
@@ -1209,6 +1211,84 @@ def _pr_review_run_gate(bindings: ToolBindings, helper: Path, args: Mapping[str,
     return load_json_checked(paths.gate)
 
 
+def _pr_review_comment_evidence(
+    comment: ReviewCommentInfo,
+    *,
+    thread_id: str | None = None,
+    thread_is_resolved: bool | None = None,
+    thread_is_outdated: bool | None = None,
+    resolved_by: str = "",
+    is_outdated: bool | None = None,
+    original_start_line: int | None = None,
+) -> dict[str, Any]:
+    return {
+        "id": comment.id,
+        "path": comment.path,
+        "line": comment.line,
+        "start_line": comment.start_line,
+        "original_line": comment.original_line,
+        "original_start_line": original_start_line,
+        "body": comment.body,
+        "html_url": comment.html_url,
+        "user": {"login": comment.author},
+        "review_id": comment.review_id,
+        "commit_id": comment.commit_id,
+        "in_reply_to_id": comment.in_reply_to_id,
+        "thread_id": thread_id,
+        "thread_is_resolved": thread_is_resolved,
+        "thread_is_outdated": thread_is_outdated,
+        "resolved_by": resolved_by,
+        "is_outdated": is_outdated if is_outdated is not None else thread_is_outdated,
+    }
+
+
+def _pr_review_thread_evidence(thread: ReviewThreadInfo) -> dict[str, Any]:
+    return {
+        "id": thread.id,
+        "is_resolved": thread.is_resolved,
+        "is_outdated": thread.is_outdated,
+        "resolved_by": thread.resolved_by,
+        "comments": [
+            {
+                "id": comment.id,
+                "path": comment.path,
+                "line": comment.line,
+                "start_line": comment.start_line,
+                "original_line": comment.original_line,
+                "original_start_line": comment.original_start_line,
+                "body": comment.body,
+                "html_url": comment.html_url,
+                "user": {"login": comment.author},
+                "review_id": comment.review_id,
+                "commit_id": comment.commit_id,
+                "diff_hunk": comment.diff_hunk,
+                "in_reply_to_id": comment.in_reply_to_id,
+                "is_outdated": comment.is_outdated,
+                "state": comment.state,
+            }
+            for comment in thread.comments
+        ],
+    }
+
+
+def _pr_review_flatten_thread_comments(threads: Sequence[ReviewThreadInfo]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for thread in threads:
+        for comment in thread.comments:
+            out.append(
+                _pr_review_comment_evidence(
+                    comment,  # type: ignore[arg-type]
+                    thread_id=thread.id,
+                    thread_is_resolved=thread.is_resolved,
+                    thread_is_outdated=thread.is_outdated,
+                    resolved_by=thread.resolved_by,
+                    is_outdated=comment.is_outdated,
+                    original_start_line=comment.original_start_line,
+                )
+            )
+    return out
+
+
 
 def _build_prepare_pr_review(bindings: ToolBindings) -> HostTool[Any, Any]:
     def execute(args: dict[str, Any], _ctx: HostToolContext[Any]) -> str:
@@ -1222,7 +1302,8 @@ def _build_prepare_pr_review(bindings: ToolBindings) -> HostTool[Any, Any]:
             pr = _run_coro(bindings.loop, bindings.github.get_pull_request(repo_full, pr_number))
             files = _run_coro(bindings.loop, bindings.github.list_pr_files(repo_full, pr_number))
             reviews = _run_coro(bindings.loop, bindings.github.list_pr_reviews(repo_full, pr_number))
-            comments = _run_coro(bindings.loop, bindings.github.list_review_comments(repo_full, pr_number))
+            review_threads = _run_coro(bindings.loop, bindings.github.list_review_threads(repo_full, pr_number))
+            prior_review_comments = _pr_review_flatten_thread_comments(review_threads)
         except GitHubError as exc:
             _audit(bindings, "prepare_pr_review", args, error=str(exc))
             _raise_command(f"PR review evidence GitHub fetch failed: {exc.status} {exc.message}")
@@ -1303,7 +1384,7 @@ def _build_prepare_pr_review(bindings: ToolBindings) -> HostTool[Any, Any]:
                 "is_latest_by_submitted_at": True,
                 "is_outdated": False,
                 "all_reviewer_cr_review_ids": [review.id for review in reviewer_cr_reviews],
-                "reviewer_inline_comment_count": sum(1 for comment in comments if comment.author.lower() == review_login_lower),
+                "reviewer_inline_comment_count": sum(1 for comment in prior_review_comments if str((comment.get("user") or {}).get("login") or "").lower() == review_login_lower),
                 "reviewer_review_body_present": bool(latest_cr_review.body.strip()),
             }
             reviewer_prior_review_bodies = [
@@ -1317,39 +1398,25 @@ def _build_prepare_pr_review(bindings: ToolBindings) -> HostTool[Any, Any]:
             ]
             reviewer_prior_inline_comments_unioned = [
                 {
-                    "comment_id": comment.id,
-                    "path": comment.path,
-                    "line": comment.line,
-                    "start_line": comment.start_line,
-                    "original_line": comment.original_line,
-                    "body": comment.body,
-                    "html_url": comment.html_url,
-                    "is_outdated": False,
-                    "thread_is_resolved": False,
+                    "comment_id": comment["id"],
+                    "path": comment["path"],
+                    "line": comment["line"],
+                    "start_line": comment["start_line"],
+                    "original_line": comment["original_line"],
+                    "body": comment["body"],
+                    "html_url": comment["html_url"],
+                    "is_outdated": comment["is_outdated"],
+                    "thread_id": comment["thread_id"],
+                    "thread_is_resolved": comment["thread_is_resolved"],
+                    "thread_is_outdated": comment["thread_is_outdated"],
                 }
-                for comment in comments
-                if comment.author.lower() == review_login_lower
+                for comment in prior_review_comments
+                if str((comment.get("user") or {}).get("login") or "").lower() == review_login_lower
             ]
 
         paths = pr_review_paths(bindings.workspace)
         evidence_path = paths.evidence
         classification_path = paths.classification
-        prior_review_comments = [
-            {
-                "id": comment.id,
-                "path": comment.path,
-                "line": comment.line,
-                "start_line": comment.start_line,
-                "original_line": comment.original_line,
-                "body": comment.body,
-                "html_url": comment.html_url,
-                "user": {"login": comment.author},
-                "review_id": comment.review_id,
-                "commit_id": comment.commit_id,
-                "in_reply_to_id": comment.in_reply_to_id,
-            }
-            for comment in comments
-        ]
         prior_reviews = [
             {
                 "id": review.id,
@@ -1374,6 +1441,7 @@ def _build_prepare_pr_review(bindings: ToolBindings) -> HostTool[Any, Any]:
             "delta_diff": delta_diff,
             "delta_anchors": delta_anchors,
             "prior_review_comments": prior_review_comments,
+            "review_threads": [_pr_review_thread_evidence(thread) for thread in review_threads],
             "prior_reviews": prior_reviews,
             "pr_conversation_comments": pr_conversation_comments,
             "reviewer_prior_review_bodies": reviewer_prior_review_bodies,
@@ -1777,7 +1845,16 @@ def _build_validate_pr_review(bindings: ToolBindings) -> HostTool[Any, Any]:
         validated_path = paths.validated
         verify_status_path = paths.verify_status
         gate = _pr_review_run_gate(bindings, helper, args)
-        _write_control_json(bindings, findings_path, {"findings": findings})
+        prior_external_dispositions = args.get("prior_external_dispositions") or []
+        if not isinstance(prior_external_dispositions, list):
+            msg = "validate_pr_review prior_external_dispositions must be an array."
+            _audit(bindings, "validate_pr_review", args, error=msg)
+            _raise_command(msg)
+        _write_control_json(
+            bindings,
+            findings_path,
+            {"findings": findings, "prior_external_dispositions": prior_external_dispositions},
+        )
         timeout = bindings.settings.request_timeout_seconds if bindings.settings is not None else None
         try:
             run_pr_review_helper(
@@ -1888,6 +1965,24 @@ def _build_validate_pr_review(bindings: ToolBindings) -> HostTool[Any, Any]:
                         "status values; failed/error entries block clean PR review verdicts."
                     ),
                     "additionalProperties": True,
+                },
+                "prior_external_dispositions": {
+                    "type": "array",
+                    "description": "Required for clean verdicts when unresolved external inline findings exist on the current head.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "comment_id": {"type": "integer"},
+                            "thread_id": {"type": "string"},
+                            "disposition": {
+                                "type": "string",
+                                "enum": ["resolved", "obsolete", "duplicate", "false_positive", "not_applicable"],
+                            },
+                            "rationale": {"type": "string"},
+                        },
+                        "required": ["disposition", "rationale"],
+                        "additionalProperties": False,
+                    },
                 }
             },
             "required": ["findings"],
@@ -2316,6 +2411,7 @@ _PR_REVIEW_FAILED_VERIFICATION_BODY_MARKERS = (
 _PR_REVIEW_FAILED_STATES = {"fail", "failed", "failure", "error", "errored", "cancelled", "timed_out", "timeout"}
 _PR_REVIEW_BLOCKING_SEVERITIES = {"critical", "required", "blocking", "blocker"}
 _PR_REVIEW_OPTIONAL_SEVERITIES = {"optional", "advisory", "minor", "nit", "nits"}
+_PR_REVIEW_PRIOR_EXTERNAL_DISPOSITIONS = {"resolved", "obsolete", "duplicate", "false_positive", "not_applicable"}
 
 
 def _pr_review_is_clean_verdict(event: str, body: str, recommendation: Mapping[str, Any]) -> bool:
@@ -2359,6 +2455,8 @@ def _pr_review_prior_external_current_head_comments(evidence: Mapping[str, Any])
     for item in comments:
         if not isinstance(item, Mapping):
             continue
+        if item.get("thread_is_resolved") is True or item.get("thread_is_outdated") is True or item.get("is_outdated") is True:
+            continue
         user = item.get("user")
         author = str(user.get("login") if isinstance(user, Mapping) else "").lower()
         if reviewer_login and author == reviewer_login:
@@ -2369,6 +2467,41 @@ def _pr_review_prior_external_current_head_comments(evidence: Mapping[str, Any])
         out.append(item)
     return out
 
+
+def _pr_review_prior_disposition_map(paths: PrReviewPaths) -> dict[tuple[str, str], Mapping[str, Any]]:
+    findings_data = _pr_review_load_mapping(paths.findings)
+    raw = findings_data.get("prior_external_dispositions")
+    out: dict[tuple[str, str], Mapping[str, Any]] = {}
+    if not isinstance(raw, list):
+        return out
+    for item in raw:
+        if not isinstance(item, Mapping):
+            continue
+        disposition = str(item.get("disposition") or "")
+        rationale = str(item.get("rationale") or "").strip()
+        if disposition not in _PR_REVIEW_PRIOR_EXTERNAL_DISPOSITIONS or not rationale:
+            continue
+        comment_id = item.get("comment_id")
+        if isinstance(comment_id, int):
+            out[("comment", str(comment_id))] = item
+        thread_id = item.get("thread_id")
+        if isinstance(thread_id, str) and thread_id:
+            out[("thread", thread_id)] = item
+    return out
+
+
+def _pr_review_missing_prior_dispositions(paths: PrReviewPaths, prior_external: Sequence[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
+    dispositions = _pr_review_prior_disposition_map(paths)
+    missing: list[Mapping[str, Any]] = []
+    for item in prior_external:
+        comment_id = item.get("id")
+        thread_id = item.get("thread_id")
+        if isinstance(comment_id, int) and ("comment", str(comment_id)) in dispositions:
+            continue
+        if isinstance(thread_id, str) and thread_id and ("thread", thread_id) in dispositions:
+            continue
+        missing.append(item)
+    return missing
 
 def _pr_review_recommendation_count_errors(paths: PrReviewPaths, recommendation: Mapping[str, Any]) -> list[str]:
     findings_data = _pr_review_load_mapping(paths.findings)
@@ -2418,8 +2551,9 @@ def _pr_review_clean_invariant_errors(paths: PrReviewPaths, *, event: str, body:
             errors.append("local verification failed")
     evidence = _pr_review_load_mapping(paths.evidence)
     prior_external = _pr_review_prior_external_current_head_comments(evidence)
-    if prior_external:
-        errors.append(f"{len(prior_external)} prior external inline review comment(s) on the current head")
+    missing_dispositions = _pr_review_missing_prior_dispositions(paths, prior_external)
+    if missing_dispositions:
+        errors.append(f"{len(missing_dispositions)} unresolved external inline review comment(s) lack explicit disposition")
     errors.extend(_pr_review_recommendation_count_errors(paths, recommendation))
     return errors
 

@@ -119,6 +119,35 @@ def collect_pr_review_sessions(db: Database, *, since: str, until: str, limit: i
     return out
 
 
+def collect_pr_review_missed_gaps(db: Database, *, since: str, until: str, limit: int) -> list[dict[str, Any]]:
+    rows = db.list_pr_review_gap_events_for_self_improvement(since=since, until=until, limit=limit)
+    return [
+        {
+            "gap_id": row.gap_id,
+            "repo": row.repo,
+            "pr_number": row.pr_number,
+            "head_sha": row.head_sha,
+            "event_delivery_id": row.event_delivery_id,
+            "source_object_kind": row.source_object_kind,
+            "source_object_id": row.source_object_id,
+            "actor_login": row.actor_login,
+            "path": row.path,
+            "line": row.line,
+            "start_line": row.start_line,
+            "body": (row.body or "")[:2000],
+            "body_hash": row.body_hash,
+            "severity_hint": row.severity_hint,
+            "thread_id": row.thread_id,
+            "confidence": row.confidence,
+            "reason": row.reason,
+            "created_at": row.created_at,
+            "observed_at": row.observed_at,
+        }
+        for row in rows
+    ]
+
+
+
 def build_self_improvement_prompt(packet: Mapping[str, Any]) -> str:
     template = resources.files("robomp.prompts").joinpath("pr_review_self_improvement.md").read_text(encoding="utf-8")
     return template + json.dumps(packet, separators=(",", ":"))
@@ -295,7 +324,13 @@ class PrReviewSelfImprovementScheduler:
         repo_root: Path,
     ) -> tuple[dict[str, Any], list[dict[str, Any]]] | None:
         sessions = collect_pr_review_sessions(self._db, since=since, until=until, limit=self._settings.pr_review_self_improve_max_sessions)
-        packet = {"run_id": run_id, "reviews": reviews, "sessions": sessions}
+        missed_gaps = collect_pr_review_missed_gaps(
+            self._db,
+            since=since,
+            until=until,
+            limit=self._settings.pr_review_self_improve_max_sessions,
+        )
+        packet = {"run_id": run_id, "reviews": reviews, "sessions": sessions, "missed_by_agent_gaps": missed_gaps}
         prompt = build_self_improvement_prompt(packet)
         try:
             with self._rpc_client_factory(executable=self._settings.omp_command, cwd=repo_root, session_dir=run_dir, env={"ROBOMP_SELF_IMPROVE": "1"}, no_session=True, no_skills=False, no_rules=False, no_title=True, model=self._settings.pr_review_self_improve_model or self._settings.pick_model(), provider=self._settings.provider, thinking=self._settings.thinking_level if self._settings.thinking_level != "off" else None, custom_tools=[], request_timeout=self._settings.request_timeout_seconds, startup_timeout=60.0) as client:

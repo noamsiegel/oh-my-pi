@@ -808,6 +808,43 @@ def test_pr_review_gap_event_dedupes_and_lists(db: Database) -> None:
     assert rows[0].body_hash
 
 
+def test_pr_review_gap_events_for_self_improvement_filters_missed_by_agent(db: Database) -> None:
+    assert db.record_pr_review_gap_event(
+        gap_kind="missed_by_agent",
+        repo="octo/widget",
+        pr_number=12,
+        head_sha="abc",
+        source_label="human",
+        source_object_kind="review_comment",
+        source_object_id="100",
+        severity_hint="required",
+        confidence=0.8,
+        reason="human signal",
+        created_at="2026-01-02T00:00:00.000000Z",
+    )
+    assert db.record_pr_review_gap_event(
+        gap_kind="merged_with_unaddressed_required",
+        repo="octo/widget",
+        pr_number=12,
+        head_sha="abc",
+        source_label="agent",
+        source_object_kind="pull_request",
+        source_object_id="12",
+        severity_hint="required",
+        confidence=1.0,
+        reason="merge signal",
+        created_at="2026-01-03T00:00:00.000000Z",
+    )
+    rows = db.list_pr_review_gap_events_for_self_improvement(
+        since="2026-01-01T00:00:00.000000Z",
+        until="2026-01-04T00:00:00.000000Z",
+        limit=10,
+    )
+    assert len(rows) == 1
+    assert rows[0].gap_kind == "missed_by_agent"
+    assert rows[0].source_object_id == "100"
+
+
 def test_pr_review_merged_with_unaddressed_required_gap(db: Database) -> None:
     assert db.record_pr_review_gap_event(
         gap_kind="merged_with_unaddressed_required",

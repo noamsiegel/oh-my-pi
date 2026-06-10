@@ -12,6 +12,7 @@ Fully autonomous rules:
 
 Return only JSON with schema_version=1, overall one of clean|changed|failed, summary, recommendations[], files_changed[], quality_gates[], commit_message, pushed.
 Each recommendation must have severity critical|required|optional, category streamline|durability|bug|policy|delegation|prompt|tooling|learning, title, summary, evidence[], proposed_change, and verification.
-Evidence items must cite session issue_key plus artifact path or transcript event id. Do not include secrets or raw long transcript text.
+Evidence items must cite session issue_key plus artifact path/transcript event id, or missed_by_agent gap_id/event_delivery_id/path. Do not include secrets or raw long transcript text.
 
 Evidence packet:
+- `missed_by_agent_gaps` contains external reviewer findings that arrived after our review and did not match any posted RoboMP finding. Treat these as first-class regression evidence.

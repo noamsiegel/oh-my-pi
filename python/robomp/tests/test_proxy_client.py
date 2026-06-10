@@ -29,6 +29,7 @@ from robomp.github_types import (
     ReactionInfo,
     RepoInfo,
     ReviewCommentInfo,
+    ReviewThreadInfo,
 )
 from robomp.proxy.server import create_proxy_app
 from robomp.proxy_client import GitHubProxyClient, ProxyGitTransport
@@ -325,6 +326,51 @@ def round_trip_app(proxy_settings: ProxySettings):
                     }
                 ],
             )
+        if path == "/graphql":
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "repository": {
+                            "pullRequest": {
+                                "reviewThreads": {
+                                    "pageInfo": {"hasNextPage": False, "endCursor": None},
+                                    "nodes": [
+                                        {
+                                            "id": "thread-1",
+                                            "isResolved": False,
+                                            "isOutdated": False,
+                                            "resolvedBy": None,
+                                            "comments": {
+                                                "nodes": [
+                                                    {
+                                                        "databaseId": 11,
+                                                        "author": {"login": "rev"},
+                                                        "body": "thread finding",
+                                                        "path": "a.py",
+                                                        "line": 7,
+                                                        "originalLine": 7,
+                                                        "startLine": None,
+                                                        "originalStartLine": None,
+                                                        "url": "https://github.test/c/11",
+                                                        "diffHunk": "@@",
+                                                        "outdated": False,
+                                                        "state": "SUBMITTED",
+                                                        "replyTo": None,
+                                                        "commit": {"oid": "ghi"},
+                                                        "pullRequestReview": {"databaseId": 12},
+                                                        "createdAt": "2026-01-01T00:00:00Z",
+                                                    }
+                                                ]
+                                            },
+                                        }
+                                    ],
+                                }
+                            }
+                        }
+                    }
+                },
+            )
         if path == "/repos/octo/widget/pulls/2/reviews/12/comments":
             return httpx.Response(
                 200,
@@ -459,6 +505,10 @@ async def test_round_trip_all_endpoints(round_trip_app) -> None:
     assert review_rcs[0].review_id == 12
     assert review_rcs[0].commit_id == "def"
     assert review_rcs[0].in_reply_to_id == 9
+    threads = await client.list_review_threads("octo/widget", 2)
+    assert len(threads) == 1 and isinstance(threads[0], ReviewThreadInfo)
+    assert threads[0].comments[0].commit_id == "ghi"
+
 
 
     prs = await client.list_pr_reviews("octo/widget", 2)

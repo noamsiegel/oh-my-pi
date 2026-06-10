@@ -110,7 +110,7 @@ For each concrete finding, add it to a candidate findings array. Include a struc
 block clean verdicts.
 
 ```
-validate_pr_review(findings=[{"path":"src/foo.ts","line":42,"body":"...","severity":"required","intent":"required_change","suggestion":{"kind":"github_suggestion","replacement":"exact replacement lines"}}], verification={"checks":[{"name":"targeted tests","status":"passed","command":"..."}]})
+validate_pr_review(findings=[{"path":"src/foo.ts","line":42,"body":"...","severity":"required","intent":"required_change","suggestion":{"kind":"github_suggestion","replacement":"exact replacement lines"}}], verification={"checks":[{"name":"targeted tests","status":"passed","command":"..."}]}, prior_external_dispositions=[{"comment_id":123,"disposition":"resolved","rationale":"current diff removed the bad path"}])
 ```
 
 - `line` is the line in the diff you're commenting on. Critical/required findings require a
@@ -126,6 +126,9 @@ validate_pr_review(findings=[{"path":"src/foo.ts","line":42,"body":"...","severi
 - If the diff introduces normalized/resolved identifiers, polymorphic foreign keys, aggregate
   counts, public response fields, or links, trace every downstream use of the raw value. Search
   for remaining raw IDs in payload/count/link paths and test mixed old/new-key scenarios.
+- Before any clean verdict, give every unresolved current-head external inline comment a
+  `prior_external_dispositions` entry: `resolved`, `obsolete`, `duplicate`, `false_positive`,
+  or `not_applicable`, with a concrete rationale.
 - After `validate_pr_review`, drop or revise invalid anchors and likely duplicates,
   then rerun `validate_pr_review`.
 - Do not call `pr_review_comment` after successful `prepare_pr_review`; `submit_pr_review`

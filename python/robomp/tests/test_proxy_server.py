@@ -446,6 +446,69 @@ async def test_list_review_comments(proxy_settings: ProxySettings) -> None:
     assert items[0]["line"] == 5
 
 
+
+async def test_list_review_threads(proxy_settings: ProxySettings) -> None:
+    def gh(req: httpx.Request) -> httpx.Response:
+        assert req.url.path == "/graphql"
+        return httpx.Response(
+            200,
+            json={
+                "data": {
+                    "repository": {
+                        "pullRequest": {
+                            "reviewThreads": {
+                                "pageInfo": {"hasNextPage": False, "endCursor": None},
+                                "nodes": [
+                                    {
+                                        "id": "thread-1",
+                                        "isResolved": True,
+                                        "isOutdated": False,
+                                        "resolvedBy": {"login": "maintainer"},
+                                        "comments": {
+                                            "nodes": [
+                                                {
+                                                    "databaseId": 9,
+                                                    "author": {"login": "rev"},
+                                                    "body": "nit",
+                                                    "path": "a.py",
+                                                    "line": 5,
+                                                    "originalLine": 5,
+                                                    "startLine": None,
+                                                    "originalStartLine": None,
+                                                    "url": "u",
+                                                    "diffHunk": "@@",
+                                                    "outdated": False,
+                                                    "state": "SUBMITTED",
+                                                    "replyTo": None,
+                                                    "commit": {"oid": "abc"},
+                                                    "pullRequestReview": {"databaseId": 44},
+                                                    "createdAt": "2026-01-01T00:00:00Z",
+                                                }
+                                            ]
+                                        },
+                                    }
+                                ],
+                            }
+                        }
+                    }
+                }
+            },
+        )
+
+    app = _build_app(proxy_settings, gh)
+    async with await _async_client(app) as client:
+        resp = await client.get(
+            "/gh/v1/review_threads",
+            params={"repo": "octo/widget", "pr_number": 1},
+            headers=_signed("GET", "/gh/v1/review_threads", params={"repo": "octo/widget", "pr_number": 1}),
+        )
+    assert resp.status_code == 200
+    items = resp.json()["items"]
+    assert items[0]["is_resolved"] is True
+    assert items[0]["resolved_by"] == "maintainer"
+    assert items[0]["comments"][0]["review_id"] == 44
+
+
 async def test_list_review_comments_for_review(proxy_settings: ProxySettings) -> None:
     def gh(req: httpx.Request) -> httpx.Response:
         assert req.url.path == "/repos/octo/widget/pulls/1/reviews/44/comments"

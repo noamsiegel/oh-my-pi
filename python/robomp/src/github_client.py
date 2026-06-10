@@ -26,6 +26,8 @@ from robomp.github_types import (
     ReactionInfo,
     RepoInfo,
     ReviewCommentInfo,
+    ReviewThreadCommentInfo,
+    ReviewThreadInfo,
 )
 
 log = logging.getLogger(__name__)
@@ -138,6 +140,25 @@ class GitHubClient:
     ) -> Any:
         resp = await self._async_client().request(method, path, json=json, params=params)
         return self._check(resp)
+
+    async def _graphql(self, query: str, variables: Mapping[str, Any]) -> Mapping[str, Any]:
+        data = await self.request("POST", "/graphql", json={"query": query, "variables": dict(variables)})
+        if not isinstance(data, Mapping):
+            raise GitHubError(502, "GitHub GraphQL returned malformed payload")
+        errors = data.get("errors")
+        if isinstance(errors, list) and errors:
+            messages = []
+            for error in errors:
+                if isinstance(error, Mapping):
+                    messages.append(str(error.get("message") or error))
+                else:
+                    messages.append(str(error))
+            raise GitHubError(502, "; ".join(messages))
+        payload = data.get("data")
+        if not isinstance(payload, Mapping):
+            raise GitHubError(502, "GitHub GraphQL returned no data")
+        return payload
+
 
     async def _paginate(self, path: str, params: Mapping[str, Any] | None = None) -> list[Any]:
         items: list[Any] = []
@@ -303,6 +324,60 @@ class GitHubClient:
         )
         return [_review_comment_from_payload(item) for item in (data or [])]
 
+    async def list_review_threads(self, repo: str, pr_number: int) -> list[ReviewThreadInfo]:
+        owner, name = repo.split("/", 1)
+        threads: list[ReviewThreadInfo] = []
+        cursor: str | None = None
+        query = """
+        query($owner:String!, $name:String!, $number:Int!, $cursor:String) {
+          repository(owner:$owner, name:$name) {
+            pullRequest(number:$number) {
+              reviewThreads(first:100, after:$cursor) {
+                pageInfo { hasNextPage endCursor }
+                nodes {
+                  id
+                  isResolved
+                  isOutdated
+                  resolvedBy { login }
+                  comments(first:100) {
+                    nodes {
+                      databaseId
+                      author { login }
+                      body
+                      path
+                      line
+                      originalLine
+                      startLine
+                      originalStartLine
+                      url
+                      diffHunk
+                      outdated
+                      state
+                      replyTo { databaseId }
+                      commit { oid }
+                      pullRequestReview { databaseId }
+                      createdAt
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+        """
+        while True:
+            payload = await self._graphql(query, {"owner": owner, "name": name, "number": pr_number, "cursor": cursor})
+            connection = (((payload.get("repository") or {}).get("pullRequest") or {}).get("reviewThreads") or {})
+            nodes = connection.get("nodes") if isinstance(connection, Mapping) else None
+            if isinstance(nodes, list):
+                for node in nodes:
+                    if isinstance(node, Mapping):
+                        threads.append(_review_thread_from_graphql(node))
+            page_info = connection.get("pageInfo") if isinstance(connection, Mapping) else None
+            if not isinstance(page_info, Mapping) or not page_info.get("hasNextPage"):
+                return threads
+            cursor = str(page_info.get("endCursor") or "")
+
     async def list_pr_reviews(self, repo: str, pr_number: int) -> list[PullRequestReviewInfo]:
         """List top-level reviews on a PR. Empty-body reviews are skipped — they
         carry no novel text beyond what the inline comments + merge state convey."""
@@ -435,6 +510,56 @@ class GitHubClient:
         data = await self.request("GET", "/user")
         return str(data["login"])
 
+
+
+def _review_thread_comment_from_graphql(item: Mapping[str, Any], *, thread_is_outdated: bool) -> ReviewThreadCommentInfo:
+    author = item.get("author") or {}
+    reply_to = item.get("replyTo") or {}
+    commit = item.get("commit") or {}
+    review = item.get("pullRequestReview") or {}
+    line = item.get("line")
+    original_line = item.get("originalLine")
+    start_line = item.get("startLine")
+    original_start_line = item.get("originalStartLine")
+    review_id = review.get("databaseId") if isinstance(review, Mapping) else None
+    in_reply_to_id = reply_to.get("databaseId") if isinstance(reply_to, Mapping) else None
+    return ReviewThreadCommentInfo(
+        id=int(item.get("databaseId") or 0),
+        author=str(author.get("login") or "") if isinstance(author, Mapping) else "",
+        body=str(item.get("body") or ""),
+        path=str(item.get("path") or ""),
+        line=line if isinstance(line, int) else None,
+        created_at=str(item.get("createdAt") or ""),
+        start_line=start_line if isinstance(start_line, int) else None,
+        original_line=original_line if isinstance(original_line, int) else None,
+        original_start_line=original_start_line if isinstance(original_start_line, int) else None,
+        html_url=str(item.get("url") or ""),
+        review_id=review_id if isinstance(review_id, int) else None,
+        commit_id=str(commit.get("oid") or "") if isinstance(commit, Mapping) else "",
+        diff_hunk=str(item.get("diffHunk") or ""),
+        in_reply_to_id=in_reply_to_id if isinstance(in_reply_to_id, int) else None,
+        is_outdated=bool(item.get("outdated") or thread_is_outdated),
+        state=str(item.get("state") or ""),
+    )
+
+
+def _review_thread_from_graphql(data: Mapping[str, Any]) -> ReviewThreadInfo:
+    resolved_by = data.get("resolvedBy") or {}
+    comments_connection = data.get("comments") or {}
+    raw_comments = comments_connection.get("nodes") if isinstance(comments_connection, Mapping) else None
+    is_outdated = bool(data.get("isOutdated"))
+    comments = tuple(
+        _review_thread_comment_from_graphql(comment, thread_is_outdated=is_outdated)
+        for comment in (raw_comments if isinstance(raw_comments, list) else [])
+        if isinstance(comment, Mapping)
+    )
+    return ReviewThreadInfo(
+        id=str(data.get("id") or ""),
+        is_resolved=bool(data.get("isResolved")),
+        is_outdated=is_outdated,
+        resolved_by=str(resolved_by.get("login") or "") if isinstance(resolved_by, Mapping) else "",
+        comments=comments,
+    )
 
 def _review_comment_from_payload(item: Mapping[str, Any]) -> ReviewCommentInfo:
     user = item.get("user") or {}

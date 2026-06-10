@@ -23,6 +23,7 @@ from robomp.github_types import (
     ReactionInfo,
     RepoInfo,
     ReviewCommentInfo,
+    ReviewThreadInfo,
 )
 
 
@@ -57,6 +58,8 @@ class GitHubBackend(Protocol):
     async def list_review_comments(self, repo: str, pr_number: int) -> list[ReviewCommentInfo]: ...
 
     async def list_review_comments_for_review(self, repo: str, pr_number: int, review_id: int) -> list[ReviewCommentInfo]: ...
+    async def list_review_threads(self, repo: str, pr_number: int) -> list[ReviewThreadInfo]: ...
+
 
     async def list_pr_reviews(self, repo: str, pr_number: int) -> list[PullRequestReviewInfo]: ...
 

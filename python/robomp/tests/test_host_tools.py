@@ -26,6 +26,8 @@ from robomp.github_types import (
     PullRequestReviewInfo,
     RepoInfo,
     ReviewCommentInfo,
+    ReviewThreadCommentInfo,
+    ReviewThreadInfo,
 )
 from robomp.host_tools import AbortController, ToolBindings, build
 from robomp.pr_review_tools import PrReviewPaths, pr_review_paths, run_pr_review_helper, save_json_checked
@@ -1267,12 +1269,74 @@ def test_submit_pr_review_refuses_clean_with_current_head_external_inline_commen
     bindings = replace(bindings, settings=Settings.model_construct(pr_review_terminal_events=True, pr_review_helper=helper))
     try:
         submit_tool = next(x for x in build(bindings) if x.name == "submit_pr_review")
-        with pytest.raises(RpcCommandError, match="prior external inline review comment"):
+        with pytest.raises(RpcCommandError, match="lack explicit disposition"):
             submit_tool.execute({"body": "Clean review: no findings.", "event": "COMMENT"}, _ctx())
     finally:
         _stop_loop(loop, t)
 
     assert called is False
+
+
+def test_submit_pr_review_allows_clean_with_prior_external_disposition(db: Database, tmp_path: Path) -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path.endswith("/reviews"):
+            captured["body"] = json.loads(request.content)
+            return httpx.Response(
+                200,
+                json={"id": 50, "user": {"login": "robomp-bot"}, "body": captured["body"]["body"], "state": "COMMENTED"},
+            )
+        if request.method == "GET" and request.url.path.endswith("/reviews/50/comments"):
+            return httpx.Response(200, json=[])
+        return httpx.Response(404, json={"message": "unrouted"})
+
+    bindings, loop, t = _review_bindings(db, tmp_path, httpx.MockTransport(handler))
+    helper = tmp_path / "pr-review-helper.js"
+    _seed_pr_review_payload_state(
+        bindings,
+        helper,
+        recommendation_event="COMMENT",
+        blocking_count=0,
+        optional_count=0,
+        recommendation_reason="informational",
+        findings=[],
+        evidence={
+            "head_sha": "payload-sha",
+            "reviewer_login": "noamsiegel",
+            "prior_review_comments": [
+                {
+                    "id": 3384770503,
+                    "thread_id": "thread-1",
+                    "path": "apps/hoa/api/admin_api/viewsets/customer_tasks.py",
+                    "line": 479,
+                    "body": "task_id contract can drift",
+                    "user": {"login": "mainstay-claude[bot]"},
+                    "commit_id": "payload-sha",
+                    "thread_is_resolved": False,
+                    "thread_is_outdated": False,
+                }
+            ],
+        },
+    )
+    save_json_checked(
+        pr_review_paths(bindings.workspace).findings,
+        {
+            "findings": [],
+            "prior_external_dispositions": [
+                {"comment_id": 3384770503, "disposition": "resolved", "rationale": "fixed by current patch"}
+            ],
+        },
+    )
+    bindings = replace(bindings, settings=Settings.model_construct(pr_review_terminal_events=True, pr_review_helper=helper))
+    try:
+        submit_tool = next(x for x in build(bindings) if x.name == "submit_pr_review")
+        submit_tool.execute({"body": "Clean review: no findings.", "event": "COMMENT"}, _ctx())
+    finally:
+        _stop_loop(loop, t)
+
+    assert captured["body"]["event"] == "COMMENT"
+
 
 
 def test_submit_pr_review_refuses_clean_when_local_verification_failed(db: Database, tmp_path: Path) -> None:
@@ -1652,8 +1716,17 @@ def test_prepare_pr_review_writes_evidence_and_returns_classification(
     async def _list_pr_reviews(repo_full: str, number: int):
         return [PullRequestReviewInfo(1, "reviewer", "body", "COMMENTED", "t", commit_id="old")]
 
-    async def _list_review_comments(repo_full: str, number: int):
-        return [ReviewCommentInfo(2, "reviewer", "finding", "src/app.py", 12, "t")]
+    async def _list_review_threads(repo_full: str, number: int):
+        return [
+            ReviewThreadInfo(
+                "thread-1",
+                is_resolved=False,
+                is_outdated=False,
+                comments=(
+                    ReviewThreadCommentInfo(2, "reviewer", "finding", "src/app.py", 12, "t", commit_id="abc"),
+                ),
+            )
+        ]
 
     async def _list_pr_commits(repo_full: str, number: int):
         return [
@@ -1678,7 +1751,7 @@ def test_prepare_pr_review_writes_evidence_and_returns_classification(
     monkeypatch.setattr(bindings.github, "get_pull_request", _get_pull_request)
     monkeypatch.setattr(bindings.github, "list_pr_files", _list_pr_files)
     monkeypatch.setattr(bindings.github, "list_pr_reviews", _list_pr_reviews)
-    monkeypatch.setattr(bindings.github, "list_review_comments", _list_review_comments)
+    monkeypatch.setattr(bindings.github, "list_review_threads", _list_review_threads)
     monkeypatch.setattr(bindings.github, "list_pr_commits", _list_pr_commits)
     monkeypatch.setattr(bindings.github, "get_authenticated_login", _get_authenticated_login)
     monkeypatch.setattr(bindings.github, "list_comments", _list_comments)
@@ -1696,6 +1769,8 @@ def test_prepare_pr_review_writes_evidence_and_returns_classification(
     assert evidence["view"]["commits"][0]["oid"] == "abc"
     assert evidence["mode"] == "fresh"
     assert evidence["anchors"][0]["validRightLines"] == [10, 11]
+    assert evidence["review_threads"][0]["id"] == "thread-1"
+    assert evidence["prior_review_comments"][0]["thread_is_resolved"] is False
     assert "risk_level: medium" in result
     assert "reviewability.status: reviewable" in result
 

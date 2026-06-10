@@ -1756,6 +1756,29 @@ class Database:
             ).fetchall()
         return [_gap_event_from_row(row) for row in rows]
 
+    def list_pr_review_gap_events_for_self_improvement(
+        self,
+        *,
+        since: str,
+        until: str,
+        limit: int,
+        gap_kind: str = "missed_by_agent",
+    ) -> list[PrReviewGapEvent]:
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT *
+                FROM pr_review_gap_events
+                WHERE gap_kind=?
+                  AND created_at >= ?
+                  AND created_at <= ?
+                ORDER BY created_at DESC, gap_id DESC
+                LIMIT ?
+                """,
+                (gap_kind, since, until, limit),
+            ).fetchall()
+        return [_gap_event_from_row(row) for row in rows]
+
     def record_pr_review_completed_review(
         self, *, issue_key: str, repo: str, pr_number: int, head_sha: str | None,
         github_review_id: int | None, event: str,
