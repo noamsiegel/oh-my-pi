@@ -225,6 +225,16 @@ class GitHubClient:
         data = await self.request("GET", f"/repos/{repo}/pulls/{number}")
         return _pr_from_payload(repo, data)
 
+    async def list_open_pull_requests(self, repo: str, *, limit: int = 30) -> list[PullRequestInfo]:
+        per_page = max(1, min(int(limit), 100))
+        data = await self.request(
+            "GET",
+            f"/repos/{repo}/pulls",
+            params={"state": "open", "per_page": per_page, "sort": "updated", "direction": "desc"},
+        )
+        return [_pr_from_payload(repo, item) for item in data or [] if isinstance(item, Mapping)]
+
+
     async def list_pr_files(self, repo: str, pr_number: int) -> list[PullRequestFileInfo]:
         data = await self._paginate(f"/repos/{repo}/pulls/{pr_number}/files")
         return [_pr_file_from_payload(item) for item in data]
@@ -721,6 +731,12 @@ def _pr_from_payload(repo: str, data: Mapping[str, Any]) -> PullRequestInfo:
     base = data.get("base") or {}
     user = data.get("user") or {}
     head_repo = head.get("repo") if isinstance(head, Mapping) else None
+    labels_raw = data.get("labels") or []
+    labels = tuple(
+        str(item.get("name") or "")
+        for item in labels_raw
+        if isinstance(item, Mapping) and item.get("name")
+    )
     return PullRequestInfo(
         repo=repo,
         number=int(data["number"]),
@@ -735,6 +751,8 @@ def _pr_from_payload(repo: str, data: Mapping[str, Any]) -> PullRequestInfo:
         head_repo=str(head_repo.get("full_name") or "") if isinstance(head_repo, Mapping) else "",
         title=str(data.get("title") or ""),
         body=str(data.get("body") or ""),
+        updated_at=str(data.get("updated_at") or ""),
+        labels=labels,
     )
 
 

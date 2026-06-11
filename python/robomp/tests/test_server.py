@@ -2290,11 +2290,18 @@ async def test_review_pr_skips_after_submitted_review(
         assert number == 900
         return []
 
+    async def _list_pr_files(self, repo_full: str, number: int):
+        assert repo_full == "octo/widget"
+        assert number == 900
+        return []
+
+
 
     monkeypatch.setattr(GitHubClient, "get_repo", _get_repo)
     monkeypatch.setattr(GitHubClient, "get_issue", _get_issue)
     monkeypatch.setattr(GitHubClient, "get_pull_request", _get_pull_request)
     monkeypatch.setattr(GitHubClient, "list_pr_reviews", _list_pr_reviews)
+    monkeypatch.setattr(GitHubClient, "list_pr_files", _list_pr_files)
 
     await tasks.review_pr(
         settings=settings,
@@ -2570,10 +2577,15 @@ async def test_review_pr_latest_approved_old_sha_skips(
     async def _list_pr_reviews(self, repo_full: str, number: int):
         return [review]
 
+    async def _list_pr_files(self, repo_full: str, number: int):
+        return []
+
+
     monkeypatch.setattr(GitHubClient, "get_repo", _get_repo)
     monkeypatch.setattr(GitHubClient, "get_issue", _get_issue)
     monkeypatch.setattr(GitHubClient, "get_pull_request", _get_pull_request)
     monkeypatch.setattr(GitHubClient, "list_pr_reviews", _list_pr_reviews)
+    monkeypatch.setattr(GitHubClient, "list_pr_files", _list_pr_files)
 
     await tasks.review_pr(
         settings=settings,
@@ -2782,7 +2794,7 @@ async def test_handle_comment_directive_reopens_finalized_issue(
     call = stub_run_task[0]
     assert call["task_kind"] == "handle_comment"
     assert call["directive"].body == "redo the fix"
-    assert sandbox.remove_calls == [("octo/widget", 88)]
+    assert sandbox.remove_calls == [("octo/widget", 88, None)]
     assert sandbox.ensure_calls
     # Reopen branches afresh (no existing_branch passed).
     assert sandbox.ensure_calls[0]["existing_branch"] is None
@@ -3607,7 +3619,7 @@ async def test_cleanup_workspace_issue_closed_removes_workspace(
     # Assert workspace removed
     assert len(sandbox.remove_calls) == 1
     remove_call = sandbox.remove_calls[0]
-    assert remove_call == ("octo/widget", 42)
+    assert remove_call == ("octo/widget", 42, None)
     # Assert issue state set to closed
     row = db.get_issue("octo/widget#42")
     assert row is not None
@@ -3644,7 +3656,7 @@ async def test_cleanup_workspace_pr_closed_mapped_origin_sets_closed(
     # Assert workspace removed for mapped issue
     assert len(sandbox.remove_calls) == 1
     remove_call = sandbox.remove_calls[0]
-    assert remove_call == ("octo/widget", 42)
+    assert remove_call == ("octo/widget", 42, None)
     # Assert issue state set to closed
     row = db.get_issue("octo/widget#42")
     assert row is not None
@@ -3681,7 +3693,7 @@ async def test_cleanup_workspace_pr_merged_mapped_origin_sets_merged(
     # Assert workspace removed for mapped issue
     assert len(sandbox.remove_calls) == 1
     remove_call = sandbox.remove_calls[0]
-    assert remove_call == ("octo/widget", 42)
+    assert remove_call == ("octo/widget", 42, None)
     # Assert issue state set to merged
     row = db.get_issue("octo/widget#42")
     assert row is not None

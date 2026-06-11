@@ -31,6 +31,7 @@ concrete files, lines, symbols, and failure modes. No speculative or duplicate c
 Critical/required `required_change` findings on a valid diff line should include
 `suggestion: {kind: "github_suggestion", replacement: "..."}` when the replacement is
 exact, contiguous, and safe to accept, so GitHub renders an “Accept suggestion” button.
+Exact accepted suggestions are eligible for an automated verify-fixes fast path, so prefer suggestions over prose for simple local replacements.
 For required local code fixes, prefer GitHub suggested changes; prose-only required findings must carry an allowed no_suggestion_reason and should be fewer than suggestions.
 Do not force suggestions for questions, design concerns, missing tests, generated code,
 migrations, multi-file fixes, or broader refactors.

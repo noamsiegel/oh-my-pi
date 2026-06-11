@@ -22,6 +22,7 @@ from robomp.db import Database, get_database
 from robomp.github_backend import GitHubBackend
 from robomp.natives_cache import NativesCache
 from robomp.pr_review_self_improver import PrReviewSelfImprovementScheduler
+from robomp.pr_review_reconciler import PrReviewLabelReconciler
 from robomp.proxy_client import GitHubProxyClient, ProxyGitTransport
 from robomp.queue import WorkerPool
 from robomp.routers import dashboard, operator, webhook
@@ -65,6 +66,7 @@ class AppServices:
     autoclose: Any
     self_improver: PrReviewSelfImprovementScheduler | None
     issue_cache: IssueBrowseCache
+    pr_review_reconciler: PrReviewLabelReconciler | None = None
 
 
 def _require_proxy_mode(cfg: OrchestratorSettings) -> tuple[str, bytes]:
@@ -100,8 +102,23 @@ def _build_services(settings: OrchestratorSettings) -> AppServices:
         natives_cache=natives_cache,
     )
     pool = WorkerPool(settings=settings, db=db, github=github, sandbox=sandbox, git_transport=git_transport)
-    self_improver = PrReviewSelfImprovementScheduler(settings=settings, db=db)
-    autoclose = AutocloseScheduler(settings=settings, db=db, github=github)
+    self_improver = (
+        PrReviewSelfImprovementScheduler(settings=settings, db=db)
+        if settings.pr_review_self_improve_enabled
+        else None
+    )
+    pr_review_reconciler: PrReviewLabelReconciler | None = None
+    if settings.pr_review_enabled and settings.pr_review_reconciler_enabled:
+        pr_review_reconciler = PrReviewLabelReconciler(
+            db=db,
+            github=github,
+            pool=pool,
+            repos=settings.repo_allowlist,
+            label_allowlist=settings.pr_review_label_allowlist,
+            bot_login=settings.bot_login,
+            interval_seconds=settings.pr_review_reconciler_interval_seconds,
+            limit_per_repo=settings.pr_review_reconciler_limit_per_repo,
+        )
     return AppServices(
         settings=settings,
         db=db,
@@ -109,8 +126,9 @@ def _build_services(settings: OrchestratorSettings) -> AppServices:
         git_transport=git_transport,
         sandbox=sandbox,
         pool=pool,
-        autoclose=autoclose,
+        autoclose=AutocloseScheduler(settings=settings, db=db, github=github),
         self_improver=self_improver,
+        pr_review_reconciler=pr_review_reconciler,
         issue_cache=IssueBrowseCache(),
     )
 
@@ -128,10 +146,14 @@ def create_app(settings: OrchestratorSettings | None = None) -> FastAPI:
         await services.pool.start()
         if services.self_improver is not None:
             await services.self_improver.start()
+        if services.pr_review_reconciler is not None:
+            await services.pr_review_reconciler.start()
         await services.autoclose.start()
         try:
             yield
         finally:
+            if services.pr_review_reconciler is not None:
+                await services.pr_review_reconciler.stop()
             if services.self_improver is not None:
                 await services.self_improver.stop()
             await services.autoclose.stop()
@@ -159,10 +181,12 @@ def create_app(settings: OrchestratorSettings | None = None) -> FastAPI:
             "log_dir": _log_dir_ready(services.settings.log_dir),
             "worker_pool": services.pool.started,
             "gh_proxy": await _check_gh_proxy_health(services.settings),
+            "sqlite_storage": False,
         }
         try:
             services.db.event_counts_by_state()
             checks["db"] = True
+            checks["sqlite_storage"] = services.db.sqlite_storage_ok()
         except Exception:
             log.warning("database readiness check failed", exc_info=True)
         if all(checks.values()):

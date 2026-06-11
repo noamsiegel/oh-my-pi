@@ -51,6 +51,7 @@ class _FakeGitHub:
         self.list_pr_reviews_called = False
         self.list_pr_files_called = False
         self.posted_comments: list[str] = []
+        self.submitted_reviews: list[dict[str, object]] = []
     async def get_repo(self, repo: str) -> RepoInfo:
         return RepoInfo(full_name=repo, default_branch="main", clone_url="https://example/octo/widget.git", private=False)
 
@@ -100,6 +101,28 @@ class _FakeGitHub:
         self.posted_comments.append(body)
         return CommentInfo(id=1, author="robomp-bot", body=body, created_at=_now_iso())
 
+    async def submit_pr_review(
+        self,
+        *,
+        repo: str,
+        pr_number: int,
+        body: str,
+        event: str,
+        comments: list[object],
+        commit_id: str | None = None,
+    ) -> PullRequestReviewInfo:
+        self.submitted_reviews.append(
+            {"repo": repo, "pr_number": pr_number, "body": body, "event": event, "comments": comments, "commit_id": commit_id}
+        )
+        return PullRequestReviewInfo(
+            id=900 + len(self.submitted_reviews),
+            author="robomp-bot",
+            body=body,
+            state=event,
+            submitted_at=_now_iso(),
+            commit_id=commit_id or "",
+        )
+
 
 class _FakeDb:
     def __init__(self) -> None:
@@ -133,6 +156,12 @@ class _FakeDb:
     def upsert_issue(self, *, key: str, repo: str, number: int, state: str, **kwargs: object) -> None:
         self.issues.append({"key": key, "repo": repo, "number": number, "state": state, **kwargs})
 
+
+    def list_pr_review_posted_findings(self, repo: str, pr_number: int) -> list[object]:
+        return []
+
+    def record_pr_review_completed_review(self, **kwargs: object) -> bool:
+        return True
 
 class _FakeSandbox:
     natives_cache = None
@@ -384,6 +413,170 @@ async def test_review_pr_verify_fixes_focus_handles_missing_commit_id(
     focus = captured["inputs"].pr_review_focus
     assert focus.mode == "verify-fixes"
     assert focus.prior_review_commit_id == ""
+
+
+def _seed_prior_suggestion(db, *, replacement: str | None = "return value;") -> None:
+    finding: dict[str, object] = {
+        "path": "src/app.py",
+        "line": 10,
+        "start_line": 10,
+        "body": "Return the checked value.",
+        "severity": "required",
+        "intent": "required_change",
+    }
+    if replacement is not None:
+        finding["suggestion"] = {"kind": "github_suggestion", "replacement": replacement}
+    db.record_pr_review_posted_findings(
+        issue_key="octo/widget#9",
+        repo="octo/widget",
+        pr_number=9,
+        head_sha=OLD_HEAD_SHA,
+        review_id=100,
+        findings=[finding],
+        posted_comments=[{"id": 456, "path": "src/app.py", "line": 10, "body": "Return the checked value."}],
+    )
+
+
+def _exact_delta(extra: str = "") -> str:
+    return (
+        "diff --git a/src/app.py b/src/app.py\n"
+        "--- a/src/app.py\n"
+        "+++ b/src/app.py\n"
+        "@@ -10,1 +10,1 @@\n"
+        "-return old_value;\n"
+        "+return value;\n"
+        f"{extra}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_review_pr_fast_path_approves_exact_prior_suggestion(
+    settings, db, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings.pr_review_ci_gate_enabled = True
+    settings.pr_review_terminal_events = True
+    _seed_prior_suggestion(db)
+    github = _FakeGitHub(_ci("passed", total=1), reviews=[_bot_review("CHANGES_REQUESTED", OLD_HEAD_SHA)])
+    calls: list[str] = []
+
+    async def _run_task(**kwargs: object) -> None:
+        calls.append(str(kwargs["task_kind"]))
+
+    def _run_git(workspace, cmd, *, timeout):
+        if "rev-parse" in cmd:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        return SimpleNamespace(returncode=0, stdout=_exact_delta(), stderr="")
+
+    monkeypatch.setattr(tasks, "run_task", _run_task)
+    monkeypatch.setattr(tasks, "_run_workspace_git", _run_git)
+
+    outcome = await tasks.review_pr(
+        settings=settings,
+        db=db,
+        github=github,  # type: ignore[arg-type]
+        sandbox=_FakeSandbox(),  # type: ignore[arg-type]
+        git_transport=_FakeGitTransport(),  # type: ignore[arg-type]
+        payload=_payload(),
+        delivery_id="delivery",
+        received_at=_now_iso(),
+    )
+
+    assert outcome is not None
+    assert outcome.state == "done"
+    assert outcome.reason == "accepted prior GitHub suggestions exactly; skipped verify-fixes agent"
+    assert calls == []
+    assert github.posted_comments == []
+    assert len(github.submitted_reviews) == 1
+    assert github.submitted_reviews[0]["event"] == "APPROVE"
+    assert github.submitted_reviews[0]["commit_id"] == HEAD_SHA
+    assert "applied exactly" in str(github.submitted_reviews[0]["body"])
+    assert db.has_completed_pr_review("octo/widget", 9, HEAD_SHA)
+
+
+@pytest.mark.asyncio
+async def test_review_pr_fast_path_falls_back_on_extra_delta(settings, db, monkeypatch: pytest.MonkeyPatch) -> None:
+    settings.pr_review_ci_gate_enabled = True
+    settings.pr_review_terminal_events = True
+    _seed_prior_suggestion(db)
+    github = _FakeGitHub(_ci("passed", total=1), reviews=[_bot_review("CHANGES_REQUESTED", OLD_HEAD_SHA)])
+    captured = {}
+
+    async def _run_task(**kwargs: object) -> None:
+        captured["inputs"] = kwargs["inputs"]
+
+    def _run_git(workspace, cmd, *, timeout):
+        if "rev-parse" in cmd:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        extra = (
+            "diff --git a/src/other.py b/src/other.py\n"
+            "--- a/src/other.py\n"
+            "+++ b/src/other.py\n"
+            "@@ -1,1 +1,1 @@\n"
+            "-old\n"
+            "+new\n"
+        )
+        return SimpleNamespace(returncode=0, stdout=_exact_delta(extra), stderr="")
+
+    monkeypatch.setattr(tasks, "run_task", _run_task)
+    monkeypatch.setattr(tasks, "_run_workspace_git", _run_git)
+
+    outcome = await tasks.review_pr(
+        settings=settings,
+        db=db,
+        github=github,  # type: ignore[arg-type]
+        sandbox=_FakeSandbox(),  # type: ignore[arg-type]
+        git_transport=_FakeGitTransport(),  # type: ignore[arg-type]
+        payload=_payload(),
+        delivery_id="delivery",
+        received_at=_now_iso(),
+    )
+
+    assert outcome is None
+    assert github.submitted_reviews == []
+    assert len(github.posted_comments) == 1
+    assert "verifying fixes" in github.posted_comments[0]
+    assert captured["inputs"].pr_review_focus.mode == "verify-fixes"
+
+
+@pytest.mark.asyncio
+async def test_review_pr_fast_path_comments_when_terminal_events_disabled(
+    settings, db, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings.pr_review_ci_gate_enabled = True
+    settings.pr_review_terminal_events = False
+    _seed_prior_suggestion(db)
+    github = _FakeGitHub(_ci("passed", total=1), reviews=[_bot_review("CHANGES_REQUESTED", OLD_HEAD_SHA)])
+    calls: list[str] = []
+
+    async def _run_task(**kwargs: object) -> None:
+        calls.append(str(kwargs["task_kind"]))
+
+    def _run_git(workspace, cmd, *, timeout):
+        if "rev-parse" in cmd:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        return SimpleNamespace(returncode=0, stdout=_exact_delta(), stderr="")
+
+    monkeypatch.setattr(tasks, "run_task", _run_task)
+    monkeypatch.setattr(tasks, "_run_workspace_git", _run_git)
+
+    outcome = await tasks.review_pr(
+        settings=settings,
+        db=db,
+        github=github,  # type: ignore[arg-type]
+        sandbox=_FakeSandbox(),  # type: ignore[arg-type]
+        git_transport=_FakeGitTransport(),  # type: ignore[arg-type]
+        payload=_payload(),
+        delivery_id="delivery",
+        received_at=_now_iso(),
+    )
+
+    assert outcome is not None
+    assert outcome.state == "done"
+    assert calls == []
+    assert github.posted_comments == []
+    assert github.submitted_reviews[0]["event"] == "COMMENT"
+    assert "non-blocking status comment" in str(github.submitted_reviews[0]["body"])
+    assert db.has_completed_pr_review("octo/widget", 9, HEAD_SHA)
 
 
 @pytest.mark.asyncio

@@ -109,6 +109,7 @@ def _make_inputs(
         repo_dir=repo_dir,
         branch="robomp/issue-1",
         review_head_sha=None,
+        workspace_key="acme__widgets__1",
     )
     repo = SimpleNamespace(full_name="acme/widgets", owner="acme", name="widgets")
     issue = SimpleNamespace(repo="acme/widgets", number=1, title="bug")
@@ -1073,3 +1074,24 @@ def test_capture_natives_cache_records_on_success(
     assert repo == "acme/widgets"
     assert key == "cafef00d"
     assert native_dir == inputs.workspace.repo_dir / "packages" / "natives" / "native"
+
+
+@pytest.mark.asyncio
+async def test_run_task_does_not_wait_forever_for_natives_cache_capture(
+    tmp_path: Path, settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    inputs, _bindings = _make_inputs(tmp_path, settings, session_has_jsonl=False)
+    inputs.natives_cache = object()  # type: ignore[assignment]
+    monkeypatch.setattr(worker, "_build_prompt", lambda *args, **kwargs: "prompt")
+    monkeypatch.setattr(worker, "_NATIVES_CACHE_CAPTURE_TIMEOUT_SECONDS", 0.01)
+
+    def fake_capture(_inputs: worker.TaskInputs) -> None:
+        import time
+
+        time.sleep(0.05)
+
+    monkeypatch.setattr(worker, "_capture_natives_cache", fake_capture)
+
+    result = await worker.run_task(task_kind="triage_issue", inputs=inputs)
+
+    assert result == "ok"

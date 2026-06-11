@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import threading
 from collections.abc import Iterable, Iterator, Mapping, Sequence
@@ -237,6 +238,29 @@ CREATE TABLE IF NOT EXISTS pr_review_completed_reviews (
   submitted_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_pr_completed_reviews_submitted ON pr_review_completed_reviews(submitted_at);
+
+CREATE TABLE IF NOT EXISTS pr_review_reconciler_repo_state (
+  repo TEXT PRIMARY KEY,
+  cursor_updated_at TEXT,
+  scanned_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS pr_review_reconciler_decisions (
+  decision_key TEXT PRIMARY KEY,
+  repo TEXT NOT NULL,
+  pr_number INTEGER NOT NULL,
+  head_sha TEXT NOT NULL,
+  pr_updated_at TEXT,
+  labels_json TEXT NOT NULL,
+  decision TEXT NOT NULL,
+  reason TEXT NOT NULL,
+  event_delivery_id TEXT,
+  observed_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_pr_reconciler_decisions_repo_pr
+  ON pr_review_reconciler_decisions(repo, pr_number, observed_at);
+CREATE INDEX IF NOT EXISTS idx_pr_reconciler_decisions_decision
+  ON pr_review_reconciler_decisions(decision, observed_at);
 
 CREATE TABLE IF NOT EXISTS pr_review_self_improvement_runs (
   run_id TEXT PRIMARY KEY,
@@ -584,6 +608,24 @@ class Database:
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS events_state_available ON events(state, available_at, received_at)"
         )
+        self._conn.execute(
+            "CREATE TABLE IF NOT EXISTS pr_review_reconciler_repo_state ("
+            "repo TEXT PRIMARY KEY, cursor_updated_at TEXT, scanned_at TEXT NOT NULL)"
+        )
+        self._conn.execute(
+            "CREATE TABLE IF NOT EXISTS pr_review_reconciler_decisions ("
+            "decision_key TEXT PRIMARY KEY, repo TEXT NOT NULL, pr_number INTEGER NOT NULL, "
+            "head_sha TEXT NOT NULL, pr_updated_at TEXT, labels_json TEXT NOT NULL, "
+            "decision TEXT NOT NULL, reason TEXT NOT NULL, event_delivery_id TEXT, observed_at TEXT NOT NULL)"
+        )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_pr_reconciler_decisions_repo_pr "
+            "ON pr_review_reconciler_decisions(repo, pr_number, observed_at)"
+        )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_pr_reconciler_decisions_decision "
+            "ON pr_review_reconciler_decisions(decision, observed_at)"
+        )
 
     def close(self) -> None:
         with self._lock:
@@ -881,6 +923,88 @@ class Database:
             return None
         received = datetime.fromisoformat(str(row["received_at"]).replace("Z", "+00:00"))
         return max(0.0, (datetime.now(UTC) - received).total_seconds())
+
+    def sqlite_deleted_wal_fds(self) -> list[str]:
+        """Return deleted SQLite fd targets for this process, if observable.
+
+        A non-empty result means the process is writing through an unlinked WAL
+        or SHM file; external DB readers see stale state and restart can lose
+        recent queue rows. Linux exposes this through /proc/self/fd.
+        """
+        fd_dir = Path("/proc/self/fd")
+        if not fd_dir.exists():
+            return []
+        targets: list[str] = []
+        db_name = self.path.name
+        for fd in fd_dir.iterdir():
+            try:
+                target = os.readlink(fd)
+            except OSError:
+                continue
+            if "(deleted)" in target and db_name in target:
+                targets.append(target)
+        return sorted(targets)
+
+    def sqlite_storage_ok(self) -> bool:
+        return not self.sqlite_deleted_wal_fds()
+
+    def get_pr_review_reconciler_cursor(self, repo: str) -> str | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT cursor_updated_at FROM pr_review_reconciler_repo_state WHERE repo=?",
+                (repo,),
+            ).fetchone()
+        if row is None:
+            return None
+        return row["cursor_updated_at"]
+
+    def set_pr_review_reconciler_cursor(self, repo: str, cursor_updated_at: str | None) -> None:
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO pr_review_reconciler_repo_state(repo, cursor_updated_at, scanned_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(repo) DO UPDATE SET
+                  cursor_updated_at=excluded.cursor_updated_at,
+                  scanned_at=excluded.scanned_at
+                """,
+                (repo, cursor_updated_at, _utcnow()),
+            )
+
+    def record_pr_review_reconciler_decision(
+        self,
+        *,
+        repo: str,
+        pr_number: int,
+        head_sha: str,
+        pr_updated_at: str | None,
+        labels: Sequence[str],
+        decision: str,
+        reason: str,
+        event_delivery_id: str | None = None,
+    ) -> None:
+        decision_key = f"{repo}#{pr_number}:{head_sha}:{decision}:{reason}"
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT OR REPLACE INTO pr_review_reconciler_decisions
+                  (decision_key, repo, pr_number, head_sha, pr_updated_at, labels_json,
+                   decision, reason, event_delivery_id, observed_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    decision_key,
+                    repo,
+                    int(pr_number),
+                    head_sha,
+                    pr_updated_at,
+                    json.dumps(tuple(labels), separators=(",", ":")),
+                    decision,
+                    reason,
+                    event_delivery_id,
+                    _utcnow(),
+                ),
+            )
 
     def recent_failure_count(self, since_seconds: float) -> int:
         """Count failed events whose terminal timestamp is within the window."""

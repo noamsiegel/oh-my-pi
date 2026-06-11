@@ -131,9 +131,13 @@ validate_pr_review(findings=[{"path":"src/foo.ts","line":42,"body":"...","severi
 - For critical/required `required_change` findings on a valid diff line, default to
   a GitHub suggested change. Include `suggestion` when the fix is an exact contiguous
   replacement for `start_line..line`, small enough to review, and safe for the author
-  to click “Accept suggestion”. If you omit `suggestion` for that kind of finding,
-  include `no_suggestion_reason` using one of the allowed enum values from
-  `validate_pr_review`; do not add a prose-only required finding without one.
+  to click “Accept suggestion”. Accepted exact GitHub suggestions can be auto-verified
+  on the next push; if an obvious blocker can be expressed as one contiguous replacement,
+  use `suggestion` instead of prose so the author can click GitHub’s Commit suggestion
+  button and Robo-MS can skip verify-fixes when the delta is exactly that replacement.
+  If you omit `suggestion` for that kind of finding, include `no_suggestion_reason`
+  using one of the allowed enum values from `validate_pr_review`; do not add a prose-only
+  required finding without one.
   Obvious local fix → GitHub suggestion. Decision needed / best long-term fix unclear
   → prose required finding with `no_suggestion_reason="design_decision"` or
   `"architecture_decision"` and explain the decision point in body. Multi-file or

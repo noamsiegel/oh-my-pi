@@ -59,6 +59,8 @@ class PullRequestInfo:
     draft: bool = False
     head_sha: str = ""
     author_type: str = ""
+    labels: tuple[str, ...] = ()
+    updated_at: str = ""
 
 
 @dataclass(slots=True, frozen=True)

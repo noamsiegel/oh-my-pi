@@ -424,6 +424,17 @@ def create_proxy_app(settings: ProxySettings) -> FastAPI:
             return _gh_error_response(exc)
         return JSONResponse(_serialize(info))
 
+    @app.get("/gh/v1/pull_requests")
+    async def list_open_pull_requests(request: Request, repo: str, limit: int = 30) -> JSONResponse:
+        await _authenticate(request)
+        github: GitHubClient = request.app.state.github
+        try:
+            items = await github.list_open_pull_requests(repo, limit=limit)
+        except GitHubError as exc:
+            return _gh_error_response(exc)
+        return JSONResponse({"items": [_serialize(item) for item in items]})
+
+
     @app.get("/gh/v1/pr_files")
     async def list_pr_files(request: Request, repo: str, pr_number: int) -> JSONResponse:
         await _authenticate(request)

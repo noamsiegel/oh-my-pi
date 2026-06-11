@@ -46,6 +46,8 @@ from robomp.natives_cache import NativesCache
 from robomp.natives_cache import compute_key as natives_compute_key
 from robomp.sandbox import GitTransport, Workspace, _prepare_slot_runtime_env, _safe_directory_env
 
+_NATIVES_CACHE_CAPTURE_TIMEOUT_SECONDS = 30.0
+
 log = logging.getLogger(__name__)
 
 
@@ -745,7 +747,16 @@ async def run_task(
         # with the source state and would poison the cache.
         raise
     else:
-        await asyncio.to_thread(_capture_natives_cache, inputs)
+        try:
+            await asyncio.wait_for(
+                asyncio.to_thread(_capture_natives_cache, inputs),
+                timeout=_NATIVES_CACHE_CAPTURE_TIMEOUT_SECONDS,
+            )
+        except TimeoutError:
+            log.warning(
+                "natives_cache capture timed out",
+                extra={"workspace": inputs.workspace.workspace_key},
+            )
         return result
 
 

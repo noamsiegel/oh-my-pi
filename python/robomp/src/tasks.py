@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import subprocess
 import logging
 from datetime import UTC, datetime
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from typing import Any
 
@@ -23,8 +25,9 @@ from robomp.github_types import (
     PullRequestReviewInfo,
     RepoInfo,
 )
+from robomp.pr_review_suggestion_fastpath import accepted_suggestions_fast_path_result
 from robomp.pr_review_policy import matching_review_labels, normalize_label_names
-from robomp.sandbox import GitTransport, SandboxManager
+from robomp.sandbox import GitTransport, SandboxManager, Workspace
 from robomp.task_outcome import DeferredTask, TaskOutcome, TransientTaskError
 from robomp.worker import DirectiveInfo, PrReviewFocus, TaskInputs, ThreadMessage, run_task
 
@@ -464,6 +467,17 @@ def _pr_review_focus(latest_review: PullRequestReviewInfo | None, head_sha: str)
         )
     return PrReviewFocus()
 
+def _run_workspace_git(workspace: Workspace, cmd: Sequence[str], *, timeout: float | None) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        list(cmd),
+        cwd=str(workspace.repo_dir),
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+    )
+
 
 async def review_pr(
     *,
@@ -608,18 +622,6 @@ async def review_pr(
         if path
     )
 
-    await _post_pr_review_started_comment(
-        db=db,
-        github=github,
-        key=key,
-        repo_full=repo_full,
-        pr_number=pr_number,
-        labels=labels,
-        head_sha=pr.head_sha,
-        allowed_labels=allowed_labels,
-        review_focus=review_focus,
-    )
-    db.upsert_issue(key=key, repo=repo.full_name, number=pr_number, state="reviewing", pr_number=pr_number)
     workspace = sandbox.ensure_workspace(
         repo=repo.full_name,
         number=pr_number,
@@ -633,6 +635,182 @@ async def review_pr(
         author_name=settings.resolved_author_name,
         author_email=settings.git_author_email,
         slot_uid=slot_uid,
+    )
+
+    if review_focus.mode == "verify-fixes" and latest_review is not None and latest_review.commit_id:
+        posted_findings = db.list_pr_review_posted_findings(repo.full_name, pr_number)
+        prior_review_id = latest_review.id
+        blocking_findings = tuple(
+            finding
+            for finding in posted_findings
+            if str(finding.review_id) == str(prior_review_id) and finding.severity in {"critical", "required"}
+        )
+        if not blocking_findings:
+            log.info(
+                "accepted-suggestion fast path ineligible: no_recorded_blocking_suggestions",
+                extra={"repo": repo.full_name, "pr": pr_number, "prior_review_id": prior_review_id},
+            )
+        elif any(not finding.suggestion_replacement for finding in blocking_findings):
+            log.info(
+                "accepted-suggestion fast path ineligible: prior_review_has_non_suggestion_blocker",
+                extra={"repo": repo.full_name, "pr": pr_number, "prior_review_id": prior_review_id},
+            )
+        else:
+            prior_verify = _run_workspace_git(
+                workspace,
+                ["git", "rev-parse", "--verify", "--quiet", latest_review.commit_id],
+                timeout=30.0,
+            )
+            if prior_verify.returncode != 0:
+                log.info(
+                    "accepted-suggestion fast path ineligible: prior review commit unavailable",
+                    extra={
+                        "repo": repo.full_name,
+                        "pr": pr_number,
+                        "prior_review_id": prior_review_id,
+                        "prior_review_commit_id": latest_review.commit_id,
+                    },
+                )
+            else:
+                delta = _run_workspace_git(
+                    workspace,
+                    ["git", "diff", "--no-color", f"{latest_review.commit_id}..{pr.head_sha}", "--", *changed_paths],
+                    timeout=60.0,
+                )
+                if delta.returncode != 0:
+                    log.info(
+                        "accepted-suggestion fast path ineligible: delta diff failed",
+                        extra={
+                            "repo": repo.full_name,
+                            "pr": pr_number,
+                            "prior_review_id": prior_review_id,
+                            "prior_review_commit_id": latest_review.commit_id,
+                        },
+                    )
+                else:
+                    result = accepted_suggestions_fast_path_result(
+                        latest_review=latest_review,
+                        current_head_sha=pr.head_sha,
+                        posted_findings=posted_findings,
+                        delta_diff=delta.stdout,
+                        terminal_events_enabled=settings.pr_review_terminal_events,
+                        bot_login=settings.bot_login,
+                        pr_author=pr.author,
+                    )
+                    if result.eligible:
+                        operation_key = (
+                            f"pr_review_accepted_suggestions_fast_path:{key}:{pr.head_sha}:{latest_review.id}"
+                        )
+                        if not db.reserve_side_effect(operation_key):
+                            if db.side_effect_succeeded(operation_key):
+                                return TaskOutcome(
+                                    "skipped",
+                                    "accepted-suggestion fast path already submitted for current head",
+                                )
+                            return TaskOutcome(
+                                "skipped",
+                                "accepted-suggestion fast path already pending for current head",
+                            )
+                        prior_short = latest_review.commit_id[:7]
+                        head_short = pr.head_sha[:7]
+                        count = len(result.suggestions)
+                        body = (
+                            f"Robo-MS verified that all {count} prior GitHub suggested change(s) from my "
+                            f"requested-changes review {latest_review.id} were applied exactly in "
+                            f"`{prior_short}..{head_short}`; skipping the verify-fixes agent."
+                        )
+                        event = result.event or "COMMENT"
+                        if event == "COMMENT":
+                            body = (
+                                body
+                                + "\n\nTerminal review events are disabled or self-review is disallowed, so this is a non-blocking status comment."
+                            )
+                        try:
+                            review = await github.submit_pr_review(
+                                repo=repo.full_name,
+                                pr_number=pr_number,
+                                body=body,
+                                event=event,
+                                comments=[],
+                                commit_id=pr.head_sha,
+                            )
+                        except GitHubError as exc:
+                            db.mark_side_effect_failed(operation_key, str(exc))
+                            db.log_tool_call(
+                                issue_key=key,
+                                tool="pr_review_accepted_suggestions_fast_path",
+                                args={
+                                    "repo": repo.full_name,
+                                    "pr": pr_number,
+                                    "head_sha": pr.head_sha,
+                                    "prior_review_id": latest_review.id,
+                                    "prior_review_commit_id": latest_review.commit_id,
+                                },
+                                error=str(exc),
+                            )
+                            raise _github_fetch_failed(exc) from exc
+                        db.mark_side_effect_succeeded(operation_key)
+                        db.record_pr_review_completed_review(
+                            issue_key=key,
+                            repo=repo.full_name,
+                            pr_number=pr_number,
+                            head_sha=pr.head_sha,
+                            github_review_id=review.id,
+                            event=event,
+                        )
+                        db.upsert_issue(
+                            key=key,
+                            repo=repo.full_name,
+                            number=pr_number,
+                            state="reviewing",
+                            branch=workspace.branch,
+                            session_dir=str(workspace.session_dir),
+                            pr_number=pr_number,
+                            review_head_sha=pr.head_sha,
+                        )
+                        db.log_tool_call(
+                            issue_key=key,
+                            tool="pr_review_accepted_suggestions_fast_path",
+                            args={
+                                "repo": repo.full_name,
+                                "pr": pr_number,
+                                "head_sha": pr.head_sha,
+                                "prior_review_id": latest_review.id,
+                                "prior_review_commit_id": latest_review.commit_id,
+                            },
+                            result={
+                                "event": event,
+                                "suggestion_count": count,
+                                "comment_ids": [s.comment_id for s in result.suggestions],
+                                "reason": result.reason,
+                            },
+                        )
+                        return TaskOutcome(
+                            "done",
+                            "accepted prior GitHub suggestions exactly; skipped verify-fixes agent",
+                        )
+                    log.info(
+                        "accepted-suggestion fast path ineligible: %s",
+                        result.reason,
+                        extra={
+                            "repo": repo.full_name,
+                            "pr": pr_number,
+                            "prior_review_id": prior_review_id,
+                            "reason": result.reason,
+                            "extra_delta_paths": result.extra_delta_paths,
+                        },
+                    )
+
+    await _post_pr_review_started_comment(
+        db=db,
+        github=github,
+        key=key,
+        repo_full=repo_full,
+        pr_number=pr_number,
+        labels=labels,
+        head_sha=pr.head_sha,
+        allowed_labels=allowed_labels,
+        review_focus=review_focus,
     )
     db.upsert_issue(
         key=key,
