@@ -21,7 +21,7 @@ from robomp.cancellation import (
 from robomp.config import Settings
 from robomp.db import Database, EventRow
 from robomp.git_ops import GitCommandError
-from robomp.queue import WorkerPool
+from robomp.queue import WorkerPool, _failure_summary
 from robomp.slot_pool import SlotPool
 from tests.fakes import (
     RecordingGitHub as _RecordingGitHub,
@@ -351,6 +351,19 @@ async def test_pull_request_failure_posts_loud_github_comment(
     assert rows[0]["tool"] == "post_pr_review_failed_comment:d-pr-fail"
     assert rows[0]["error"] is None
 
+
+
+
+def test_failure_summary_extracts_auth_broker_root_cause() -> None:
+    error = (
+        "RPC process exited with code 1. Stderr: \n"
+        "[Uncaught Exception] AuthBrokerError: Auth broker request failed after 2 attempt(s)\n"
+        '{"cause":{"message":"Unable to connect. Is the computer able to access the url?","code":"ConnectionRefused"}}'
+    )
+    assert _failure_summary(error) == (
+        "AuthBrokerError: Auth broker request failed after 2 attempt(s); "
+        "ConnectionRefused: Unable to connect. Is the computer able to access the url?"
+    )
 
 @pytest.mark.asyncio
 async def test_run_event_marks_failed_when_not_shutting_down(

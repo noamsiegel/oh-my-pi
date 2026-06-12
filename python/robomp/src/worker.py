@@ -19,7 +19,10 @@ import shutil
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from urllib.error import HTTPError, URLError
+from urllib.parse import urljoin
+from urllib.request import Request, urlopen
+from typing import Any, Mapping
 
 from omp_rpc import (
     MessageUpdateEvent,
@@ -45,6 +48,7 @@ from robomp.host_tools import AbortController, ToolBindings, _git_identity_env
 from robomp.natives_cache import NativesCache
 from robomp.natives_cache import compute_key as natives_compute_key
 from robomp.sandbox import GitTransport, Workspace, _prepare_slot_runtime_env, _safe_directory_env
+from robomp.task_outcome import DEFAULT_TASK_RETRY_DELAY_SECONDS, DeferredTask
 
 _NATIVES_CACHE_CAPTURE_TIMEOUT_SECONDS = 30.0
 
@@ -207,6 +211,32 @@ def _build_extra_env(settings: Settings) -> dict[str, str]:
     if _AGENT_HOME.is_dir():
         env["HOME"] = str(_AGENT_HOME)
     return env
+
+
+def _auth_broker_unavailable_reason(env: Mapping[str, str] | None = None, *, timeout: float = 2.0) -> str | None:
+    env = env or os.environ
+    broker_url = str(env.get("OMP_AUTH_BROKER_URL") or "").strip()
+    if not broker_url:
+        return None
+    health_url = urljoin(broker_url.rstrip("/") + "/", "v1/healthz")
+    try:
+        request = Request(health_url, method="GET")
+        with urlopen(request, timeout=timeout) as response:
+            if 200 <= int(response.status) < 300:
+                return None
+            return f"OMP auth broker unavailable at {health_url}: HTTP {response.status}"
+    except HTTPError as exc:
+        return f"OMP auth broker unavailable at {health_url}: HTTP {exc.code}"
+    except URLError as exc:
+        return f"OMP auth broker unavailable at {health_url}: {exc.reason}"
+    except OSError as exc:
+        return f"OMP auth broker unavailable at {health_url}: {exc}"
+
+
+def _defer_if_auth_broker_unavailable() -> None:
+    reason = _auth_broker_unavailable_reason()
+    if reason is not None:
+        raise DeferredTask(reason, retry_delay_seconds=DEFAULT_TASK_RETRY_DELAY_SECONDS)
 
 
 _TERMINAL_TRIAGE_TOOLS: frozenset[str] = frozenset({"gh_open_pr", "mark_unable_to_reproduce", "abort_task"})
@@ -534,6 +564,7 @@ def _run_rpc_blocking(
             "pragma_thinking": thinking_override,
         },
     )
+    _defer_if_auth_broker_unavailable()
     inputs.db.set_event_model(inputs.delivery_id, chosen_model)
     append_system_prompt = (
         persona.system_append_pr_review(

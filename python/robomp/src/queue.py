@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import traceback
 from collections.abc import Awaitable, Callable, Mapping
 from contextlib import suppress
@@ -35,6 +36,29 @@ RETRYABLE_PR_WORKSPACE_ERROR_MARKERS = (
 )
 PR_WORKSPACE_RETRY_DELAY_SECONDS = 300.0
 MAX_PR_WORKSPACE_PREP_ATTEMPTS = 2
+
+_AUTH_BROKER_ERROR_RE = re.compile(r"(AuthBrokerError: [^\n]+)")
+_AUTH_BROKER_CAUSE_CODE_RE = re.compile(r'"code":"([^"]+)"')
+_AUTH_BROKER_CAUSE_MESSAGE_RE = re.compile(r'"cause":\{.*?"message":"([^"]+)"')
+
+
+def _failure_summary(error: str) -> str:
+    stripped = error.strip()
+    if not stripped:
+        return "unknown error"
+    auth = _AUTH_BROKER_ERROR_RE.search(stripped)
+    if auth is not None:
+        summary = auth.group(1)
+        cause_code = _AUTH_BROKER_CAUSE_CODE_RE.search(stripped)
+        cause_message = _AUTH_BROKER_CAUSE_MESSAGE_RE.search(stripped)
+        if cause_code is not None and cause_message is not None:
+            summary = f"{summary}; {cause_code.group(1)}: {cause_message.group(1)}"
+        return summary
+    for line in stripped.splitlines():
+        clean = line.strip()
+        if clean and clean not in {"Stderr:", "Traceback (most recent call last):"}:
+            return clean
+    return "unknown error"
 
 
 def _is_retryable_pr_workspace_error(row: EventRow, error: str) -> bool:
@@ -307,7 +331,7 @@ class WorkerPool:
 
     @staticmethod
     def _failure_comment_body(row: EventRow, error: str) -> str:
-        first_line = error.strip().splitlines()[0] if error.strip() else "unknown error"
+        first_line = _failure_summary(error)
         if len(first_line) > 1800:
             first_line = f"{first_line[:1800]}…"
         return (

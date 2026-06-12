@@ -11,13 +11,14 @@ import asyncio
 import stat
 from pathlib import Path
 from types import SimpleNamespace
+from urllib.error import URLError
 
 import pytest
 
 from robomp import worker
 from robomp.config import Settings
 from robomp.git_ops import DirtyState
-
+from robomp.task_outcome import DeferredTask
 
 class _FakeRpcClient:
     instances: list[_FakeRpcClient] = []
@@ -750,6 +751,33 @@ async def test_run_rpc_review_pr_reminds_until_submit_pr_review(tmp_path: Path, 
     assert fake.prompts[0] == "kickoff"
     assert all("submit_pr_review" in p for p in fake.prompts[1:])
     assert all("gh_open_pr" not in p for p in fake.prompts[1:])
+
+
+def test_auth_broker_preflight_skips_when_url_unset() -> None:
+    assert worker._auth_broker_unavailable_reason({}) is None  # noqa: SLF001
+
+
+def test_auth_broker_preflight_reports_connection_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_urlopen(_request, timeout: float):
+        raise URLError("Connection refused")
+
+    monkeypatch.setattr(worker, "urlopen", fake_urlopen)
+    reason = worker._auth_broker_unavailable_reason({"OMP_AUTH_BROKER_URL": "http://host.docker.internal:18765"})  # noqa: SLF001
+    assert reason is not None
+    assert "http://host.docker.internal:18765/v1/healthz" in reason
+    assert "Connection refused" in reason
+
+
+def test_auth_broker_preflight_defers_without_retry_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_urlopen(_request, timeout: float):
+        raise URLError("Connection refused")
+
+    monkeypatch.setenv("OMP_AUTH_BROKER_URL", "http://host.docker.internal:18765")
+    monkeypatch.setattr(worker, "urlopen", fake_urlopen)
+    with pytest.raises(DeferredTask) as exc:
+        worker._defer_if_auth_broker_unavailable()  # noqa: SLF001
+    assert exc.value.outcome.retry_limit is None
+    assert exc.value.outcome.retry_delay_seconds == 300.0
 
 
 def test_review_pr_prompt_includes_verify_fixes_focus(tmp_path: Path, settings: Settings) -> None:
