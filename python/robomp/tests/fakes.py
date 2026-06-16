@@ -22,9 +22,14 @@ class RecordingGitHub:
 
     def __init__(self) -> None:
         self.comments: list[tuple[str, int, str]] = []
+        self.updated_comments: list[tuple[str, int, str]] = []
 
     async def post_comment(self, repo: str, number: int, body: str) -> _Comment:
         self.comments.append((repo, number, body))
+        return _Comment()
+
+    async def update_comment(self, repo: str, comment_id: int, body: str) -> _Comment:
+        self.updated_comments.append((repo, comment_id, body))
         return _Comment()
 
     async def get_repo(self, repo_full: str):
@@ -61,6 +66,7 @@ class RecordingSandbox:
         self.tmp_root = tmp_root or Path("/tmp/robomp-test-workspaces")
         self.ensure_calls: list[dict[str, Any]] = []
         self.remove_calls: list[tuple[str, int, str | None]] = []
+        self.superseded_calls: list[tuple[str, int, str]] = []
 
     def ensure_workspace(
         self,
@@ -109,6 +115,10 @@ class RecordingSandbox:
 
     def remove_workspace(self, *, repo: str, number: int, head_sha: str | None = None) -> None:
         self.remove_calls.append((repo, number, head_sha))
+
+    def remove_superseded_pr_review_workspaces(self, *, repo: str, number: int, keep_head_sha: str) -> int:
+        self.superseded_calls.append((repo, number, keep_head_sha))
+        return 0
 
 
 class StubGitTransport:

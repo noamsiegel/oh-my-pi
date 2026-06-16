@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import time
@@ -118,6 +119,8 @@ def _build_services(settings: OrchestratorSettings) -> AppServices:
             bot_login=settings.bot_login,
             interval_seconds=settings.pr_review_reconciler_interval_seconds,
             limit_per_repo=settings.pr_review_reconciler_limit_per_repo,
+            ci_gate_enabled=settings.pr_review_ci_gate_enabled,
+            webhook_staleness_warn_seconds=settings.pr_review_webhook_staleness_warn_seconds,
         )
     return AppServices(
         settings=settings,
@@ -216,6 +219,23 @@ def create_app(settings: OrchestratorSettings | None = None) -> FastAPI:
         if latest_self_improvement is not None:
             status_name = str(latest_self_improvement.get("status") or "unknown")
             lines.append(f'robomp_self_improver_last_status{{status="{status_name}"}} 1')
+        gate_counts = services.db.pr_review_gate_status_counts()
+        for gate_name in ("unknown", "pending", "blocked", "passed", "reviewing", "reviewed", "ineligible", "closed"):
+            lines.append(f'robomp_pr_review_gate{{status="{gate_name}"}} {gate_counts.get(gate_name, 0)}')
+        webhook_age = services.db.seconds_since_last_webhook()
+        if webhook_age is not None:
+            lines.append(f"robomp_seconds_since_last_webhook {webhook_age:.1f}")
+        try:
+            # The byte-sum walks every workspace tree; keep it off the event loop.
+            ws_stats = await asyncio.to_thread(services.sandbox.workspace_storage_stats)
+            lines.append(f"robomp_workspace_entries {ws_stats.entries}")
+            lines.append(f"robomp_workspace_bytes {ws_stats.bytes}")
+            lines.append(f"robomp_workspace_root_free_bytes {ws_stats.free_bytes}")
+            lines.append(f"robomp_workspace_root_total_bytes {ws_stats.total_bytes}")
+            lines.append("robomp_workspace_metrics_error 0")
+        except Exception:
+            log.warning("workspace storage metrics failed", exc_info=True)
+            lines.append("robomp_workspace_metrics_error 1")
         return PlainTextResponse("\n".join(lines) + "\n")
 
     app.include_router(webhook.router)

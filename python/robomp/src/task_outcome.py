@@ -8,6 +8,8 @@ from typing import Literal
 TaskState = Literal["done", "skipped", "failed", "queued"]
 DEFAULT_TASK_RETRY_DELAY_SECONDS = 300.0
 MAX_TRANSIENT_TASK_ATTEMPTS = 2
+MAX_INFRA_UNAVAILABLE_ATTEMPTS = 8
+INFRA_UNAVAILABLE_MARKER = "infrastructure unavailable: "
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,9 +56,35 @@ class DeferredTask(TaskControl):
         super().__init__(TaskOutcome("queued", reason, retry_delay_seconds, retry_limit=None))
 
 
+class InfrastructureUnavailable(TaskControl):
+    """A required dependency (e.g. the auth broker) is unreachable. Retry a
+    bounded number of times, then dead-letter — never spin forever in silence
+    the way an uncapped DeferredTask did. The reconciler re-queues a fresh
+    delivery once the dependency recovers, so dead-lettering loses nothing."""
+
+    def __init__(
+        self,
+        reason: str,
+        *,
+        retry_delay_seconds: float,
+        retry_limit: int = MAX_INFRA_UNAVAILABLE_ATTEMPTS,
+    ) -> None:
+        super().__init__(
+            TaskOutcome(
+                "queued",
+                f"{INFRA_UNAVAILABLE_MARKER}{reason}",
+                retry_delay_seconds,
+                retry_limit=retry_limit,
+            )
+        )
+
+
 __all__ = [
     "DEFAULT_TASK_RETRY_DELAY_SECONDS",
     "DeferredTask",
+    "INFRA_UNAVAILABLE_MARKER",
+    "InfrastructureUnavailable",
+    "MAX_INFRA_UNAVAILABLE_ATTEMPTS",
     "MAX_TRANSIENT_TASK_ATTEMPTS",
     "PermanentTaskError",
     "SkipWork",

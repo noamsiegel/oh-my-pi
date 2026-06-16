@@ -15,7 +15,7 @@ import json
 import logging
 from collections.abc import Iterable, Mapping
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 
@@ -176,8 +176,12 @@ class GitHubProxyClient:
         data = await self._request("GET", "/gh/v1/pull_request", params={"repo": repo, "number": number})
         return _pr_from(data)
 
-    async def list_open_pull_requests(self, repo: str, *, limit: int = 30) -> list[PullRequestInfo]:
-        data = await self._request("GET", "/gh/v1/pull_requests", params={"repo": repo, "limit": limit})
+    async def list_pull_requests(
+        self, repo: str, *, state: Literal["open", "closed", "all"] = "open", limit: int = 30
+    ) -> list[PullRequestInfo]:
+        data = await self._request(
+            "GET", "/gh/v1/pull_requests", params={"repo": repo, "state": state, "limit": limit}
+        )
         return [_pr_from(item) for item in (data.get("items") if isinstance(data, dict) else None) or []]
 
 
@@ -274,6 +278,14 @@ class GitHubProxyClient:
         )
         return _comment_from(data)
 
+    async def update_comment(self, repo: str, comment_id: int, body: str) -> CommentInfo:
+        data = await self._request(
+            "POST",
+            "/gh/v1/update_comment",
+            json_body={"repo": repo, "comment_id": comment_id, "body": body},
+        )
+        return _comment_from(data)
+
     async def open_pull_request(
         self,
         *,
@@ -330,6 +342,21 @@ class GitHubProxyClient:
             json_body={"repo": repo, "number": number, "labels": labels},
         )
         return tuple(str(lbl) for lbl in (data.get("labels") if isinstance(data, dict) else None) or [])
+
+    async def remove_issue_label(self, repo: str, number: int, name: str) -> tuple[str, ...]:
+        data = await self._request(
+            "POST",
+            "/gh/v1/remove_issue_label",
+            json_body={"repo": repo, "number": number, "name": name},
+        )
+        return tuple(str(lbl) for lbl in (data.get("labels") if isinstance(data, dict) else None) or [])
+
+    async def set_label(self, repo: str, name: str, *, color: str, description: str | None = None) -> None:
+        await self._request(
+            "POST",
+            "/gh/v1/set_label",
+            json_body={"repo": repo, "name": name, "color": color, "description": description},
+        )
 
     async def submit_pr_review(
         self,
@@ -721,6 +748,7 @@ def _pr_from(data: Any) -> PullRequestInfo:
         body=str(data.get("body") or ""),
         labels=tuple(str(item) for item in data.get("labels") or ()),
         updated_at=str(data.get("updated_at") or ""),
+        merged=bool(data.get("merged")),
     )
 
 

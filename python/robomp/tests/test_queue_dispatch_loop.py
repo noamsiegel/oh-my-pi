@@ -9,7 +9,7 @@ import pytest
 from robomp.config import Settings
 from robomp.db import Database, issue_key
 from robomp.queue import WorkerPool
-from robomp.task_outcome import TaskOutcome, TransientTaskError
+from robomp.task_outcome import INFRA_UNAVAILABLE_MARKER, TaskOutcome, TransientTaskError
 
 
 class _StubSandbox:
@@ -174,6 +174,88 @@ async def test_transient_task_error_fails_after_retry_limit(settings: Settings, 
 
 
 @pytest.mark.asyncio
+async def test_infra_unavailable_dead_letters_without_pr_comment(
+    settings: Settings, db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from robomp import tasks
+
+    async def _infra(**kwargs):
+        return TaskOutcome(
+            "queued", f"{INFRA_UNAVAILABLE_MARKER}broker down", retry_delay_seconds=60, retry_limit=2
+        )
+
+    monkeypatch.setattr(tasks, "triage_issue", _infra)
+    db.record_event(
+        delivery_id="infra-deadletter-test",
+        event_type="manual",
+        repo="octo/widget",
+        issue_key=issue_key("octo/widget", 77),
+        payload={"action": "opened", "issue": {"number": 77}, "repository": {"full_name": "octo/widget"}},
+        task="triage_issue",
+    )
+    first = db.claim_next_event()
+    assert first is not None
+    assert db.requeue_event(first.delivery_id, from_states=("running",))
+    second = db.claim_next_event()
+    assert second is not None and second.attempts == 2
+
+    pool = _make_pool(settings, db)
+    posted: list[tuple[str, str]] = []
+
+    async def _spy(row, error):  # noqa: ANN001
+        posted.append((row.delivery_id, error))
+
+    monkeypatch.setattr(pool, "_post_failure_comment", _spy)
+    await pool._dispatch_and_mark(second)
+
+    event = db.get_event("infra-deadletter-test")
+    assert event is not None
+    assert event.state == "failed"
+    assert event.last_error.startswith(INFRA_UNAVAILABLE_MARKER)
+    # Infrastructure outage must NOT comment on the PR — the watchdog alerts and
+    # the reconciler re-queues once the dependency recovers.
+    assert posted == []
+
+
+@pytest.mark.asyncio
+async def test_non_infra_dead_letter_posts_pr_comment(
+    settings: Settings, db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from robomp import tasks
+
+    async def _fail(**kwargs):
+        return TaskOutcome("queued", "agent crashed", retry_delay_seconds=60, retry_limit=2)
+
+    monkeypatch.setattr(tasks, "triage_issue", _fail)
+    db.record_event(
+        delivery_id="normal-deadletter-test",
+        event_type="manual",
+        repo="octo/widget",
+        issue_key=issue_key("octo/widget", 78),
+        payload={"action": "opened", "issue": {"number": 78}, "repository": {"full_name": "octo/widget"}},
+        task="triage_issue",
+    )
+    first = db.claim_next_event()
+    assert first is not None
+    assert db.requeue_event(first.delivery_id, from_states=("running",))
+    second = db.claim_next_event()
+    assert second is not None and second.attempts == 2
+
+    pool = _make_pool(settings, db)
+    posted: list[tuple[str, str]] = []
+
+    async def _spy(row, error):  # noqa: ANN001
+        posted.append((row.delivery_id, error))
+
+    monkeypatch.setattr(pool, "_post_failure_comment", _spy)
+    await pool._dispatch_and_mark(second)
+
+    event = db.get_event("normal-deadletter-test")
+    assert event is not None
+    assert event.state == "failed"
+    assert posted and posted[0][1] == "agent crashed"
+
+@pytest.mark.asyncio
 async def test_same_issue_two_event_dispatcher_serialization(
     settings: Settings, db: Database, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -254,3 +336,67 @@ async def test_same_issue_two_event_dispatcher_serialization(
     second_final = db.get_event("second-event")
     assert first_final.state == "done"
     assert second_final.state == "done"
+
+@pytest.mark.asyncio
+async def test_workspace_gc_loop_protects_inflight_issue_keys(
+    settings: Settings, db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Periodic workspace GC passes the in-flight issue keys as protected."""
+    from robomp.sandbox import WorkspaceGcResult
+
+    class _GcSandbox:
+        natives_cache = None
+
+        def __init__(self) -> None:
+            self.gc_calls: list[frozenset[str]] = []
+            self.pool_calls = 0
+
+        def gc_workspaces(
+            self,
+            *,
+            max_age_seconds: float,
+            max_bytes: int,
+            min_free_bytes: int,
+            protected_issue_keys: frozenset[str] = frozenset(),
+            now: float | None = None,
+        ) -> WorkspaceGcResult:
+            self.gc_calls.append(protected_issue_keys)
+            # free_bytes == min_free_bytes keeps the below-floor warning quiet.
+            return WorkspaceGcResult(
+                evicted=0,
+                freed_bytes=0,
+                total_bytes=0,
+                free_bytes=min_free_bytes,
+                remaining_bytes=0,
+                scanned=0,
+            )
+
+        def gc_clone_pools(self) -> int:
+            self.pool_calls += 1
+            return 0
+
+    sandbox = _GcSandbox()
+    monkeypatch.setattr(settings, "workspace_gc_interval_seconds", 0.01)
+    pool = WorkerPool(
+        settings=settings,
+        db=db,
+        github=_StubGitHub(),  # type: ignore[arg-type]
+        sandbox=sandbox,  # type: ignore[arg-type]
+        git_transport=_StubGitTransport(),  # type: ignore[arg-type]
+    )
+    async with pool._inflight_lock:
+        pool._inflight.add("octo/widget#42")
+
+    task = asyncio.create_task(pool._workspace_gc_loop())
+    try:
+        for _ in range(200):
+            if sandbox.gc_calls:
+                break
+            await asyncio.sleep(0.01)
+        assert sandbox.gc_calls, "workspace gc loop never invoked gc_workspaces"
+    finally:
+        pool._stop.set()
+        await asyncio.wait_for(task, timeout=2.0)
+
+    assert sandbox.gc_calls[0] == frozenset({"octo/widget#42"})
+    assert sandbox.pool_calls >= 1

@@ -262,6 +262,27 @@ CREATE INDEX IF NOT EXISTS idx_pr_reconciler_decisions_repo_pr
 CREATE INDEX IF NOT EXISTS idx_pr_reconciler_decisions_decision
   ON pr_review_reconciler_decisions(decision, observed_at);
 
+CREATE TABLE IF NOT EXISTS pr_review_ci_gate_state (
+  issue_key             TEXT PRIMARY KEY,
+  repo                  TEXT NOT NULL,
+  pr_number             INTEGER NOT NULL,
+  current_head_sha      TEXT,
+  gate_status           TEXT NOT NULL
+    CHECK (gate_status IN ('unknown','pending','blocked','passed','reviewing','reviewed','ineligible','closed')),
+  blocked_episode       INTEGER NOT NULL DEFAULT 0,
+  episode_start_head_sha TEXT,
+  last_notified_episode INTEGER NOT NULL DEFAULT 0,
+  last_notice_comment_id INTEGER,
+  last_ci_signature     TEXT,
+  first_pending_at      TEXT,
+  last_checked_at       TEXT,
+  updated_at            TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_pr_ci_gate_repo_pr
+  ON pr_review_ci_gate_state(repo, pr_number);
+CREATE INDEX IF NOT EXISTS idx_pr_ci_gate_head
+  ON pr_review_ci_gate_state(repo, current_head_sha);
+
 CREATE TABLE IF NOT EXISTS pr_review_self_improvement_runs (
   run_id TEXT PRIMARY KEY,
   started_at TEXT NOT NULL,
@@ -486,6 +507,49 @@ class PrReviewGapEvent:
     reason: str
     created_at: str
     observed_at: str
+
+
+# CI-gate status values. ``blocked`` = latest reviewable head has failed/timed-out
+# CI. A "blocking episode" is a contiguous run of ``blocked`` status; it ends when
+# CI passes, a review is submitted, or the PR closes, so a later red cycle opens a
+# fresh episode and earns one new notice.
+PrReviewGateStatus = Literal[
+    "unknown", "pending", "blocked", "passed", "reviewing", "reviewed", "ineligible", "closed"
+]
+
+
+@dataclass(slots=True, frozen=True)
+class PrReviewGateState:
+    issue_key: str
+    repo: str
+    pr_number: int
+    current_head_sha: str | None
+    gate_status: PrReviewGateStatus
+    blocked_episode: int
+    episode_start_head_sha: str | None
+    last_notified_episode: int
+    last_notice_comment_id: int | None
+    last_ci_signature: str | None
+    first_pending_at: str | None
+    last_checked_at: str | None
+    updated_at: str
+
+
+@dataclass(slots=True, frozen=True)
+class PrReviewGateTransition:
+    """Result of ``Database.transition_pr_review_gate``.
+
+    ``should_notify`` is True only when a *new* blocking episode opened that has
+    not yet been announced; the caller posts one comment then calls
+    ``mark_pr_review_gate_notified``. ``signature_changed`` flags a counts change
+    inside an already-announced episode so an optional sticky comment can be edited.
+    """
+
+    state: PrReviewGateState
+    entered_blocked_episode: bool
+    should_notify: bool
+    episode: int
+    signature_changed: bool
 
 
 def _bool_from_db(value: object) -> bool | None:
@@ -1896,6 +1960,183 @@ class Database:
                 (key, issue_key, repo, pr_number, head_sha, github_review_id, event, submitted_at),
             )
             return cur.rowcount > 0
+
+    # ---- PR review CI gate state ----
+    @staticmethod
+    def _gate_state_from_row(row: sqlite3.Row) -> PrReviewGateState:
+        return PrReviewGateState(
+            issue_key=row["issue_key"],
+            repo=row["repo"],
+            pr_number=int(row["pr_number"]),
+            current_head_sha=row["current_head_sha"],
+            gate_status=row["gate_status"],
+            blocked_episode=int(row["blocked_episode"]),
+            episode_start_head_sha=row["episode_start_head_sha"],
+            last_notified_episode=int(row["last_notified_episode"]),
+            last_notice_comment_id=_int_or_none(row["last_notice_comment_id"]),
+            last_ci_signature=row["last_ci_signature"],
+            first_pending_at=row["first_pending_at"],
+            last_checked_at=row["last_checked_at"],
+            updated_at=row["updated_at"],
+        )
+
+    def get_pr_review_gate_state(self, issue_key: str) -> PrReviewGateState | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM pr_review_ci_gate_state WHERE issue_key=?",
+                (issue_key,),
+            ).fetchone()
+        return None if row is None else self._gate_state_from_row(row)
+
+    def transition_pr_review_gate(
+        self,
+        *,
+        issue_key: str,
+        repo: str,
+        pr_number: int,
+        head_sha: str | None,
+        gate_status: PrReviewGateStatus,
+        ci_signature: str | None = None,
+    ) -> PrReviewGateTransition:
+        """Advance the per-PR CI-gate state machine and decide notification.
+
+        ``blocked_episode`` increments only when entering ``blocked`` from a
+        non-blocked status, so a contiguous run of failing heads is one episode.
+        ``should_notify`` is True only when that new episode has not been
+        announced; the caller posts once then calls ``mark_pr_review_gate_notified``.
+        ``last_notified_episode``/``last_notice_comment_id`` are owned by that
+        method and never touched here.
+        """
+        now = _utcnow()
+        with self._txn() as conn:
+            row = conn.execute(
+                "SELECT * FROM pr_review_ci_gate_state WHERE issue_key=?",
+                (issue_key,),
+            ).fetchone()
+            prev_status = row["gate_status"] if row is not None else "unknown"
+            prev_episode = int(row["blocked_episode"]) if row is not None else 0
+            prev_notified = int(row["last_notified_episode"]) if row is not None else 0
+            prev_signature = row["last_ci_signature"] if row is not None else None
+            prev_first_pending = row["first_pending_at"] if row is not None else None
+            prev_episode_head = row["episode_start_head_sha"] if row is not None else None
+            prev_comment_id = _int_or_none(row["last_notice_comment_id"]) if row is not None else None
+
+            entered = False
+            signature_changed = False
+            episode = prev_episode
+            episode_head = prev_episode_head
+            first_pending = prev_first_pending
+
+            if gate_status == "blocked":
+                if prev_status != "blocked":
+                    episode = prev_episode + 1
+                    episode_head = head_sha
+                    entered = True
+                else:
+                    signature_changed = prev_signature != ci_signature
+                first_pending = None
+            elif gate_status == "pending":
+                first_pending = prev_first_pending or now
+            else:
+                first_pending = None
+
+            should_notify = gate_status == "blocked" and prev_notified < episode
+
+            conn.execute(
+                """
+                INSERT INTO pr_review_ci_gate_state
+                  (issue_key, repo, pr_number, current_head_sha, gate_status, blocked_episode,
+                   episode_start_head_sha, last_notified_episode, last_notice_comment_id,
+                   last_ci_signature, first_pending_at, last_checked_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(issue_key) DO UPDATE SET
+                  repo=excluded.repo,
+                  pr_number=excluded.pr_number,
+                  current_head_sha=excluded.current_head_sha,
+                  gate_status=excluded.gate_status,
+                  blocked_episode=excluded.blocked_episode,
+                  episode_start_head_sha=excluded.episode_start_head_sha,
+                  last_ci_signature=excluded.last_ci_signature,
+                  first_pending_at=excluded.first_pending_at,
+                  last_checked_at=excluded.last_checked_at,
+                  updated_at=excluded.updated_at
+                """,
+                (
+                    issue_key, repo, pr_number, head_sha, gate_status, episode,
+                    episode_head, prev_notified, prev_comment_id,
+                    ci_signature, first_pending, now, now,
+                ),
+            )
+            new_row = conn.execute(
+                "SELECT * FROM pr_review_ci_gate_state WHERE issue_key=?",
+                (issue_key,),
+            ).fetchone()
+        state = self._gate_state_from_row(new_row)
+        return PrReviewGateTransition(
+            state=state,
+            entered_blocked_episode=entered,
+            should_notify=should_notify,
+            episode=episode,
+            signature_changed=signature_changed,
+        )
+
+    def mark_pr_review_gate_notified(
+        self, issue_key: str, *, episode: int, comment_id: int | None
+    ) -> None:
+        now = _utcnow()
+        with self._lock:
+            self._conn.execute(
+                """
+                UPDATE pr_review_ci_gate_state
+                SET last_notified_episode=?, last_notice_comment_id=?, updated_at=?
+                WHERE issue_key=?
+                """,
+                (episode, comment_id, now, issue_key),
+            )
+
+    def find_pr_numbers_by_head_sha(self, repo: str, head_sha: str) -> list[int]:
+        """Open PRs whose last-observed gate head matches ``head_sha`` — lets a
+        ``status`` webhook (SHA, no PR number) map onto a known PR to re-probe."""
+        if not head_sha:
+            return []
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT pr_number FROM pr_review_ci_gate_state
+                WHERE repo=? AND current_head_sha=? AND gate_status <> 'closed'
+                """,
+                (repo, head_sha),
+            ).fetchall()
+        return [int(r["pr_number"]) for r in rows]
+
+    def pr_review_gate_status_counts(self) -> dict[str, int]:
+        """Row counts per CI-gate status, for ``/metrics`` observability."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT gate_status, COUNT(*) AS n FROM pr_review_ci_gate_state GROUP BY gate_status"
+            ).fetchall()
+        return {row["gate_status"]: int(row["n"]) for row in rows}
+
+    def seconds_since_last_webhook(self) -> float | None:
+        """Age (seconds) of the most recent NATIVE (GitHub-delivered) webhook
+        event, or None if none recorded. A steadily growing value means
+        deliveries have stopped and the reconciler backstop is silently carrying
+        the load — the signal that turned a 5-minute outage into an 8-day one."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT MAX(received_at) AS ts FROM events "
+                "WHERE delivery_id NOT LIKE 'reconcile%' AND delivery_id NOT LIKE 'ci-probe%'"
+            ).fetchone()
+        ts = row["ts"] if row is not None else None
+        if not ts:
+            return None
+        try:
+            dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=UTC)
+        return max(0.0, (datetime.now(UTC) - dt).total_seconds())
 
     def _last_done_self_improvement_key(self) -> str | None:
         row = self._conn.execute(

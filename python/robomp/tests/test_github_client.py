@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 
 import httpx
 import pytest
@@ -143,6 +144,35 @@ def test_get_pull_request_parses_title_and_body() -> None:
     pr = _run_async(client.get_pull_request("octo/widget", 9))
     assert pr.title == "Fix crash"
     assert pr.body == "Fixes #1"
+
+
+def test_list_pull_requests_accepts_closed_state_and_merged_flag() -> None:
+    captured: dict[str, str | None] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/repos/octo/widget/pulls"
+        captured["state"] = request.url.params.get("state")
+        return httpx.Response(
+            200,
+            json=[
+                {
+                    "number": 9,
+                    "html_url": "https://github.com/octo/widget/pull/9",
+                    "head": {"ref": "fix", "sha": "abc", "repo": {"full_name": "octo/widget"}},
+                    "base": {"ref": "main"},
+                    "state": "closed",
+                    "user": {"login": "alice"},
+                    "merged_at": "2026-06-12T00:00:00Z",
+                }
+            ],
+        )
+
+    client = GitHubClient("tok", transport=httpx.MockTransport(handler))
+    prs = _run_async(client.list_pull_requests("octo/widget", state="closed"))
+    assert captured["state"] == "closed"
+    assert len(prs) == 1
+    assert prs[0].merged is True
+    assert prs[0].state == "closed"
 
 
 def test_list_pr_files_parses_changed_file_summary() -> None:
@@ -604,3 +634,34 @@ def test_close_issue_propagates_error() -> None:
     with pytest.raises(GitHubError) as exc:
         _run_async(client.close_issue("octo/widget", 42))
     assert exc.value.status == 404
+
+
+def test_set_label_updates_existing_via_patch() -> None:
+    seen: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["method"] = request.method
+        seen["path"] = request.url.path
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"name": "review:ready", "color": "0E8A16"})
+
+    client = GitHubClient("tok", transport=httpx.MockTransport(handler))
+    _run_async(client.set_label("o/r", "review:ready", color="0E8A16", description="ready"))
+    assert seen["method"] == "PATCH"
+    assert str(seen["path"]).startswith("/repos/o/r/labels/")
+    assert seen["body"] == {"color": "0E8A16", "description": "ready"}
+
+
+def test_set_label_creates_when_absent() -> None:
+    calls: list[tuple[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append((request.method, request.url.path))
+        if request.method == "PATCH":
+            return httpx.Response(404, json={"message": "Not Found"})
+        return httpx.Response(201, json={"name": "provider:openai", "color": "1F7A8C"})
+
+    client = GitHubClient("tok", transport=httpx.MockTransport(handler))
+    _run_async(client.set_label("o/r", "provider:openai", color="1F7A8C"))
+    assert calls[0][0] == "PATCH"
+    assert calls[1] == ("POST", "/repos/o/r/labels")

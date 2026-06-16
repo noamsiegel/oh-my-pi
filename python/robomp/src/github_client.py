@@ -5,7 +5,8 @@ from __future__ import annotations
 import logging
 import time
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, Literal
+from urllib.parse import quote
 
 import httpx
 
@@ -225,12 +226,16 @@ class GitHubClient:
         data = await self.request("GET", f"/repos/{repo}/pulls/{number}")
         return _pr_from_payload(repo, data)
 
-    async def list_open_pull_requests(self, repo: str, *, limit: int = 30) -> list[PullRequestInfo]:
+    async def list_pull_requests(
+        self, repo: str, *, state: Literal["open", "closed", "all"] = "open", limit: int = 30
+    ) -> list[PullRequestInfo]:
+        if state not in {"open", "closed", "all"}:
+            raise ValueError(f"invalid pull request state: {state!r}")
         per_page = max(1, min(int(limit), 100))
         data = await self.request(
             "GET",
             f"/repos/{repo}/pulls",
-            params={"state": "open", "per_page": per_page, "sort": "updated", "direction": "desc"},
+            params={"state": state, "per_page": per_page, "sort": "updated", "direction": "desc"},
         )
         return [_pr_from_payload(repo, item) for item in data or [] if isinstance(item, Mapping)]
 
@@ -408,6 +413,14 @@ class GitHubClient:
         )
         return _comment_from_payload(data)
 
+    async def update_comment(self, repo: str, comment_id: int, body: str) -> CommentInfo:
+        data = await self.request(
+            "PATCH",
+            f"/repos/{repo}/issues/comments/{comment_id}",
+            json={"body": body},
+        )
+        return _comment_from_payload(data)
+
     async def open_pull_request(
         self,
         *,
@@ -468,6 +481,40 @@ class GitHubClient:
             json={"labels": labels},
         )
         return tuple(str(lbl["name"]) if isinstance(lbl, dict) else str(lbl) for lbl in (data or []))
+
+    async def remove_issue_label(self, repo: str, number: int, name: str) -> tuple[str, ...]:
+        """Remove a single label from an issue (or PR). Idempotent: a label that is
+        not present (`404`) is treated as already removed.
+
+        Uses `DELETE /repos/{owner}/{repo}/issues/{n}/labels/{name}` and returns the
+        label set remaining after the delete.
+        """
+        try:
+            data = await self.request(
+                "DELETE",
+                f"/repos/{repo}/issues/{number}/labels/{quote(name, safe='')}",
+            )
+        except GitHubError as exc:
+            if exc.status == 404:
+                return ()
+            raise
+        return tuple(str(lbl["name"]) if isinstance(lbl, dict) else str(lbl) for lbl in (data or []))
+
+    async def set_label(self, repo: str, name: str, *, color: str, description: str | None = None) -> None:
+        """Ensure repo label `name` has `color` (and `description` when given). Idempotent:
+        updates the label, or creates it when absent (`404`)."""
+        payload: dict[str, Any] = {"color": color}
+        if description is not None:
+            payload["description"] = description
+        try:
+            await self.request("PATCH", f"/repos/{repo}/labels/{quote(name, safe='')}", json=payload)
+        except GitHubError as exc:
+            if exc.status != 404:
+                raise
+            create: dict[str, Any] = {"name": name, "color": color}
+            if description is not None:
+                create["description"] = description
+            await self.request("POST", f"/repos/{repo}/labels", json=create)
 
     async def submit_pr_review(
         self,
@@ -753,6 +800,7 @@ def _pr_from_payload(repo: str, data: Mapping[str, Any]) -> PullRequestInfo:
         body=str(data.get("body") or ""),
         updated_at=str(data.get("updated_at") or ""),
         labels=labels,
+        merged=bool(data.get("merged")) or bool(data.get("merged_at")),
     )
 
 

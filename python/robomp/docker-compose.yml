@@ -66,6 +66,16 @@ services:
       # self-improvement run needs to push its jj bookmark.
       ROBOMP_PR_REVIEW_SELF_IMPROVE_PUSH_TOKEN: ${ROBOMP_PR_REVIEW_SELF_IMPROVE_PUSH_TOKEN:-}
 
+      # --- PR-review HOA test sandbox (non-secret local DB/Redis only) ---
+      # Exposes a throwaway Postgres + Redis to incoming-PR review tasks so
+      # targeted `manage.py test` runs really execute. No production secrets.
+      ROBOMP_PR_REVIEW_HOA_DB_HOST: ${ROBOMP_PR_REVIEW_HOA_DB_HOST:-db}
+      ROBOMP_PR_REVIEW_HOA_DB_NAME: ${ROBOMP_PR_REVIEW_HOA_DB_NAME:-postgres}
+      ROBOMP_PR_REVIEW_HOA_DB_USER: ${ROBOMP_PR_REVIEW_HOA_DB_USER:-postgres}
+      ROBOMP_PR_REVIEW_HOA_DB_PASS: ${ROBOMP_PR_REVIEW_HOA_DB_PASS:-postgres}
+      ROBOMP_PR_REVIEW_HOA_DB_PORT: ${ROBOMP_PR_REVIEW_HOA_DB_PORT:-5432}
+      ROBOMP_PR_REVIEW_HOA_REDIS_HOST: ${ROBOMP_PR_REVIEW_HOA_REDIS_HOST:-cache}
+
       # --- container-fixed paths ---
       ROBOMP_OMP_COMMAND: omp
       ROBOMP_WORKSPACE_ROOT: /data/workspaces
@@ -77,6 +87,10 @@ services:
     depends_on:
       gh-proxy:
         condition: service_started
+      pr-review-db:
+        condition: service_healthy
+      pr-review-cache:
+        condition: service_healthy
     # Resolve `llm-gateway.internal` (used in /srv/agent-home/.omp/agent/models.yml) to the
     # Docker host. The actual gateway listens on 127.0.0.1:4000 on the host;
     # `host-gateway` is Docker's alias for the host bridge IP.
@@ -143,6 +157,47 @@ services:
       # against the same per-issue worktrees the orchestrator builds.
       - robomp_data:/data
 
+  # ───────────────────────────────────────────────────────────────────────────
+  # pr-review-db / pr-review-cache
+  #
+  # Throwaway Postgres + Redis reachable only on the `default` network via the
+  # `db`/`cache` aliases. No host port mapping. Used by incoming-PR review
+  # sandboxes so HOA `manage.py test` targets run for real.
+  # ───────────────────────────────────────────────────────────────────────────
+  pr-review-db:
+    image: postgres:16-alpine
+    stop_grace_period: 15s
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_DB: postgres
+      POSTGRES_PASSWORD: postgres
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks:
+      default:
+        aliases:
+          - db
+    volumes:
+      - robomp_pr_review_pgdata:/var/lib/postgresql/data
+
+  pr-review-cache:
+    image: redis:6.2-alpine
+    stop_grace_period: 15s
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks:
+      default:
+        aliases:
+          - cache
+
 networks:
   # External-facing bridge: webhook ingress (8080) and the orchestrator's
   # outbound path to the host LLM gateway via extra_hosts.
@@ -155,3 +210,4 @@ networks:
 volumes:
   # Docker-managed Linux volume so UID/GID permissions on /data are enforced.
   robomp_data: {}
+  robomp_pr_review_pgdata: {}

@@ -61,6 +61,7 @@ class PullRequestInfo:
     author_type: str = ""
     labels: tuple[str, ...] = ()
     updated_at: str = ""
+    merged: bool = False
 
 
 @dataclass(slots=True, frozen=True)

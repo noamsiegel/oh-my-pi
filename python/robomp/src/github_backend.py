@@ -9,7 +9,7 @@ dataclasses (`IssueInfo`, `RepoInfo`, …) defined in `github_types`.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 from robomp.github_types import (
     CommentInfo,
@@ -38,7 +38,9 @@ class GitHubBackend(Protocol):
     async def list_closing_pull_requests(self, repo: str, number: int) -> tuple[int, ...]: ...
 
     async def get_pull_request(self, repo: str, number: int) -> PullRequestInfo: ...
-    async def list_open_pull_requests(self, repo: str, *, limit: int = 30) -> list[PullRequestInfo]: ...
+    async def list_pull_requests(
+        self, repo: str, *, state: Literal["open", "closed", "all"] = "open", limit: int = 30
+    ) -> list[PullRequestInfo]: ...
 
 
     async def list_pr_files(self, repo: str, pr_number: int) -> list[PullRequestFileInfo]: ...
@@ -70,6 +72,8 @@ class GitHubBackend(Protocol):
     # ---- writes ----
     async def post_comment(self, repo: str, number: int, body: str) -> CommentInfo: ...
 
+    async def update_comment(self, repo: str, comment_id: int, body: str) -> CommentInfo: ...
+
     async def open_pull_request(
         self,
         *,
@@ -92,6 +96,10 @@ class GitHubBackend(Protocol):
     ) -> None: ...
 
     async def add_issue_labels(self, repo: str, number: int, labels: list[str]) -> tuple[str, ...]: ...
+
+    async def remove_issue_label(self, repo: str, number: int, name: str) -> tuple[str, ...]: ...
+
+    async def set_label(self, repo: str, name: str, *, color: str, description: str | None = None) -> None: ...
 
     async def submit_pr_review(
         self,

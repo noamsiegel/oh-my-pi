@@ -643,6 +643,42 @@ async def test_get_commit_ci_status_parses_proxy_payload() -> None:
     assert ci.checks[0].name == "build"
     assert ci.checks[0].source == "check_run"
 
+
+async def test_list_pull_requests_sends_state_and_parses_merged() -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        assert req.url.path == "/gh/v1/pull_requests"
+        assert req.url.params.get("repo") == "octo/widget"
+        assert req.url.params.get("state") == "closed"
+        return httpx.Response(
+            200,
+            json={
+                "items": [
+                    {
+                        "repo": "octo/widget",
+                        "number": 9,
+                        "html_url": "https://github.com/octo/widget/pull/9",
+                        "head_ref": "fix",
+                        "base_ref": "main",
+                        "state": "closed",
+                        "head_sha": "abc",
+                        "author": "alice",
+                        "merged": True,
+                    }
+                ]
+            },
+        )
+
+    client = GitHubProxyClient(
+        base_url="http://proxy.test",
+        hmac_key=_HMAC,
+        transport=httpx.MockTransport(handler),
+    )
+    prs = await client.list_pull_requests("octo/widget", state="closed")
+    assert len(prs) == 1
+    assert isinstance(prs[0], PullRequestInfo)
+    assert prs[0].merged is True
+    assert prs[0].state == "closed"
+
 # ============================================================================
 # 3. Error decode
 # ============================================================================

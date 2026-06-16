@@ -386,7 +386,7 @@ def route(
         number = _check_payload_pr_number(payload)
         if number is None:
             return RouteDecision("skip", None, repo, None, f"{event_type}.completed missing PR number")
-        return RouteDecision("queue", "review_pr", repo, issue_key(repo, number), f"{event_type}.completed")
+        return RouteDecision("queue", "probe_pr_review_ci", repo, issue_key(repo, number), f"{event_type}.completed")
 
     if event_type == "status":
         return RouteDecision("skip", None, repo, None, "status webhook ignored; PR number unavailable")

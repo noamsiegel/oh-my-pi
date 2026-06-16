@@ -13,6 +13,7 @@ from robomp.config import (
     load_proxy_settings,
     reset_settings_cache,
 )
+from robomp.pr_review_tools import pr_review_runtime_env
 
 
 def test_settings_load_from_env(env: dict[str, str]) -> None:
@@ -101,6 +102,56 @@ def test_pr_review_ci_gate_env_parses(monkeypatch: pytest.MonkeyPatch, env: dict
     assert cfg.pr_review_ci_gate_enabled is True
     assert cfg.pr_review_ci_gate_retry_seconds == 42.0
     assert cfg.pr_review_ci_gate_timeout_seconds == 99.0
+
+
+def test_workspace_gc_env_defaults_and_overrides(monkeypatch: pytest.MonkeyPatch, env: dict[str, str]) -> None:
+    cfg = Settings()  # type: ignore[call-arg]
+    assert cfg.workspace_gc_interval_seconds == 1800.0
+    assert cfg.workspace_gc_max_age_seconds == 86400.0
+    assert cfg.workspace_gc_max_bytes == 120 * 1024**3
+    assert cfg.workspace_gc_min_free_bytes == 100 * 1024**3
+    monkeypatch.setenv("ROBOMP_WORKSPACE_GC_INTERVAL_SECONDS", "60")
+    monkeypatch.setenv("ROBOMP_WORKSPACE_GC_MAX_AGE_SECONDS", "3600")
+    monkeypatch.setenv("ROBOMP_WORKSPACE_GC_MAX_BYTES", "12345")
+    monkeypatch.setenv("ROBOMP_WORKSPACE_GC_MIN_FREE_BYTES", "67890")
+    reset_settings_cache()
+    overridden = Settings()  # type: ignore[call-arg]
+    assert overridden.workspace_gc_interval_seconds == 60.0
+    assert overridden.workspace_gc_max_age_seconds == 3600.0
+    assert overridden.workspace_gc_max_bytes == 12345
+    assert overridden.workspace_gc_min_free_bytes == 67890
+
+
+def test_pr_review_hoa_env_parses(monkeypatch: pytest.MonkeyPatch, env: dict[str, str]) -> None:
+    reset_settings_cache()
+    cfg = Settings()  # type: ignore[call-arg]
+    assert cfg.pr_review_hoa_db_host == ""
+    assert pr_review_runtime_env(cfg) == {}
+
+    monkeypatch.setenv("ROBOMP_PR_REVIEW_HOA_DB_HOST", "db")
+    monkeypatch.setenv("ROBOMP_PR_REVIEW_HOA_DB_NAME", "hoa")
+    monkeypatch.setenv("ROBOMP_PR_REVIEW_HOA_DB_USER", "hoauser")
+    monkeypatch.setenv("ROBOMP_PR_REVIEW_HOA_DB_PASS", "hoapass")
+    monkeypatch.setenv("ROBOMP_PR_REVIEW_HOA_DB_PORT", "5544")
+    monkeypatch.setenv("ROBOMP_PR_REVIEW_HOA_REDIS_HOST", "cache")
+    reset_settings_cache()
+    cfg = Settings()  # type: ignore[call-arg]
+    assert cfg.pr_review_hoa_db_host == "db"
+    assert cfg.pr_review_hoa_db_name == "hoa"
+    assert cfg.pr_review_hoa_db_user == "hoauser"
+    assert cfg.pr_review_hoa_db_pass == "hoapass"
+    assert cfg.pr_review_hoa_db_port == "5544"
+    assert cfg.pr_review_hoa_redis_host == "cache"
+    assert pr_review_runtime_env(cfg) == {
+        "ENV": "dev",
+        "IS_LOCAL": "1",
+        "DB_NAME": "hoa",
+        "DB_USER": "hoauser",
+        "DB_PASS": "hoapass",
+        "DB_HOST": "db",
+        "DB_PORT": "5544",
+        "REDIS_HOST": "cache",
+    }
 
 
 def test_pr_review_delegate_models_parse(monkeypatch: pytest.MonkeyPatch, env: dict[str, str]) -> None:

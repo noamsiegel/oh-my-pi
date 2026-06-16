@@ -355,6 +355,40 @@ async def test_get_issue(proxy_settings: ProxySettings) -> None:
     assert payload["is_pull_request"] is False
 
 
+async def test_list_pull_requests_forwards_state_and_serializes_merged(proxy_settings: ProxySettings) -> None:
+    def gh(req: httpx.Request) -> httpx.Response:
+        assert req.url.path == "/repos/octo/widget/pulls"
+        assert req.url.params.get("state") == "closed"
+        return httpx.Response(
+            200,
+            json=[
+                {
+                    "number": 9,
+                    "html_url": "https://github.com/octo/widget/pull/9",
+                    "head": {"ref": "fix", "sha": "abc", "repo": {"full_name": "octo/widget"}},
+                    "base": {"ref": "main"},
+                    "state": "closed",
+                    "user": {"login": "alice"},
+                    "merged_at": "2026-06-12T00:00:00Z",
+                }
+            ],
+        )
+
+    app = _build_app(proxy_settings, gh)
+    params = {"repo": "octo/widget", "state": "closed"}
+    async with await _async_client(app) as client:
+        resp = await client.get(
+            "/gh/v1/pull_requests",
+            params=params,
+            headers=_signed("GET", "/gh/v1/pull_requests", params=params),
+        )
+    assert resp.status_code == 200
+    items = resp.json()["items"]
+    assert len(items) == 1
+    assert items[0]["state"] == "closed"
+    assert items[0]["merged"] is True
+
+
 async def test_list_issues(proxy_settings: ProxySettings) -> None:
     def gh(req: httpx.Request) -> httpx.Response:
         assert req.url.path == "/repos/octo/widget/issues"

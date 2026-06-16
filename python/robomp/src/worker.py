@@ -47,8 +47,13 @@ from robomp.github_types import (
 from robomp.host_tools import AbortController, ToolBindings, _git_identity_env
 from robomp.natives_cache import NativesCache
 from robomp.natives_cache import compute_key as natives_compute_key
+from robomp.pr_review_tools import pr_review_runtime_env
 from robomp.sandbox import GitTransport, Workspace, _prepare_slot_runtime_env, _safe_directory_env
-from robomp.task_outcome import DEFAULT_TASK_RETRY_DELAY_SECONDS, DeferredTask
+from robomp.task_outcome import (
+    DEFAULT_TASK_RETRY_DELAY_SECONDS,
+    MAX_INFRA_UNAVAILABLE_ATTEMPTS,
+    InfrastructureUnavailable,
+)
 
 _NATIVES_CACHE_CAPTURE_TIMEOUT_SECONDS = 30.0
 
@@ -233,10 +238,34 @@ def _auth_broker_unavailable_reason(env: Mapping[str, str] | None = None, *, tim
         return f"OMP auth broker unavailable at {health_url}: {exc}"
 
 
+def _auth_broker_defer_attempts() -> int:
+    raw = os.environ.get("ROBOMP_AUTH_BROKER_DEFER_MAX_ATTEMPTS", "").strip()
+    if not raw:
+        return MAX_INFRA_UNAVAILABLE_ATTEMPTS
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return MAX_INFRA_UNAVAILABLE_ATTEMPTS
+
+
 def _defer_if_auth_broker_unavailable() -> None:
     reason = _auth_broker_unavailable_reason()
-    if reason is not None:
-        raise DeferredTask(reason, retry_delay_seconds=DEFAULT_TASK_RETRY_DELAY_SECONDS)
+    if reason is None:
+        return
+    retry_limit = _auth_broker_defer_attempts()
+    # Surface the cause loudly and cap the retries. Previously this deferred
+    # silently and forever (uncapped DeferredTask), which hid a multi-day broker
+    # outage behind reasonless "retry scheduled" lines. Capping dead-letters the
+    # delivery so the watchdog alerts; the reconciler re-queues once healthy.
+    log.warning(
+        "auth broker unavailable; deferring task",
+        extra={"reason": reason, "retry_limit": retry_limit},
+    )
+    raise InfrastructureUnavailable(
+        reason,
+        retry_delay_seconds=DEFAULT_TASK_RETRY_DELAY_SECONDS,
+        retry_limit=retry_limit,
+    )
 
 
 _TERMINAL_TRIAGE_TOOLS: frozenset[str] = frozenset({"gh_open_pr", "mark_unable_to_reproduce", "abort_task"})
@@ -538,6 +567,8 @@ def _run_rpc_blocking(
     rpc_env.update(_prepare_slot_runtime_env(inputs.workspace, inputs.slot_uid))
     rpc_env.update(_safe_directory_env(bindings.workspace.repo_dir))
     rpc_env.update(_git_identity_env(inputs.settings.resolved_author_name, inputs.settings.git_author_email))
+    if task_kind == "review_pr":
+        rpc_env.update(pr_review_runtime_env(settings))
     resuming = _has_prior_session(bindings.workspace.session_dir)
     extra_args: tuple[str, ...] = ("--continue",) if resuming else ()
     log.info(

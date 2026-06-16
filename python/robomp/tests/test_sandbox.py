@@ -612,6 +612,73 @@ def test_ensure_workspace_recreates_corrupt_same_head_pr_workspace(tmp_path: Pat
     assert head == sha
     assert rewritten["head_sha"] == sha
 
+def test_remove_superseded_pr_review_workspaces_keeps_current_head(tmp_path: Path, upstream_repo: Path) -> None:
+    sha1 = _publish_pr_readme(upstream_repo, tmp_path, ref="refs/pull/7/head", content="head one\n", clone_name="sup-one")
+    mgr = SandboxManager(tmp_path / "workspaces")
+    ws1 = mgr.ensure_workspace(
+        repo="octo/widget",
+        number=7,
+        title="incoming PR",
+        clone_url=str(upstream_repo),
+        default_branch="main",
+        pr_head=7,
+        pr_head_sha=sha1,
+        pr_base_ref="main",
+        pr_changed_paths=("README.md",),
+        author_name="robomp-bot",
+        author_email="robomp-bot@example.invalid",
+    )
+    sha2 = _publish_pr_readme(upstream_repo, tmp_path, ref="refs/pull/7/head", content="head two\n", clone_name="sup-two")
+    ws2 = mgr.ensure_workspace(
+        repo="octo/widget",
+        number=7,
+        title="incoming PR",
+        clone_url=str(upstream_repo),
+        default_branch="main",
+        pr_head=7,
+        pr_head_sha=sha2,
+        pr_base_ref="main",
+        pr_changed_paths=("README.md",),
+        author_name="robomp-bot",
+        author_email="robomp-bot@example.invalid",
+    )
+    assert ws1.root.exists()
+    assert ws2.root.exists()
+
+    removed = mgr.remove_superseded_pr_review_workspaces(repo="octo/widget", number=7, keep_head_sha=sha2)
+
+    assert removed == 1
+    assert not ws1.root.exists()
+    assert ws2.root.exists()
+    assert ws2.repo_dir.exists()
+    assert mgr.pool_path("octo/widget").exists()
+
+
+def test_remove_superseded_pr_review_workspaces_skips_malformed_dirs_and_pool(tmp_path: Path) -> None:
+    root = tmp_path / "workspaces"
+    mgr = SandboxManager(root)
+    old = "a" * 40
+    keep = "b" * 40
+    other_pr = "c" * 40
+    (root / f"octo__widget__7__{old}").mkdir()
+    (root / f"octo__widget__7__{keep}").mkdir()
+    (root / f"octo__widget__8__{other_pr}").mkdir()
+    (root / "octo__widget__7__notahex").mkdir()
+    (root / "random-dir").mkdir()
+    (mgr.pool / "octo__widget").mkdir()
+
+    removed = mgr.remove_superseded_pr_review_workspaces(repo="octo/widget", number=7, keep_head_sha=keep)
+
+    assert removed == 1
+    assert not (root / f"octo__widget__7__{old}").exists()
+    assert (root / f"octo__widget__7__{keep}").exists()
+    assert (root / f"octo__widget__8__{other_pr}").exists()
+    assert (root / "octo__widget__7__notahex").exists()
+    assert (root / "random-dir").exists()
+    assert mgr.pool.exists()
+    assert (mgr.pool / "octo__widget").exists()
+
+
 
 def test_chown_workspace_noops_when_not_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[tuple[list[str], bool]] = []

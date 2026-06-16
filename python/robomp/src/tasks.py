@@ -13,7 +13,7 @@ from typing import Any
 
 from robomp import persona
 from robomp.config import Settings
-from robomp.db import Database, IssueRow, IssueState, issue_key
+from robomp.db import Database, IssueRow, IssueState, PrReviewGateTransition, issue_key
 from robomp.github_backend import GitHubBackend
 from robomp.github_payloads import parse_issue_payload, repo_full_name
 from robomp.github_types import (
@@ -27,6 +27,7 @@ from robomp.github_types import (
 )
 from robomp.pr_review_suggestion_fastpath import accepted_suggestions_fast_path_result
 from robomp.pr_review_policy import matching_review_labels, normalize_label_names
+from robomp.pr_review_tools import pr_review_comment_retryable
 from robomp.sandbox import GitTransport, SandboxManager, Workspace
 from robomp.task_outcome import DeferredTask, TaskOutcome, TransientTaskError
 from robomp.worker import DirectiveInfo, PrReviewFocus, TaskInputs, ThreadMessage, run_task
@@ -55,6 +56,42 @@ def _elapsed_since_iso(ts: str | None) -> float | None:
 
 def _ci_gate_summary(ci: PullRequestCiStatusInfo) -> str:
     return f"state={ci.state} total={ci.total_count} pending={ci.pending_count} failed={ci.failed_count}"
+
+
+def _expected_head_sha(payload: Mapping[str, Any]) -> str | None:
+    """Head SHA the event was queued for (reconciler payload + native webhooks
+    both carry ``pull_request.head.sha``). Lets the worker skip a review whose
+    head was superseded by a newer push before it ran, instead of reviewing or
+    gate-commenting on a now-stale head."""
+    pr = payload.get("pull_request")
+    if not isinstance(pr, Mapping):
+        return None
+    head = pr.get("head")
+    if not isinstance(head, Mapping):
+        return None
+    sha = head.get("sha")
+    return sha if isinstance(sha, str) and sha else None
+
+
+def _event_head_sha(payload: Mapping[str, Any]) -> str | None:
+    """Head SHA an event concerns, across PR + CI webhook shapes — used to
+    debounce a burst of CI webhooks for the same head before any GitHub fetch."""
+    pr = payload.get("pull_request")
+    if isinstance(pr, Mapping):
+        head = pr.get("head")
+        if isinstance(head, Mapping) and isinstance(head.get("sha"), str) and head["sha"]:
+            return head["sha"]
+    for node_key in ("check_run", "check_suite"):
+        node = payload.get(node_key)
+        if isinstance(node, Mapping):
+            sha = node.get("head_sha")
+            if isinstance(sha, str) and sha:
+                return sha
+            suite = node.get("check_suite")
+            if isinstance(suite, Mapping) and isinstance(suite.get("head_sha"), str) and suite["head_sha"]:
+                return suite["head_sha"]
+    sha = payload.get("sha")  # status event
+    return sha if isinstance(sha, str) and sha else None
 
 
 def _pr_review_ci_gate_outcome(
@@ -154,8 +191,13 @@ async def _post_pr_review_started_comment(
     trigger = sorted(matching_review_labels(labels, allowed_labels))
     trigger_text = f" triggered by `{trigger[0]}`" if trigger else ""
     if review_focus.mode == "verify-fixes":
+        detail = (
+            "verifying fixes for my prior requested changes"
+            if review_focus.prior_review_state == "CHANGES_REQUESTED"
+            else "re-reviewing the changes since my last review"
+        )
         body = (
-            f"Robo-MS is verifying fixes for my prior requested changes on this PR now{trigger_text}. "
+            f"Robo-MS is {detail} on this PR now{trigger_text}. "
             "I’ll post an `APPROVE` or `REQUEST_CHANGES` review when the eval finishes."
         )
     else:
@@ -198,8 +240,17 @@ async def _post_pr_review_started_comment(
     )
 
 
-async def _post_pr_review_ci_gate_comment(
+def _ci_gate_notice_body(ci: PullRequestCiStatusInfo) -> str:
+    return (
+        "Robo-MS won’t review this PR until all CI checks pass "
+        f"({ci.failed_count} failing, {ci.pending_count} pending of {ci.total_count} checks). "
+        "I’ll review automatically once the checks are green — push fixes or re-run CI and I’ll pick it up."
+    )
+
+
+async def _apply_pr_review_ci_gate(
     *,
+    settings: Settings,
     db: Database,
     github: GitHubBackend,
     key: str,
@@ -207,39 +258,134 @@ async def _post_pr_review_ci_gate_comment(
     pr_number: int,
     head_sha: str,
     ci: PullRequestCiStatusInfo,
-) -> None:
-    """Post a one-time notice that review is gated on CI, keyed per head SHA so
-    retries and reconciler cycles never repost. Only called for terminal skips
-    (failed / timed-out CI), never for transient pending deferrals."""
-    operation_key = f"post_pr_review_ci_gate_notice:{key}:{head_sha}"
-    if not db.reserve_side_effect(operation_key):
-        succeeded = db.side_effect_succeeded(operation_key)
-        message = "side effect already succeeded: %s" if succeeded else "side effect already pending: %s"
-        log.info(message, operation_key, extra={"key": key, "operation_key": operation_key, "succeeded": succeeded})
-        return
-    body = (
-        "Robo-MS won’t review this PR until all CI checks pass "
-        f"({ci.failed_count} failing, {ci.pending_count} pending of {ci.total_count} checks). "
-        "I’ll review automatically once the checks are green — push fixes or re-run CI and I’ll pick it up."
+    received_at: str | None,
+) -> TaskOutcome | None:
+    """Evaluate the CI gate for the live head, advance per-PR gate state, and
+    post/refresh the single per-episode notice. Returns the gate outcome:
+    ``None`` => CI passed (proceed to review); skipped/deferred otherwise.
+
+    Shared by ``review_pr`` and the cheap ``probe_pr_review_ci`` task so both
+    paths share one idempotent, episode-scoped notification."""
+    outcome = _pr_review_ci_gate_outcome(settings, ci, received_at=received_at)
+    signature = _ci_gate_summary(ci)
+    if outcome is None:
+        db.transition_pr_review_gate(
+            issue_key=key,
+            repo=repo_full,
+            pr_number=pr_number,
+            head_sha=head_sha,
+            gate_status="passed",
+            ci_signature=signature,
+        )
+        return None
+    gate_status = "blocked" if outcome.state == "skipped" else "pending"
+    transition = db.transition_pr_review_gate(
+        issue_key=key,
+        repo=repo_full,
+        pr_number=pr_number,
+        head_sha=head_sha,
+        gate_status=gate_status,
+        ci_signature=signature,
     )
+    log.info(
+        "PR CI gate blocked review",
+        extra={
+            "repo": repo_full,
+            "pr": pr_number,
+            "state": ci.state,
+            "total": ci.total_count,
+            "pending": ci.pending_count,
+            "failed": ci.failed_count,
+            "gate_status": gate_status,
+            "episode": transition.episode,
+            "notify": transition.should_notify,
+        },
+    )
+    if gate_status == "blocked":
+        await _maybe_post_pr_review_ci_gate_notice(
+            settings=settings,
+            db=db,
+            github=github,
+            key=key,
+            repo_full=repo_full,
+            pr_number=pr_number,
+            head_sha=head_sha,
+            ci=ci,
+            transition=transition,
+        )
+    return outcome
+
+
+async def _maybe_post_pr_review_ci_gate_notice(
+    *,
+    settings: Settings,
+    db: Database,
+    github: GitHubBackend,
+    key: str,
+    repo_full: str,
+    pr_number: int,
+    head_sha: str,
+    ci: PullRequestCiStatusInfo,
+    transition: PrReviewGateTransition,
+) -> None:
+    """Post exactly one gate notice per blocking episode, then (optionally) edit
+    that same comment in place as CI counts change. Idempotent across heads and
+    reconciler cycles: the create is keyed on the episode, and a sticky edit only
+    fires when the CI signature changed within an already-announced episode."""
+    body = _ci_gate_notice_body(ci)
+    if transition.should_notify:
+        operation_key = f"post_pr_review_ci_gate_notice:{key}:episode:{transition.episode}"
+        if not db.reserve_side_effect(operation_key):
+            return
+        try:
+            comment = await github.post_comment(repo_full, pr_number, body)
+        except GitHubError as exc:
+            db.mark_side_effect_failed(operation_key, str(exc))
+            db.log_tool_call(
+                issue_key=key,
+                tool=operation_key,
+                args={"repo": repo_full, "pr": pr_number, "head_sha": head_sha, "ci_state": ci.state, "episode": transition.episode},
+                error=str(exc),
+            )
+            log.warning("CI gate comment failed", extra={"repo": repo_full, "pr": pr_number, "err": str(exc)})
+            return
+        db.mark_side_effect_succeeded(operation_key)
+        db.mark_pr_review_gate_notified(key, episode=transition.episode, comment_id=comment.id)
+        db.log_tool_call(
+            issue_key=key,
+            tool=operation_key,
+            args={"repo": repo_full, "pr": pr_number, "head_sha": head_sha, "ci_state": ci.state, "episode": transition.episode},
+            result={"comment_id": comment.id, "episode": transition.episode},
+        )
+        return
+    comment_id = transition.state.last_notice_comment_id
+    if not (
+        settings.pr_review_gate_sticky_comment_enabled
+        and transition.signature_changed
+        and comment_id is not None
+    ):
+        return
+    operation_key = f"update_pr_review_ci_gate_notice:{key}:episode:{transition.episode}:{_ci_gate_summary(ci)}"
+    if not db.reserve_side_effect(operation_key):
+        return
     try:
-        comment = await github.post_comment(repo_full, pr_number, body)
+        await github.update_comment(repo_full, comment_id, body)
     except GitHubError as exc:
         db.mark_side_effect_failed(operation_key, str(exc))
         db.log_tool_call(
             issue_key=key,
             tool=operation_key,
-            args={"repo": repo_full, "pr": pr_number, "head_sha": head_sha, "ci_state": ci.state},
+            args={"repo": repo_full, "pr": pr_number, "comment_id": comment_id, "ci_state": ci.state},
             error=str(exc),
         )
-        log.warning("CI gate comment failed", extra={"repo": repo_full, "pr": pr_number, "err": str(exc)})
+        log.warning("CI gate comment edit failed", extra={"repo": repo_full, "pr": pr_number, "err": str(exc)})
         return
     db.mark_side_effect_succeeded(operation_key)
     db.log_tool_call(
         issue_key=key,
         tool=operation_key,
-        args={"repo": repo_full, "pr": pr_number, "head_sha": head_sha, "ci_state": ci.state},
-        result={"comment_id": comment.id},
+        args={"repo": repo_full, "pr": pr_number, "comment_id": comment_id, "ci_state": ci.state},
+        result={"comment_id": comment_id, "episode": transition.episode},
     )
 
 
@@ -474,29 +620,14 @@ async def triage_issue(
     await run_task(task_kind="triage_issue", inputs=inputs)
 
 
-def _comment_review_retryable(review_body: str) -> bool:
-    body = review_body.lower()
-    retryable_markers = (
-        "promotedsection is not defined",
-        "command not found: uv",
-        "`uv` is not installed",
-        "`uv` is unavailable",
-        "uv is not installed",
-        "uv is unavailable",
-        "manage.py`/`yarn` unavailable",
-        "manage.py/yarn unavailable",
-        "yarn unavailable",
-        "command not found: yarn",
-    )
-    return any(marker in body for marker in retryable_markers)
-
 def _pr_review_focus(latest_review: PullRequestReviewInfo | None, head_sha: str) -> PrReviewFocus:
-    if (
-        latest_review is not None
-        and latest_review.state.upper() == "CHANGES_REQUESTED"
-        and latest_review.commit_id != head_sha
-    ):
-        prior = latest_review.commit_id or ""
+    if latest_review is None:
+        return PrReviewFocus()
+    state = latest_review.state.upper()
+    prior = latest_review.commit_id or ""
+    # CHANGES_REQUESTED: its blocking findings must be verified, so re-review in verify-fixes
+    # even when the prior commit is unknown (the agent verifies against the full diff).
+    if state == "CHANGES_REQUESTED" and prior != head_sha:
         reason = (
             "verify fixes for prior bot CHANGES_REQUESTED review"
             if prior
@@ -506,6 +637,22 @@ def _pr_review_focus(latest_review: PullRequestReviewInfo | None, head_sha: str)
             mode="verify-fixes",
             reason=reason,
             prior_review_state="CHANGES_REQUESTED",
+            prior_review_commit_id=prior,
+            prior_review_id=latest_review.id,
+            prior_review_submitted_at=latest_review.submitted_at,
+        )
+    # APPROVE/COMMENT: non-blocking. Re-review only the incremental delta, which needs a known
+    # prior commit. A transient-failure COMMENT is not a real verdict and never anchors.
+    if (
+        state in {"APPROVED", "COMMENTED"}
+        and prior
+        and prior != head_sha
+        and not (state == "COMMENTED" and pr_review_comment_retryable(latest_review.body))
+    ):
+        return PrReviewFocus(
+            mode="verify-fixes",
+            reason=f"incremental re-review of delta since prior bot {state} review",
+            prior_review_state=state,
             prior_review_commit_id=prior,
             prior_review_id=latest_review.id,
             prior_review_submitted_at=latest_review.submitted_at,
@@ -568,35 +715,31 @@ async def review_pr(
         log.info("skip: PR authored by bot", extra={"repo": repo_full, "pr": pr_number, "author": pr.author})
         return _skipped("skip: PR authored by bot")
     key = issue_key(repo.full_name, pr_number)
+    expected_head = _expected_head_sha(payload)
+    if expected_head and expected_head != pr.head_sha:
+        log.info(
+            "skip: review_pr head superseded since event was queued",
+            extra={"repo": repo_full, "pr": pr_number, "expected_head": expected_head, "head_sha": pr.head_sha},
+        )
+        return _skipped("skip: PR head superseded since event was queued")
     if settings.pr_review_ci_gate_enabled:
         try:
             ci_status = await github.get_commit_ci_status(repo.full_name, pr.head_sha)
         except GitHubError as exc:
             log.warning("PR CI status fetch failed", extra={"repo": repo.full_name, "pr": pr_number, "err": str(exc)})
             raise _github_fetch_failed(exc) from exc
-        ci_outcome = _pr_review_ci_gate_outcome(settings, ci_status, received_at=received_at)
+        ci_outcome = await _apply_pr_review_ci_gate(
+            settings=settings,
+            db=db,
+            github=github,
+            key=key,
+            repo_full=repo_full,
+            pr_number=pr_number,
+            head_sha=pr.head_sha,
+            ci=ci_status,
+            received_at=received_at,
+        )
         if ci_outcome is not None:
-            log.info(
-                "PR CI gate blocked review",
-                extra={
-                    "repo": repo.full_name,
-                    "pr": pr_number,
-                    "state": ci_status.state,
-                    "total": ci_status.total_count,
-                    "pending": ci_status.pending_count,
-                    "failed": ci_status.failed_count,
-                },
-            )
-            if ci_outcome.state == "skipped":
-                await _post_pr_review_ci_gate_comment(
-                    db=db,
-                    github=github,
-                    key=key,
-                    repo_full=repo_full,
-                    pr_number=pr_number,
-                    head_sha=pr.head_sha,
-                    ci=ci_status,
-                )
             return ci_outcome
     review_labeled = "triaged" in labels or any(label.startswith("review:") for label in labels)
     try:
@@ -619,7 +762,7 @@ async def review_pr(
         latest_state = latest_review.state.upper()
         if latest_state in {"APPROVED", "COMMENTED"}:
             if latest_review.commit_id == pr.head_sha:
-                if latest_state == "COMMENTED" and _comment_review_retryable(latest_review.body):
+                if latest_state == "COMMENTED" and pr_review_comment_retryable(latest_review.body):
                     log.info("retrying PR review after retryable comment-only failure", extra={"repo": repo_full, "pr": pr_number})
                 else:
                     reason = "skip: PR already approved by bot" if latest_state == "APPROVED" else "skip: PR already commented by bot"
@@ -677,7 +820,12 @@ async def review_pr(
         if path
     )
 
-    workspace = sandbox.ensure_workspace(
+    # Git worktree prep fetches the (large) monorepo through the proxy with a
+    # synchronous client; run it off the event loop so the HTTP server (health,
+    # webhook receipt) stays responsive while reviews run. run_task already does
+    # the same for the agent RPC.
+    workspace = await asyncio.to_thread(
+        sandbox.ensure_workspace,
         repo=repo.full_name,
         number=pr_number,
         title=issue.title,
@@ -692,7 +840,36 @@ async def review_pr(
         slot_uid=slot_uid,
     )
 
-    if review_focus.mode == "verify-fixes" and latest_review is not None and latest_review.commit_id:
+    # Reap superseded PR-head workspaces for this PR. claim_next_event()
+    # serializes queued/running rows by issue_key, so no other event for this
+    # PR runs concurrently; only older heads remain to remove.
+    # Best-effort: cleanup of stale-head workspaces must never fail the review of
+    # the current head (a `git worktree remove` can time out under disk/IO load).
+    try:
+        removed = await asyncio.to_thread(
+            sandbox.remove_superseded_pr_review_workspaces,
+            repo=repo.full_name,
+            number=pr_number,
+            keep_head_sha=pr.head_sha,
+        )
+    except Exception as exc:  # noqa: BLE001 - stale-head cleanup is non-critical
+        log.warning(
+            "pr_review superseded workspace cleanup failed (non-fatal)",
+            extra={"repo": repo.full_name, "pr": pr_number, "head_sha": pr.head_sha, "err": str(exc)},
+        )
+    else:
+        if removed > 0:
+            log.info(
+                "pr_review superseded workspaces removed",
+                extra={"repo": repo.full_name, "pr": pr_number, "removed": removed, "head_sha": pr.head_sha},
+            )
+
+    if (
+        review_focus.mode == "verify-fixes"
+        and review_focus.prior_review_state == "CHANGES_REQUESTED"
+        and latest_review is not None
+        and latest_review.commit_id
+    ):
         posted_findings = db.list_pr_review_posted_findings(repo.full_name, pr_number)
         prior_review_id = latest_review.id
         blocking_findings = tuple(
@@ -711,7 +888,8 @@ async def review_pr(
                 extra={"repo": repo.full_name, "pr": pr_number, "prior_review_id": prior_review_id},
             )
         else:
-            prior_verify = _run_workspace_git(
+            prior_verify = await asyncio.to_thread(
+                _run_workspace_git,
                 workspace,
                 ["git", "rev-parse", "--verify", "--quiet", latest_review.commit_id],
                 timeout=30.0,
@@ -727,7 +905,8 @@ async def review_pr(
                     },
                 )
             else:
-                delta = _run_workspace_git(
+                delta = await asyncio.to_thread(
+                    _run_workspace_git,
                     workspace,
                     ["git", "diff", "--no-color", f"{latest_review.commit_id}..{pr.head_sha}", "--", *changed_paths],
                     timeout=60.0,
@@ -813,6 +992,13 @@ async def review_pr(
                             github_review_id=review.id,
                             event=event,
                         )
+                        db.transition_pr_review_gate(
+                            issue_key=key,
+                            repo=repo.full_name,
+                            pr_number=pr_number,
+                            head_sha=pr.head_sha,
+                            gate_status="reviewed",
+                        )
                         db.upsert_issue(
                             key=key,
                             repo=repo.full_name,
@@ -856,17 +1042,18 @@ async def review_pr(
                         },
                     )
 
-    await _post_pr_review_started_comment(
-        db=db,
-        github=github,
-        key=key,
-        repo_full=repo_full,
-        pr_number=pr_number,
-        labels=labels,
-        head_sha=pr.head_sha,
-        allowed_labels=allowed_labels,
-        review_focus=review_focus,
-    )
+    if settings.pr_review_started_comments_enabled:
+        await _post_pr_review_started_comment(
+            db=db,
+            github=github,
+            key=key,
+            repo_full=repo_full,
+            pr_number=pr_number,
+            labels=labels,
+            head_sha=pr.head_sha,
+            allowed_labels=allowed_labels,
+            review_focus=review_focus,
+        )
     db.upsert_issue(
         key=key,
         repo=repo.full_name,
@@ -892,6 +1079,132 @@ async def review_pr(
         pr_review_focus=review_focus,
     )
     await run_task(task_kind="review_pr", inputs=inputs, pr_number=pr_number, pr=pr)
+
+
+def _enqueue_review_for_head(db: Database, repo_full: str, pr: PullRequestInfo) -> bool:
+    """Queue a full ``review_pr`` for ``pr``'s current head after CI passed.
+    Idempotent per head via the delivery id, so a webhook-driven review for the
+    same head is never duplicated into a second agent run."""
+    delivery_id = f"ci-probe-review-{repo_full.replace('/', '__')}-{pr.number}-{pr.head_sha}"
+    payload = {
+        "action": "synchronize",
+        "repository": {"full_name": repo_full},
+        "pull_request": {
+            "number": pr.number,
+            "draft": pr.draft,
+            "state": pr.state,
+            "user": {"login": pr.author, "type": pr.author_type or "User"},
+            "head": {"sha": pr.head_sha, "ref": pr.head_ref},
+            "base": {"ref": pr.base_ref},
+            "labels": [{"name": label} for label in pr.labels],
+        },
+    }
+    return db.record_event(
+        delivery_id=delivery_id,
+        event_type="pull_request",
+        repo=repo_full,
+        issue_key=issue_key(repo_full, pr.number),
+        payload=payload,
+        state="queued",
+        task="review_pr",
+        route_reason="ci probe: CI passed",
+        route_version=1,
+    )
+
+
+async def probe_pr_review_ci(
+    *,
+    settings: Settings,
+    db: Database,
+    github: GitHubBackend,
+    payload: Mapping[str, Any],
+    delivery_id: str,
+    received_at: str | None = None,
+    event_issue_key: str | None = None,
+) -> TaskOutcome | None:
+    """Cheap CI-gate probe: confirm eligibility + current head, evaluate the CI
+    gate (advancing per-PR gate state and posting at most one episode notice),
+    and enqueue a full ``review_pr`` only once CI is green. Never builds a
+    workspace or runs the review agent, so red/pending heads cost a few reads
+    instead of a worker spin-up. Shared by check-webhook routing and the
+    reconciler backstop."""
+    # CI/check webhook payloads (check_suite/check_run/status) carry no
+    # ``pull_request.number``; the router resolves it into the event's issue_key,
+    # so prefer that and fall back to the payload for PR-shaped events.
+    if event_issue_key:
+        repo_full, _, num = event_issue_key.rpartition("#")
+        pr_number = int(num) if num.isdigit() else 0
+    else:
+        pr_node = payload.get("pull_request") or {}
+        pr_number = int(pr_node.get("number") or 0)
+        repo_full = repo_full_name(payload) or ""
+    if pr_number <= 0 or not repo_full:
+        return _skipped("skip: probe missing repo/number")
+    key = issue_key(repo_full, pr_number)
+    # Debounce a burst of CI webhooks for the same head before any GitHub fetch:
+    # if this head was gate-checked within the window, no-op. A new head (or a
+    # reconciler re-probe, which is interval >> debounce) still falls through.
+    if settings.pr_review_ci_gate_enabled:
+        event_head = _event_head_sha(payload)
+        if event_head:
+            gate = db.get_pr_review_gate_state(key)
+            if gate is not None and gate.current_head_sha == event_head:
+                elapsed = _elapsed_since_iso(gate.last_checked_at)
+                if elapsed is not None and elapsed < settings.pr_review_ci_debounce_seconds:
+                    return _skipped("skip: CI probe debounced (head checked recently)")
+    try:
+        issue, pr = await asyncio.gather(
+            github.get_issue(repo_full, pr_number),
+            github.get_pull_request(repo_full, pr_number),
+        )
+    except GitHubError as exc:
+        log.warning("probe_pr_review_ci fetch failed", extra={"repo": repo_full, "pr": pr_number, "err": str(exc)})
+        raise _github_fetch_failed(exc) from exc
+    if pr.state.lower() != "open":
+        return _skipped("skip: PR not open")
+    if pr.draft:
+        return _skipped("skip: PR is draft")
+    if pr.author.endswith("[bot]") or pr.author_type == "Bot":
+        return _skipped("skip: PR authored by bot")
+    labels = normalize_label_names(issue.labels)
+    allowed_labels = settings.pr_review_label_allowlist
+    if allowed_labels and labels.isdisjoint(allowed_labels):
+        return _skipped("skip: PR missing review trigger label")
+    expected_head = _expected_head_sha(payload)
+    if expected_head and expected_head != pr.head_sha:
+        return _skipped("skip: PR head superseded since probe was queued")
+    if db.has_completed_pr_review(repo_full, pr_number, pr.head_sha):
+        db.transition_pr_review_gate(
+            issue_key=key, repo=repo_full, pr_number=pr_number,
+            head_sha=pr.head_sha, gate_status="reviewed",
+        )
+        return _skipped("skip: PR review already submitted for head")
+    if not settings.pr_review_ci_gate_enabled:
+        enqueued = _enqueue_review_for_head(db, repo_full, pr)
+        return TaskOutcome("done", "CI gate disabled; review enqueued" if enqueued else "review already queued")
+    try:
+        ci_status = await github.get_commit_ci_status(repo_full, pr.head_sha)
+    except GitHubError as exc:
+        log.warning("probe CI status fetch failed", extra={"repo": repo_full, "pr": pr_number, "err": str(exc)})
+        raise _github_fetch_failed(exc) from exc
+    ci_outcome = await _apply_pr_review_ci_gate(
+        settings=settings,
+        db=db,
+        github=github,
+        key=key,
+        repo_full=repo_full,
+        pr_number=pr_number,
+        head_sha=pr.head_sha,
+        ci=ci_status,
+        received_at=received_at,
+    )
+    if ci_outcome is not None:
+        # blocked (skipped, episode notice handled) or pending (queued -> the
+        # queue re-runs this probe after the retry delay; backstop for missed
+        # check webhooks). Either way, no review is enqueued yet.
+        return ci_outcome
+    enqueued = _enqueue_review_for_head(db, repo_full, pr)
+    return TaskOutcome("done", "CI passed; review enqueued" if enqueued else "CI passed; review already queued")
 
 
 async def handle_comment(
@@ -972,9 +1285,10 @@ async def handle_comment(
         # Maintainer reopen: tear down stale workspace, reset state, branch
         # afresh from default. The old branch may have been merged/deleted.
         log.info("directive reopen", extra={"key": key, "from_state": existing.state, "author": directive.author})
-        sandbox.remove_workspace(repo=repo.full_name, number=issue.number)
+        await asyncio.to_thread(sandbox.remove_workspace, repo=repo.full_name, number=issue.number)
         db.upsert_issue(key=key, repo=repo.full_name, number=issue.number, state="reproducing")
-        workspace = sandbox.ensure_workspace(
+        workspace = await asyncio.to_thread(
+            sandbox.ensure_workspace,
             repo=repo.full_name,
             number=issue.number,
             title=issue.title,
@@ -1009,7 +1323,8 @@ async def handle_comment(
         await run_task(task_kind="handle_comment", inputs=inputs, comment=comment, directive=directive)
         return
 
-    workspace = sandbox.ensure_workspace(
+    workspace = await asyncio.to_thread(
+        sandbox.ensure_workspace,
         repo=repo.full_name,
         number=issue.number,
         title=issue.title,
@@ -1197,7 +1512,7 @@ async def handle_pr_conversation(
             "directive reopen (pr)",
             extra={"key": issue_row.key, "from_state": issue_row.state, "author": directive.author},
         )
-        sandbox.remove_workspace(repo=issue_row.repo, number=issue_row.number)
+        await asyncio.to_thread(sandbox.remove_workspace, repo=issue_row.repo, number=issue_row.number)
         db.upsert_issue(key=issue_row.key, repo=issue_row.repo, number=issue_row.number, state="reproducing")
         issue_row = db.get_issue(issue_row.key) or issue_row
     # Bare @mention with no request body — the route stashes an empty
@@ -1308,17 +1623,24 @@ async def cleanup_workspace(
     number = issue_payload.get("number")
     if not isinstance(number, int):
         return _skipped("skip: cleanup missing issue number")
-    # If this is a PR close, map to the originating issue.
-    issue_row: IssueRow | None
-    if "pull_request" in payload:
-        issue_row = db.find_issue_by_pr(repo_full, number)
+    # If this is a PR close, map to the originating issue first, then fall back
+    # to a directly-keyed issue row.
+    is_pr = "pull_request" in payload
+    if is_pr:
+        issue_row = db.find_issue_by_pr(repo_full, number) or db.get_issue(issue_key(repo_full, number))
     else:
         issue_row = db.get_issue(issue_key(repo_full, number))
-    if issue_row is None:
-        return _skipped("skip: cleanup missing issue row")
-    sandbox.remove_workspace(repo=issue_row.repo, number=issue_row.number)
-    db.set_issue_state(issue_row.key, target_state)
-    log.info("cleanup", extra={"key": issue_row.key, "state": target_state})
+    if issue_row is not None:
+        await asyncio.to_thread(sandbox.remove_workspace, repo=issue_row.repo, number=issue_row.number)
+        db.set_issue_state(issue_row.key, target_state)
+        log.info("cleanup", extra={"key": issue_row.key, "state": target_state})
+        return None
+    if is_pr:
+        # Direct incoming-PR workspace never mapped to an originating issue.
+        await asyncio.to_thread(sandbox.remove_workspace, repo=repo_full, number=number)
+        log.info("cleanup direct pr workspace", extra={"repo": repo_full, "pr": number, "state": target_state})
+        return None
+    return _skipped("skip: cleanup missing issue row")
 
 
 __all__ = [

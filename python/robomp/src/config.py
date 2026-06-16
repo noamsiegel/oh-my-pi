@@ -42,9 +42,31 @@ class Settings(BaseSettings):
     pr_review_ci_gate_enabled: bool = Field(False, alias="ROBOMP_PR_REVIEW_CI_GATE_ENABLED")
     pr_review_ci_gate_retry_seconds: float = Field(300.0, alias="ROBOMP_PR_REVIEW_CI_GATE_RETRY_SECONDS")
     pr_review_ci_gate_timeout_seconds: float = Field(7200.0, alias="ROBOMP_PR_REVIEW_CI_GATE_TIMEOUT_SECONDS")
+    # CI-gate hardening. The gate notice ("won't review until CI passes") is
+    # posted at most once per *blocking episode* (a contiguous run of red CI),
+    # not once per failing head — so an author iterating on a red PR no longer
+    # collects one bot comment per push. ``started_comments_enabled`` controls
+    # the legacy "reviewing now" ping (the review itself is the signal; off by
+    # default). ``ci_preflight`` routes CI-gated discovery through the cheap
+    # ``probe_pr_review_ci`` task so a full ``review_pr`` only runs once CI is
+    # green. ``gate_sticky_comment`` edits the single episode comment in place
+    # as counts change instead of staying stale. Backstop re-probes a blocked/
+    # pending head no more often than ``ci_pending_backstop_seconds``.
+    pr_review_started_comments_enabled: bool = Field(False, alias="ROBOMP_PR_REVIEW_STARTED_COMMENTS_ENABLED")
+    pr_review_ci_preflight_enabled: bool = Field(True, alias="ROBOMP_PR_REVIEW_CI_PREFLIGHT_ENABLED")
+    pr_review_gate_sticky_comment_enabled: bool = Field(True, alias="ROBOMP_PR_REVIEW_GATE_STICKY_COMMENT_ENABLED")
+    pr_review_ci_pending_backstop_seconds: float = Field(900.0, alias="ROBOMP_PR_REVIEW_CI_PENDING_BACKSTOP_SECONDS")
+    pr_review_ci_debounce_seconds: float = Field(45.0, alias="ROBOMP_PR_REVIEW_CI_DEBOUNCE_SECONDS")
+    pr_review_webhook_staleness_warn_seconds: float = Field(1800.0, alias="ROBOMP_PR_REVIEW_WEBHOOK_STALENESS_WARN_SECONDS")
     pr_review_helper: Path | None = Field(None, alias="ROBOMP_PR_REVIEW_HELPER")
     pr_review_delegate_models_raw: str = Field("", alias="ROBOMP_PR_REVIEW_DELEGATE_MODELS")
     pr_review_delegate_model_map_raw: str = Field("", alias="ROBOMP_PR_REVIEW_DELEGATE_MODEL_MAP")
+    pr_review_hoa_db_host: str = Field("", alias="ROBOMP_PR_REVIEW_HOA_DB_HOST")
+    pr_review_hoa_db_name: str = Field("postgres", alias="ROBOMP_PR_REVIEW_HOA_DB_NAME")
+    pr_review_hoa_db_user: str = Field("postgres", alias="ROBOMP_PR_REVIEW_HOA_DB_USER")
+    pr_review_hoa_db_pass: str = Field("postgres", alias="ROBOMP_PR_REVIEW_HOA_DB_PASS")
+    pr_review_hoa_db_port: str = Field("5432", alias="ROBOMP_PR_REVIEW_HOA_DB_PORT")
+    pr_review_hoa_redis_host: str = Field("", alias="ROBOMP_PR_REVIEW_HOA_REDIS_HOST")
 
     pr_review_learning_db: Path | None = Field(None, alias="ROBOMP_PR_REVIEW_LEARNING_DB")
     pr_review_self_improve_enabled: bool = Field(True, alias="ROBOMP_PR_REVIEW_SELF_IMPROVE_ENABLED")
@@ -154,6 +176,16 @@ class Settings(BaseSettings):
     natives_cache_max_entries_per_repo: int = Field(8, alias="ROBOMP_NATIVES_CACHE_MAX_ENTRIES_PER_REPO")
     natives_cache_max_bytes: int = Field(4 * 1024**3, alias="ROBOMP_NATIVES_CACHE_MAX_BYTES")
     natives_cache_gc_interval_seconds: float = Field(3600.0, alias="ROBOMP_NATIVES_CACHE_GC_INTERVAL_SECONDS")
+
+    # Workspace garbage collection. Bounds total workspace disk use so a
+    # reconciler-driven deployment with missed close webhooks never fills the
+    # disk with old PR-head worktrees. ``interval <= 0`` disables the periodic
+    # sweep; ``max_age``/``max_bytes``/``min_free`` each disable only their own
+    # cap when ``<= 0``.
+    workspace_gc_interval_seconds: float = Field(1800.0, alias="ROBOMP_WORKSPACE_GC_INTERVAL_SECONDS")
+    workspace_gc_max_age_seconds: float = Field(86400.0, alias="ROBOMP_WORKSPACE_GC_MAX_AGE_SECONDS")
+    workspace_gc_max_bytes: int = Field(120 * 1024**3, alias="ROBOMP_WORKSPACE_GC_MAX_BYTES")
+    workspace_gc_min_free_bytes: int = Field(100 * 1024**3, alias="ROBOMP_WORKSPACE_GC_MIN_FREE_BYTES")
 
     @field_validator("bot_login", mode="after")
     @classmethod

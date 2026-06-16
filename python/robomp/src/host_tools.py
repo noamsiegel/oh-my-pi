@@ -38,11 +38,13 @@ from robomp.github_types import (
 from robomp.pr_review_tools import (
     PrReviewPaths,
     load_json_checked,
+    pr_review_comment_retryable,
     pr_review_delegate_models,
     pr_review_helper_path,
     pr_review_model_family,
     pr_review_parse_diff_anchors,
     pr_review_paths,
+    pr_review_runtime_env,
     run_pr_review_helper,
 )
 from robomp.sandbox import (
@@ -237,6 +239,8 @@ def _repo_command_env(bindings: ToolBindings, *, include_auth_broker: bool = Fal
     env.update(_prepare_slot_runtime_env(bindings.workspace, bindings.slot_uid))
     env.update(_safe_directory_env(bindings.workspace.repo_dir))
     env.update(_git_identity_env(bindings.author_name, bindings.author_email))
+    if bindings.review_mode:
+        env.update(pr_review_runtime_env(bindings.settings))
     env["GIT_TERMINAL_PROMPT"] = "0"
     return env
 
@@ -1047,9 +1051,44 @@ _AUTO_PR_CLASSIFICATIONS = frozenset({"bug", "documentation"})
 _PRIORITIES = ("prio:p0", "prio:p1", "prio:p2", "prio:p3")
 _FUNCTIONAL = ("agent", "tool", "tui", "cli", "prompting", "sdk", "auth", "setup", "ux", "providers")
 _PLATFORMS = ("platform:linux", "platform:macos", "platform:windows", "platform:wsl")
-_PR_REVIEW_LABELS = ("review:clean", "review:minor", "review:maintainer-call", "review:deprioritized")
+_PR_REVIEW_VERDICT_LABEL_SPECS: dict[str, tuple[str, str]] = {
+    # verdict -> (hex color, newcomer-facing description); classify_pr applies exactly one.
+    "review:ready": ("0E8A16", "Reviewed: no blocking issues — any developer can merge as-is"),
+    "review:needs-work": ("FBCA04", "Reviewed: land small local fixes before merge"),
+    "review:needs-discussion": ("1D76DB", "Reviewed: align with peers before merge (default/feature/contract change)"),
+    "review:do-not-merge": ("B60205", "Reviewed: do not merge as-is (broken, off-spec, or superseded)"),
+}
+_PR_REVIEW_LABELS = tuple(_PR_REVIEW_VERDICT_LABEL_SPECS)
 _PR_TYPES = ("feat", "fix", "docs", "refactor", "perf", "test", "chore", "ci", "build")
 _TRIGGER_LABELS = ("robo-review", "hoa", "mail")
+# Group colors for bot-applied PR-review labels (GitHub auto-creates new labels gray, so
+# classify_pr re-asserts these). Verdicts carry per-label semantic colors above; every other
+# group shares one muted hue so it reads as a family without competing with the verdict signal.
+_PR_REVIEW_LABEL_COLOR_TRIAGED = "D0D7DE"
+_PR_REVIEW_LABEL_COLOR_TYPE = "8957E5"
+_PR_REVIEW_LABEL_COLOR_AREA = "6E7781"
+_PR_REVIEW_LABEL_COLOR_PROVIDER = "1F7A8C"
+
+
+def _pr_review_label_style(label: str) -> tuple[str, str | None] | None:
+    """Return (color, description|None) for a bot-applied PR-review label, else None.
+
+    Provider labels win over the `providers` functional area; verdicts carry descriptions.
+    """
+    verdict = _PR_REVIEW_VERDICT_LABEL_SPECS.get(label)
+    if verdict is not None:
+        return verdict
+    if label == "triaged":
+        return (_PR_REVIEW_LABEL_COLOR_TRIAGED, None)
+    if label == "providers" or label.startswith("provider:"):
+        return (_PR_REVIEW_LABEL_COLOR_PROVIDER, None)
+    if label in _PR_TYPES:
+        return (_PR_REVIEW_LABEL_COLOR_TYPE, None)
+    if label in _FUNCTIONAL:
+        return (_PR_REVIEW_LABEL_COLOR_AREA, None)
+    return None
+
+
 _STATIC_LABEL_ALLOWLIST = frozenset(
     (
         *_PRIMARY_TYPES,
@@ -1408,16 +1447,37 @@ def _build_prepare_pr_review(bindings: ToolBindings) -> HostTool[Any, Any]:
         bot_login = getattr(bindings.settings, "bot_login", "") if bindings.settings is not None else ""
         review_login = reviewer_login or bot_login
         review_login_lower = review_login.lower()
-        reviewer_cr_reviews = [
+        reviewer_reviews = [
             review
             for review in reviews
-            if review_login_lower
-            and review.author.lower() == review_login_lower
-            and review.state.upper() == "CHANGES_REQUESTED"
+            if review_login_lower and review.author.lower() == review_login_lower
         ]
+        # CHANGES_REQUESTED anchor: its blocking findings must always be verified, so this stays
+        # the helper's verify-fixes verdict path (unchanged behaviour) even when the prior commit
+        # is unknown/unreachable — the agent then verifies against the full diff.
+        reviewer_cr_reviews = [r for r in reviewer_reviews if r.state.upper() == "CHANGES_REQUESTED"]
         latest_cr_review = max(reviewer_cr_reviews, key=lambda review: review.submitted_at) if reviewer_cr_reviews else None
-        verify_fixes = bool(latest_cr_review and latest_cr_review.commit_id != pr.head_sha)
-        mode = "verify-fixes" if verify_fixes else "fresh"
+        cr_verify_fixes = bool(latest_cr_review and latest_cr_review.commit_id != pr.head_sha)
+        # Incremental anchor: the reviewer's latest review is a non-blocking APPROVE/COMMENT on an
+        # older head. Re-review only the delta. A transient-failure COMMENT is not a real verdict.
+        # Evidence mode stays "fresh" so the helper's verdict can still reach APPROVE (prior
+        # non-blocking notes never become approval-blockers); the presence of delta_diff is the
+        # incremental signal (drives delta-only review + delegation-gate skip).
+        latest_review = max(reviewer_reviews, key=lambda review: review.submitted_at) if reviewer_reviews else None
+        incremental_anchor = (
+            latest_review
+            if (
+                not cr_verify_fixes
+                and latest_review is not None
+                and latest_review.state.upper() in {"APPROVED", "COMMENTED"}
+                and bool(latest_review.commit_id)
+                and latest_review.commit_id != pr.head_sha
+                and not (latest_review.state.upper() == "COMMENTED" and pr_review_comment_retryable(latest_review.body))
+            )
+            else None
+        )
+
+        mode = "verify-fixes" if cr_verify_fixes else "fresh"
         delta_diff: str | None = None
         delta_anchors: list[dict[str, Any]] | None = None
         delta_unavailable_reason: str | None = None
@@ -1425,22 +1485,28 @@ def _build_prepare_pr_review(bindings: ToolBindings) -> HostTool[Any, Any]:
         reviewer_prior_review_bodies: list[dict[str, Any]] = []
         reviewer_prior_inline_comments_unioned: list[dict[str, Any]] | None = None
 
-        if latest_cr_review is not None and verify_fixes:
+        def _compute_delta(prior_sha: str) -> tuple[str | None, str | None]:
+            """(delta_diff, unavailable_reason); fetches the prior sha if not present locally."""
+            verify_proc = _run_repo_command(bindings, ("git", "rev-parse", "--verify", "--quiet", prior_sha), timeout=timeout)
+            if verify_proc.returncode != 0:
+                _run_repo_command(bindings, ("git", "fetch", "origin", prior_sha), timeout=timeout)
+                verify_proc = _run_repo_command(bindings, ("git", "rev-parse", "--verify", "--quiet", prior_sha), timeout=timeout)
+            if verify_proc.returncode != 0:
+                return None, "prior_sha_unreachable"
+            pr_file_paths = tuple(file.path for file in files if file.path)
+            delta_cmd = ["git", "diff", "--no-color", f"{prior_sha}..{pr.head_sha}", *(["--", *pr_file_paths] if pr_file_paths else [])]
+            delta_proc = _run_repo_command(bindings, tuple(delta_cmd), timeout=timeout)
+            if delta_proc.returncode != 0:
+                return None, "delta_diff_failed"
+            return delta_proc.stdout, None
+
+        if cr_verify_fixes and latest_cr_review is not None:
             prior_sha = latest_cr_review.commit_id or ""
             reviewer_prior_review_bodies = [
-                {
-                    "review_id": review.id,
-                    "state": review.state,
-                    "body": review.body,
-                    "sha": review.commit_id,
-                    "submitted_at": review.submitted_at,
-                }
-                for review in reviewer_cr_reviews
+                {"review_id": r.id, "state": r.state, "body": r.body, "sha": r.commit_id, "submitted_at": r.submitted_at}
+                for r in reviewer_cr_reviews
             ]
-            reviewer_prior_inline_comments_unioned = _pr_review_reviewer_inline_comments_unioned(
-                review_threads,
-                review_login,
-            )
+            reviewer_prior_inline_comments_unioned = _pr_review_reviewer_inline_comments_unioned(review_threads, review_login)
             prior_review = {
                 "state": "CHANGES_REQUESTED",
                 "review_id": latest_cr_review.id,
@@ -1449,7 +1515,7 @@ def _build_prepare_pr_review(bindings: ToolBindings) -> HostTool[Any, Any]:
                 "dismissed": False,
                 "is_latest_by_submitted_at": True,
                 "is_outdated": False,
-                "all_reviewer_cr_review_ids": [review.id for review in reviewer_cr_reviews],
+                "all_reviewer_cr_review_ids": [r.id for r in reviewer_cr_reviews],
                 "reviewer_inline_comment_count": len(reviewer_prior_inline_comments_unioned),
                 "reviewer_review_body_present": bool(latest_cr_review.body.strip()),
             }
@@ -1457,36 +1523,27 @@ def _build_prepare_pr_review(bindings: ToolBindings) -> HostTool[Any, Any]:
                 prior_review["is_outdated"] = True
                 delta_unavailable_reason = "missing_prior_commit_id"
             else:
-                verify_proc = _run_repo_command(
-                    bindings,
-                    ("git", "rev-parse", "--verify", "--quiet", prior_sha),
-                    timeout=timeout,
-                )
-                if verify_proc.returncode != 0:
-                    _run_repo_command(bindings, ("git", "fetch", "origin", prior_sha), timeout=timeout)
-                    verify_proc = _run_repo_command(
-                        bindings,
-                        ("git", "rev-parse", "--verify", "--quiet", prior_sha),
-                        timeout=timeout,
-                    )
-                if verify_proc.returncode != 0:
-                    prior_review["is_outdated"] = True
-                    delta_unavailable_reason = "prior_sha_unreachable"
+                delta_diff, delta_unavailable_reason = _compute_delta(prior_sha)
+                if delta_diff is not None:
+                    delta_anchors = pr_review_parse_diff_anchors(delta_diff)
                 else:
-                    pr_file_paths = tuple(file.path for file in files if file.path)
-                    delta_cmd: list[str] = [
-                        "git",
-                        "diff",
-                        "--no-color",
-                        f"{prior_sha}..{pr.head_sha}",
-                        *(["--", *pr_file_paths] if pr_file_paths else []),
-                    ]
-                    delta_proc = _run_repo_command(bindings, tuple(delta_cmd), timeout=timeout)
-                    if delta_proc.returncode != 0:
-                        delta_unavailable_reason = "delta_diff_failed"
-                    else:
-                        delta_diff = delta_proc.stdout
-                        delta_anchors = pr_review_parse_diff_anchors(delta_diff)
+                    prior_review["is_outdated"] = True
+        elif incremental_anchor is not None:
+            prior_sha = incremental_anchor.commit_id or ""
+            delta_diff, delta_unavailable_reason = _compute_delta(prior_sha)
+            if delta_diff is not None:
+                delta_anchors = pr_review_parse_diff_anchors(delta_diff)
+                prior_review = {
+                    "state": incremental_anchor.state.upper(),
+                    "review_id": incremental_anchor.id,
+                    "sha": prior_sha,
+                    "submitted_at": incremental_anchor.submitted_at,
+                    "dismissed": False,
+                    "is_latest_by_submitted_at": True,
+                    "is_outdated": False,
+                    "reviewer_review_body_present": bool(incremental_anchor.body.strip()),
+                }
+            # else: prior head unreachable / delta failed → leave a fresh full review.
 
         paths = pr_review_paths(bindings.workspace)
         evidence_path = paths.evidence
@@ -1567,6 +1624,17 @@ def _build_prepare_pr_review(bindings: ToolBindings) -> HostTool[Any, Any]:
             _audit_pr_review_helper_error(bindings, "prepare_pr_review", args, exc)
             raise
         classification = load_json_checked(classification_path)
+        if mode == "verify-fixes" or delta_diff is not None:
+            # Incremental re-review: the one full review already owned domain delegation. The
+            # helper enforces delegation off classification.domains_required in BOTH the validate
+            # `gate` and the submit `payload` coverage checks, so dropping non-correctness domains
+            # here makes the entire re-review delegation-free in one place (correctness is always
+            # covered by the main agent's own review).
+            domains = classification.get("domains_required")
+            if isinstance(domains, list):
+                classification["domains_required"] = [d for d in domains if d == "correctness"]
+            classification["delegation_required"] = False
+            _write_control_json(bindings, classification_path, classification)
         _audit(
             bindings,
             "prepare_pr_review",
@@ -2124,6 +2192,46 @@ def _build_classify_pr(bindings: ToolBindings) -> HostTool[Any, Any]:
             _audit(bindings, "classify_pr", args, error=str(exc))
             _raise_command(f"GitHub rejected labels: {exc.status} {exc.message}")
         bindings.db.set_issue_classification(bindings.issue_key, str(review_label))
+        # Verdict labels are mutually exclusive: drop any other review:* verdict the PR
+        # still carries (e.g. a prior `review:needs-work` now graded `review:ready`) so
+        # exactly one verdict label remains for filtering. Best-effort — a failed cleanup
+        # must never fail the classification that already applied.
+        final_labels = set(applied)
+        for stale in _PR_REVIEW_LABELS:
+            if stale != review_label and stale in final_labels:
+                try:
+                    _run_coro(
+                        bindings.loop,
+                        bindings.github.remove_issue_label(
+                            bindings.repo.full_name, bindings.default_comment_number, stale
+                        ),
+                    )
+                    final_labels.discard(stale)
+                except GitHubError as exc:
+                    log.warning(
+                        "classify_pr: stale verdict label cleanup failed",
+                        extra={"key": bindings.issue_key, "label": stale, "error": str(exc)},
+                    )
+        applied = tuple(sorted(final_labels))
+        # Keep bot-managed labels at their group colors (GitHub auto-creates new labels gray).
+        # Best-effort and idempotent — a failed recolor must not fail classification.
+        for label in labels:
+            style = _pr_review_label_style(label)
+            if style is None:
+                continue
+            color, description = style
+            try:
+                _run_coro(
+                    bindings.loop,
+                    bindings.github.set_label(
+                        bindings.repo.full_name, label, color=color, description=description
+                    ),
+                )
+            except GitHubError as exc:
+                log.warning(
+                    "classify_pr: label color ensure failed",
+                    extra={"key": bindings.issue_key, "label": label, "error": str(exc)},
+                )
         _audit(
             bindings,
             "classify_pr",
@@ -2495,7 +2603,7 @@ def _with_pr_review_process_report(
     )
 
 
-_PR_REVIEW_CLEAN_BODY_MARKERS = ("review:clean", "clean review")
+_PR_REVIEW_CLEAN_BODY_MARKERS = ("review:ready", "clean review")
 _PR_REVIEW_FAILED_VERIFICATION_BODY_MARKERS = (
     "could not run",
     "failed to run",
@@ -2690,6 +2798,74 @@ def _pr_review_build_payload(bindings: ToolBindings, *, event: str, body: str, a
     return load_json_checked(paths.payload)
 
 
+def _pr_review_reconcile_verdict_label(bindings: ToolBindings, *, event: str) -> str | None:
+    """Keep `review:ready` honest: it must only stand on an actual `APPROVE`.
+
+    `classify_pr` picks the verdict in phase 1, before the deep review surfaces
+    blocking findings, so a PR graded `review:ready` can still submit as `COMMENT`
+    (e.g. a blocking finding with REQUEST_CHANGES disabled). When the posted event is
+    not `APPROVE`, downgrade a stored `review:ready` to `review:needs-work` and move the
+    label to match. Best-effort: the review is already posted, so a failed relabel must
+    not fail the tool. Returns the new label when changed, else None.
+    """
+    if event == "APPROVE":
+        return None
+    issue = bindings.db.get_issue(bindings.issue_key)
+    if issue is None or issue.classification != "review:ready":
+        return None
+    downgraded = "review:needs-work"
+    repo_full = bindings.repo.full_name
+    number = bindings.default_comment_number
+    try:
+        _run_coro(bindings.loop, bindings.github.add_issue_labels(repo_full, number, [downgraded]))
+        _run_coro(bindings.loop, bindings.github.remove_issue_label(repo_full, number, "review:ready"))
+        style = _pr_review_label_style(downgraded)
+        if style is not None:
+            color, description = style
+            _run_coro(bindings.loop, bindings.github.set_label(repo_full, downgraded, color=color, description=description))
+    except GitHubError as exc:
+        log.warning(
+            "submit_pr_review: verdict label reconcile failed",
+            extra={"key": bindings.issue_key, "from": "review:ready", "to": downgraded, "error": str(exc)},
+        )
+        return None
+    bindings.db.set_issue_classification(bindings.issue_key, downgraded)
+    return downgraded
+
+
+def _recover_submitted_pr_review(
+    bindings: ToolBindings, *, commit_id: str | None
+) -> tuple[str, Any]:
+    """Classify a stale ``submit_pr_review`` reservation by checking GitHub.
+
+    A pending-but-not-succeeded reservation means a prior attempt reserved the
+    idempotency key then died. Returns ``("found", review)`` if the bot review
+    for ``commit_id`` actually landed, ``("absent", None)`` if GitHub positively
+    shows none (safe to re-drive the submit), or ``("unknown", None)`` when we
+    cannot confirm (keep the conservative "already pending" behavior so a real
+    review is never duplicated)."""
+    if not commit_id:
+        return ("unknown", None)
+    bot_login = getattr(bindings.settings, "bot_login", "") if bindings.settings is not None else ""
+    if not bot_login:
+        return ("unknown", None)
+    try:
+        reviews = _run_coro(
+            bindings.loop,
+            bindings.github.list_pr_reviews(bindings.repo.full_name, bindings.default_comment_number),
+        )
+    except GitHubError:
+        return ("unknown", None)
+    candidates = [
+        review
+        for review in reviews
+        if review.author.lower() == bot_login.lower() and review.commit_id == commit_id
+    ]
+    if candidates:
+        return ("found", max(candidates, key=lambda review: review.submitted_at))
+    return ("absent", None)
+
+
 def _build_submit_pr_review(bindings: ToolBindings) -> HostTool[Any, Any]:
     def execute(args: dict[str, Any], _ctx: HostToolContext[Any]) -> str:
         _require_review_mode(bindings, "submit_pr_review", args)
@@ -2816,9 +2992,35 @@ def _build_submit_pr_review(bindings: ToolBindings) -> HostTool[Any, Any]:
                 message = f"side effect already succeeded: {operation_key}"
                 _audit(bindings, "submit_pr_review", args, result={"skipped": "side_effect_already_succeeded", "operation_key": operation_key})
                 return message
-            message = f"side effect already pending: {operation_key}"
-            _audit(bindings, "submit_pr_review", args, result={"skipped": "side_effect_already_pending", "operation_key": operation_key})
-            return message
+            # Stale pending reservation: a prior attempt reserved the key then died
+            # before recording the outcome. Returning a success-like message here
+            # would let the event be marked done with NO GitHub review. Verify
+            # against GitHub before deciding.
+            recovery_status, recovered = _recover_submitted_pr_review(bindings, commit_id=final_commit_id)
+            if recovery_status == "found" and recovered is not None:
+                bindings.db.record_pr_review_completed_review(
+                    issue_key=bindings.issue_key,
+                    repo=bindings.repo.full_name,
+                    pr_number=bindings.default_comment_number,
+                    head_sha=final_commit_id or None,
+                    github_review_id=recovered.id,
+                    event=raw_event,
+                )
+                bindings.db.mark_side_effect_succeeded(operation_key)
+                message = f"side effect recovered: existing review id={recovered.id} for {operation_key}"
+                _audit(bindings, "submit_pr_review", args, result={"recovered_review_id": recovered.id, "operation_key": operation_key})
+                return message
+            if recovery_status != "absent":
+                message = f"side effect already pending: {operation_key}"
+                _audit(bindings, "submit_pr_review", args, result={"skipped": "side_effect_already_pending", "operation_key": operation_key})
+                return message
+            # GitHub confirms no review landed for this head: release the dead
+            # reservation and fall through to re-submit.
+            bindings.db.mark_side_effect_failed(operation_key, "stale pending reservation; prior attempt never landed")
+            if not bindings.db.reserve_side_effect(operation_key):
+                message = f"side effect already pending: {operation_key}"
+                _audit(bindings, "submit_pr_review", args, result={"skipped": "side_effect_already_pending", "operation_key": operation_key})
+                return message
         try:
             review = _run_coro(
                 bindings.loop,
@@ -2899,10 +3101,14 @@ def _build_submit_pr_review(bindings: ToolBindings) -> HostTool[Any, Any]:
             _audit(bindings, "submit_pr_review", args, error=msg)
             _raise_command(msg)
         bindings.db.mark_side_effect_succeeded(operation_key)
+        downgraded_label = _pr_review_reconcile_verdict_label(bindings, event=raw_event)
+        if downgraded_label is not None:
+            result["verdict_label_downgraded"] = downgraded_label
         _audit(bindings, "submit_pr_review", args, result=result)
         suffix = f"; requested_event={requested_event}" if requested_event != raw_event else ""
         posted_suffix = f"; posted_findings={posted_findings_count}" if pr_review_payload_available else ""
-        return f"submitted PR review id={review.id}; event={raw_event}{suffix}; comments={len(comments)}{posted_suffix}"
+        label_suffix = f"; verdict_label_downgraded={downgraded_label}" if downgraded_label else ""
+        return f"submitted PR review id={review.id}; event={raw_event}{suffix}; comments={len(comments)}{posted_suffix}{label_suffix}"
 
     return host_tool(
         name="submit_pr_review",

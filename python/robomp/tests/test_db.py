@@ -907,3 +907,25 @@ def test_migration_adds_event_route_columns_to_existing_db(tmp_path: Path) -> No
     assert len(running) == 1
     # list_running_events returns dict format, so use subscript access
     assert running[0]["model"] == "claude-sonnet-4-0"
+
+
+def test_seconds_since_last_webhook_ignores_backstop(db: Database) -> None:
+    assert db.seconds_since_last_webhook() is None
+    # Reconciler/probe-origin events are NOT native webhooks — they must not
+    # mask a dead ingress.
+    db.record_event(
+        delivery_id="reconcile-pr-review-x", event_type="pull_request", repo="octo/widget",
+        issue_key=issue_key("octo/widget", 1), payload={}, state="queued",
+    )
+    db.record_event(
+        delivery_id="ci-probe-review-x", event_type="pull_request", repo="octo/widget",
+        issue_key=issue_key("octo/widget", 2), payload={}, state="queued",
+    )
+    assert db.seconds_since_last_webhook() is None
+    # A GitHub-delivered (native) webhook counts and is recent.
+    db.record_event(
+        delivery_id="gh-delivery-guid", event_type="pull_request", repo="octo/widget",
+        issue_key=issue_key("octo/widget", 3), payload={},
+    )
+    age = db.seconds_since_last_webhook()
+    assert age is not None and 0.0 <= age < 60.0

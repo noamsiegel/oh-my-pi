@@ -21,7 +21,7 @@ findings = "Array of candidate findings with path, line, body, severity, intent,
 description = "Classify an incoming PR, apply triaged/review labels, and persist the review label. Review-mode only."
 
 [classify_pr.parameters]
-review_label = "Required review verdict label: one of `review:clean`, `review:minor`, `review:maintainer-call`, or `review:deprioritized`."
+review_label = "Required review verdict label: one of `review:ready`, `review:needs-work`, `review:needs-discussion`, or `review:do-not-merge`."
 type = "Exactly one PR type: feat, fix, docs, refactor, perf, test, chore, ci, or build."
 area = "Zero or more functional labels. Unknown values are dropped silently; omit when none apply."
 provider = "Only when provider-scoped; format `provider:<name>`. Omit otherwise."

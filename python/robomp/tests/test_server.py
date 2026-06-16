@@ -224,6 +224,10 @@ def test_metrics_reports_queue_counts_and_self_improver(env) -> None:
                     '2026-06-01T00:00:00.000000Z', '2026-06-01T00:01:00.000000Z')
             """
         )
+        db.transition_pr_review_gate(
+            issue_key=issue_key("octo/widget", 9), repo="octo/widget", pr_number=9,
+            head_sha="abc123", gate_status="blocked", ci_signature="state=failed",
+        )
         resp = client.get("/metrics")
     close_database()
 
@@ -234,6 +238,16 @@ def test_metrics_reports_queue_counts_and_self_improver(env) -> None:
     assert "robomp_events_failed 1\n" in text
     assert "robomp_recent_failures_total 1\n" in text
     assert 'robomp_self_improver_last_status{status="done"} 1\n' in text
+    assert "robomp_workspace_entries " in text
+    assert "robomp_workspace_bytes " in text
+    assert "robomp_workspace_root_free_bytes " in text
+    assert "robomp_workspace_root_total_bytes " in text
+    assert "robomp_workspace_metrics_error 0\n" in text
+    assert 'robomp_pr_review_gate{status="blocked"} 1\n' in text
+    assert 'robomp_pr_review_gate{status="passed"} 0\n' in text
+    # The seeded "metric-queued" delivery is a native (non-reconciler) webhook,
+    # so the freshness gauge for ingress-outage detection is emitted.
+    assert "robomp_seconds_since_last_webhook " in text
 
 
 def test_metrics_reports_queue_counts(env) -> None:
@@ -2161,7 +2175,7 @@ async def test_review_pr_retries_when_ranked_but_not_submitted(
         body="body",
         state="open",
         author="alice",
-        labels=("triaged", "review:minor"),
+        labels=("triaged", "review:needs-work"),
         is_pull_request=True,
     )
     pr = PullRequestInfo(
@@ -2246,7 +2260,9 @@ async def test_review_pr_skips_after_submitted_review(
     sandbox = _RecordingSandbox(tmp_path)
     db = get_database(settings.sqlite_path)
     key = issue_key("octo/widget", 900)
-    db.log_tool_call(issue_key=key, tool="submit_pr_review", args={"body": "done"}, result={"review_id": 12})
+    db.record_pr_review_completed_review(
+        issue_key=key, repo="octo/widget", pr_number=900, head_sha="abc", github_review_id=12, event="APPROVE"
+    )
     repo = RepoInfo(
         full_name="octo/widget", default_branch="main", clone_url="https://github.com/octo/widget.git", private=False
     )
@@ -2257,7 +2273,7 @@ async def test_review_pr_skips_after_submitted_review(
         body="body",
         state="open",
         author="alice",
-        labels=("triaged", "review:minor"),
+        labels=("triaged", "review:needs-work"),
         is_pull_request=True,
     )
     pr = PullRequestInfo(
@@ -2269,6 +2285,7 @@ async def test_review_pr_skips_after_submitted_review(
         state="open",
         author="alice",
         head_repo="alice/widget",
+        head_sha="abc",
     )
 
     async def _get_repo(self, repo_full: str):
@@ -2382,6 +2399,84 @@ async def test_review_pr_first_review_with_allowed_label_reaches_workspace(
     assert sandbox.ensure_calls[0]["pr_changed_paths"] == ("src/app.ts",)
     close_database()
 
+
+async def test_review_pr_reaps_superseded_workspaces_for_current_head(
+    settings: Settings, tmp_path: Path, stub_run_task, monkeypatch
+) -> None:
+    from robomp import tasks
+    from robomp.github_client import GitHubClient
+    from robomp.github_types import (
+        CommentInfo,
+        IssueInfo,
+        PullRequestFileInfo,
+        PullRequestInfo,
+        RepoInfo,
+    )
+
+    settings.pr_review_label_allowlist_raw = "robo-review"
+    sandbox = _RecordingSandbox(tmp_path)
+    db = get_database(settings.sqlite_path)
+    db.upsert_issue(
+        key="octo/widget#900",
+        repo="octo/widget",
+        number=900,
+        state="reviewing",
+        pr_number=900,
+        review_head_sha="a" * 40,
+    )
+    repo = RepoInfo("octo/widget", "main", "https://github.com/octo/widget.git", False)
+    issue = IssueInfo("octo/widget", 900, "Fix parser", "body", "open", "alice", ("robo-review",), True)
+    pr = PullRequestInfo(
+        "octo/widget",
+        900,
+        "https://github.com/octo/widget/pull/900",
+        "alice/fix",
+        "main",
+        "open",
+        "alice",
+        "alice/widget",
+        head_sha="b" * 40,
+        author_type="User",
+    )
+
+    async def _get_repo(self, repo_full: str):
+        return repo
+
+    async def _get_issue(self, repo_full: str, number: int):
+        return issue
+
+    async def _get_pull_request(self, repo_full: str, number: int):
+        return pr
+
+    async def _list_pr_files(self, repo_full: str, number: int):
+        return [PullRequestFileInfo("src/app.ts", "modified", 1, 1)]
+
+    async def _list_pr_reviews(self, repo_full: str, number: int):
+        return []
+
+    async def _post_comment(self, repo_full: str, number: int, body: str):
+        return CommentInfo(123, settings.bot_login, body, "t")
+
+    monkeypatch.setattr(GitHubClient, "list_pr_files", _list_pr_files)
+    monkeypatch.setattr(GitHubClient, "get_repo", _get_repo)
+    monkeypatch.setattr(GitHubClient, "get_issue", _get_issue)
+    monkeypatch.setattr(GitHubClient, "get_pull_request", _get_pull_request)
+    monkeypatch.setattr(GitHubClient, "list_pr_reviews", _list_pr_reviews)
+    monkeypatch.setattr(GitHubClient, "post_comment", _post_comment)
+
+    await tasks.review_pr(
+        settings=settings,
+        db=db,
+        github=GitHubClient("t"),
+        sandbox=sandbox,
+        git_transport=LocalGitTransport(token=None),
+        payload={"pull_request": {"number": 900}, "repository": {"full_name": "octo/widget"}},
+        delivery_id="d-review-superseded",
+    )
+
+    assert sandbox.ensure_calls[0]["pr_head_sha"] == "b" * 40
+    assert sandbox.superseded_calls == [("octo/widget", 900, "b" * 40)]
+    close_database()
 
 async def test_review_pr_passes_renamed_paths_to_workspace(
     settings: Settings, tmp_path: Path, stub_run_task, monkeypatch
@@ -2545,13 +2640,15 @@ async def test_review_pr_github_initial_fetch_failure_is_transient(
     close_database()
 
 
-async def test_review_pr_latest_approved_old_sha_skips(
+async def test_review_pr_latest_approved_old_sha_continues(
     settings: Settings, tmp_path: Path, stub_run_task, monkeypatch
 ) -> None:
     from robomp import tasks
     from robomp.github_client import GitHubClient
     from robomp.github_types import (
+        CommentInfo,
         IssueInfo,
+        PullRequestFileInfo,
         PullRequestInfo,
         PullRequestReviewInfo,
         RepoInfo,
@@ -2574,18 +2671,24 @@ async def test_review_pr_latest_approved_old_sha_skips(
     async def _get_pull_request(self, repo_full: str, number: int):
         return pr
 
+    async def _list_pr_files(self, repo_full: str, number: int):
+        return [PullRequestFileInfo("src/app.ts", "modified", 1, 1)]
+
     async def _list_pr_reviews(self, repo_full: str, number: int):
         return [review]
 
-    async def _list_pr_files(self, repo_full: str, number: int):
-        return []
+    async def _post_comment(self, repo_full: str, number: int, body: str):
+        assert repo_full == "octo/widget"
+        assert number == 900
+        assert "triggered by `robo-review`" in body
+        return CommentInfo(123, settings.bot_login, body, "t")
 
-
+    monkeypatch.setattr(GitHubClient, "list_pr_files", _list_pr_files)
     monkeypatch.setattr(GitHubClient, "get_repo", _get_repo)
     monkeypatch.setattr(GitHubClient, "get_issue", _get_issue)
     monkeypatch.setattr(GitHubClient, "get_pull_request", _get_pull_request)
     monkeypatch.setattr(GitHubClient, "list_pr_reviews", _list_pr_reviews)
-    monkeypatch.setattr(GitHubClient, "list_pr_files", _list_pr_files)
+    monkeypatch.setattr(GitHubClient, "post_comment", _post_comment)
 
     await tasks.review_pr(
         settings=settings,
@@ -2594,11 +2697,13 @@ async def test_review_pr_latest_approved_old_sha_skips(
         sandbox=sandbox,
         git_transport=LocalGitTransport(token=None),
         payload={"pull_request": {"number": 900}, "repository": {"full_name": "octo/widget"}},
-        delivery_id="d-review-approved",
+        delivery_id="d-review-approved-rereview",
     )
 
-    assert stub_run_task == []
-    assert sandbox.ensure_calls == []
+    assert len(stub_run_task) == 1
+    assert sandbox.ensure_calls[0]["pr_head"] == 900
+    assert sandbox.ensure_calls[0]["pr_base_ref"] == "main"
+    assert sandbox.ensure_calls[0]["pr_changed_paths"] == ("src/app.ts",)
     close_database()
 
 
@@ -3699,10 +3804,10 @@ async def test_cleanup_workspace_pr_merged_mapped_origin_sets_merged(
     assert row is not None
     assert row.state == "merged"
     close_database()
-async def test_cleanup_workspace_unknown_issue_pr_no_op_without_remove(
+async def test_cleanup_workspace_unknown_issue_no_op_without_remove(
     settings: Settings, tmp_path: Path
 ) -> None:
-    """Unknown issue/PR no-ops without remove."""
+    """Unknown non-PR issue close no-ops without removing a workspace."""
     from robomp import tasks
     sandbox = _RecordingSandbox(tmp_path)
     db = get_database(settings.sqlite_path)
@@ -3718,6 +3823,27 @@ async def test_cleanup_workspace_unknown_issue_pr_no_op_without_remove(
         payload=payload,
         target_state="closed",
     )
-    # Assert no remove calls
-    assert len(sandbox.remove_calls) == 0
+    assert sandbox.remove_calls == []
+    close_database()
+async def test_cleanup_workspace_unknown_pr_removes_direct_workspace(
+    settings: Settings, tmp_path: Path
+) -> None:
+    """Closed PR with no mapped/direct issue row still removes the direct PR workspace."""
+    from robomp import tasks
+    sandbox = _RecordingSandbox(tmp_path)
+    db = get_database(settings.sqlite_path)
+    payload = {
+        "action": "closed",
+        "pull_request": {"number": 900, "merged": False},
+        "repository": {"full_name": "octo/widget"},
+    }
+    await tasks.cleanup_workspace(
+        settings=settings,
+        db=db,
+        sandbox=sandbox,
+        payload=payload,
+        target_state="closed",
+    )
+    assert sandbox.remove_calls == [("octo/widget", 900, None)]
+    assert db.get_issue("octo/widget#900") is None
     close_database()

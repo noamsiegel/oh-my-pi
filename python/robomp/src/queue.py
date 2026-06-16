@@ -18,6 +18,7 @@ from robomp.github_backend import GitHubBackend
 from robomp.sandbox import GitTransport, SandboxManager, _reap_slot
 from robomp.slot_pool import SlotPool
 from robomp.task_outcome import (
+    INFRA_UNAVAILABLE_MARKER,
     TaskControl,
     TaskOutcome,
 )
@@ -65,7 +66,18 @@ def _is_retryable_pr_workspace_error(row: EventRow, error: str) -> bool:
     if row.event_type != "pull_request" or row.attempts >= MAX_PR_WORKSPACE_PREP_ATTEMPTS:
         return False
     lowered = error.lower()
-    return any(marker.lower() in lowered for marker in RETRYABLE_PR_WORKSPACE_ERROR_MARKERS)
+    if any(marker.lower() in lowered for marker in RETRYABLE_PR_WORKSPACE_ERROR_MARKERS):
+        return True
+    # A `git worktree remove` that times out is disk/IO contention during
+    # workspace prep — transient, retry rather than fail the review.
+    return "worktree" in lowered and "remove" in lowered and "timed out" in lowered
+
+
+def _is_superseded_pr_head_error(error: str) -> bool:
+    # prepare_pr_worktree raises "PR head mismatch: expected X, got Y" when the PR
+    # head moves between the pre-flight check and the worktree fetch. The newer
+    # head triggers its own review, so this is a clean skip, not a failure.
+    return "pr head mismatch" in error.lower()
 
 
 _TaskHandler = Callable[[EventRow, int | None], Awaitable[TaskOutcome | None]]
@@ -167,6 +179,10 @@ class WorkerPool:
         # restarted orchestrator doesn't burn CPU on a cold cache.
         if self.sandbox.natives_cache is not None and self.settings.natives_cache_gc_interval_seconds > 0:
             self._workers.append(asyncio.create_task(self._natives_cache_gc_loop(), name="robomp-natives-gc"))
+        # Periodic workspace GC, if enabled. Sleep-first like the natives GC so
+        # a freshly restarted orchestrator doesn't sweep before settling.
+        if self.settings.workspace_gc_interval_seconds > 0:
+            self._workers.append(asyncio.create_task(self._workspace_gc_loop(), name="robomp-workspace-gc"))
 
     async def stop(self, *, drain_timeout: float = 25.0, kill_timeout: float = 5.0) -> None:
         """Halt the dispatcher, then drain (or kill) in-flight `_run_event` tasks.
@@ -255,6 +271,55 @@ class WorkerPool:
                         log.info("natives_cache gc swept", extra={"evicted": evicted})
                 except Exception:
                     log.exception("natives_cache gc raised")
+        except asyncio.CancelledError:
+            raise
+
+    async def _workspace_gc_loop(self) -> None:
+        """Periodic workspace GC: TTL/size/free-space eviction + clone-pool hygiene.
+
+        Sleep-first like ``_natives_cache_gc_loop`` so a restart doesn't sweep
+        before the dispatcher settles. In-flight issue keys are protected each
+        sweep. Cancellation is the only exit; per-sweep failures are logged.
+        """
+        interval = self.settings.workspace_gc_interval_seconds
+        log.info("workspace gc loop online", extra={"interval": interval})
+        try:
+            while not self._stop.is_set():
+                try:
+                    await asyncio.wait_for(self._stop.wait(), timeout=interval)
+                    return  # stop was set during the wait
+                except TimeoutError:
+                    pass
+                try:
+                    protected = frozenset(await self.inflight_snapshot())
+                    result = await asyncio.to_thread(
+                        self.sandbox.gc_workspaces,
+                        max_age_seconds=self.settings.workspace_gc_max_age_seconds,
+                        max_bytes=self.settings.workspace_gc_max_bytes,
+                        min_free_bytes=self.settings.workspace_gc_min_free_bytes,
+                        protected_issue_keys=protected,
+                    )
+                    await asyncio.to_thread(self.sandbox.gc_clone_pools)
+                    if result.evicted > 0:
+                        log.info(
+                            "workspace gc swept",
+                            extra={
+                                "evicted": result.evicted,
+                                "freed_bytes": result.freed_bytes,
+                                "remaining_bytes": result.remaining_bytes,
+                                "free_bytes": result.free_bytes,
+                            },
+                        )
+                    if result.free_bytes < self.settings.workspace_gc_min_free_bytes:
+                        log.warning(
+                            "workspace disk free below floor",
+                            extra={
+                                "free_bytes": result.free_bytes,
+                                "min_free_bytes": self.settings.workspace_gc_min_free_bytes,
+                            },
+                        )
+                except Exception:
+                    log.exception("workspace gc raised")
         except asyncio.CancelledError:
             raise
 
@@ -433,6 +498,16 @@ class WorkerPool:
             elif row.delivery_id in self._cancelled:
                 log.info("event cancelled", extra={"delivery": row.delivery_id})
                 self.db.mark_event(row.delivery_id, "failed", error="cancelled by operator")
+            elif _is_superseded_pr_head_error(str(exc)):
+                log.info(
+                    "skip: review_pr head superseded during workspace prep",
+                    extra={"delivery": row.delivery_id, "key": row.issue_key},
+                )
+                self.db.mark_event(
+                    row.delivery_id,
+                    "skipped",
+                    error="skip: PR head superseded during workspace prep",
+                )
             elif _is_retryable_pr_workspace_error(row, str(exc)):
                 message = f"retrying workspace preparation after transient git failure: {exc}"
                 self.db.requeue_event(
@@ -448,6 +523,7 @@ class WorkerPool:
                         "delivery": row.delivery_id,
                         "key": row.issue_key,
                         "attempts": row.attempts,
+                        "reason": message,
                         "delay": PR_WORKSPACE_RETRY_DELAY_SECONDS,
                     },
                 )
@@ -490,8 +566,22 @@ class WorkerPool:
         elif outcome.state == "queued":
             error = outcome.reason or "task retry queued"
             if outcome.retry_limit is not None and row.attempts >= outcome.retry_limit:
+                infra = error.startswith(INFRA_UNAVAILABLE_MARKER)
                 self.db.mark_event(row.delivery_id, "failed", error=error)
-                await self._post_failure_comment(row, error)
+                log.error(
+                    "task dead-lettered",
+                    extra={
+                        "delivery": row.delivery_id,
+                        "key": row.issue_key,
+                        "attempts": row.attempts,
+                        "reason": _failure_summary(error),
+                        "infra": infra,
+                    },
+                )
+                # Infra outages (e.g. broker down) are surfaced by the liveness
+                # watchdog and re-queued by the reconciler — don't spam the PR.
+                if not infra:
+                    await self._post_failure_comment(row, error)
                 return
             delay = outcome.retry_delay_seconds
             available_at = iso_seconds_from_now(delay) if delay is not None and delay > 0 else None
@@ -505,6 +595,7 @@ class WorkerPool:
                     "key": row.issue_key,
                     "attempts": row.attempts,
                     "delay": delay,
+                    "reason": _failure_summary(error),
                 },
             )
 
@@ -542,6 +633,21 @@ class WorkerPool:
             received_at=row.received_at,
             slot_uid=slot_uid,
         )
+
+    async def _run_probe_pr_review_ci(self, row: EventRow, slot_uid: int | None) -> TaskOutcome | None:
+        outcome = await tasks.probe_pr_review_ci(
+            settings=self.settings,
+            db=self.db,
+            github=self.github,
+            payload=row.payload,
+            delivery_id=row.delivery_id,
+            received_at=row.received_at,
+            event_issue_key=row.issue_key,
+        )
+        # A green probe enqueues a review_pr; nudge the dispatcher so it drains
+        # without waiting for the next poll.
+        self.wake()
+        return outcome
 
     async def _run_triage_issue(self, row: EventRow, slot_uid: int | None) -> TaskOutcome | None:
         return await tasks.triage_issue(
@@ -631,6 +737,7 @@ class WorkerPool:
         )
         task_registry: Mapping[str, _TaskHandler] = {
             "review_pr": self._run_review_pr,
+            "probe_pr_review_ci": self._run_probe_pr_review_ci,
             "triage_issue": self._run_triage_issue,
             "handle_pr_conversation": self._run_handle_pr_conversation,
             "handle_comment": self._run_handle_comment,

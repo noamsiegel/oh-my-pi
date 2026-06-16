@@ -168,6 +168,12 @@ def test_repo_command_env_excludes_parent_secrets(
     monkeypatch.setenv("BUN_INSTALL_CACHE_DIR", "/data/cache/bun-cache")
 
     bindings, loop, thread = _bindings(db, tmp_path, httpx.MockTransport(lambda _r: httpx.Response(500)), slot_uid=2001)
+    bindings = replace(
+        bindings,
+        settings=Settings.model_construct(
+            pr_review_hoa_db_host="db", pr_review_hoa_redis_host="cache"
+        ),
+    )
     try:
         env = host_tools._repo_command_env(bindings)
         rpc_env = host_tools._repo_command_env(bindings, include_auth_broker=True)
@@ -190,6 +196,14 @@ def test_repo_command_env_excludes_parent_secrets(
         "BUN_INSTALL",
         "NODE_OPTIONS",
         "OMP_AUTH_BROKER_TOKEN",
+        "ENV",
+        "IS_LOCAL",
+        "DB_HOST",
+        "DB_NAME",
+        "DB_USER",
+        "DB_PASS",
+        "DB_PORT",
+        "REDIS_HOST",
     ):
         assert key not in env
     assert rpc_env["OMP_AUTH_BROKER_TOKEN"] == "broker-secret"
@@ -902,18 +916,28 @@ def test_gh_post_comment_rejects_in_review_mode(db: Database, tmp_path: Path) ->
 
 def test_classify_pr_applies_review_labels_and_persists_label(db: Database, tmp_path: Path) -> None:
     captured: dict[str, Any] = {}
+    colored: dict[str, str] = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
-        captured["path"] = request.url.path
-        captured["body"] = json.loads(request.content)
-        return httpx.Response(200, json=[{"name": label} for label in captured["body"]["labels"]])
+        from urllib.parse import unquote
+
+        path = request.url.path
+        if request.method == "POST" and path.endswith("/issues/99/labels"):
+            captured["path"] = path
+            captured["body"] = json.loads(request.content)
+            return httpx.Response(200, json=[{"name": label} for label in captured["body"]["labels"]])
+        if request.method == "PATCH" and "/labels/" in path:
+            name = unquote(path.rsplit("/labels/", 1)[1])
+            colored[name] = json.loads(request.content)["color"]
+            return httpx.Response(200, json={"name": name})
+        return httpx.Response(404, json={"message": "unrouted"})
 
     bindings, loop, t = _review_bindings(db, tmp_path, httpx.MockTransport(handler))
     try:
         tool = next(x for x in build(bindings) if x.name == "classify_pr")
         result = tool.execute(
             {
-                "review_label": "review:minor",
+                "review_label": "review:needs-work",
                 "type": "fix",
                 "area": ["tool", "unknown"],
                 "provider": "provider:openai",
@@ -924,11 +948,18 @@ def test_classify_pr_applies_review_labels_and_persists_label(db: Database, tmp_
     finally:
         _stop_loop(loop, t)
 
-    assert "review:minor" in result
+    assert "review:needs-work" in result
     assert captured["path"].endswith("/issues/99/labels")
-    assert captured["body"]["labels"] == ["triaged", "review:minor", "fix", "tool", "providers", "provider:openai"]
+    assert captured["body"]["labels"] == ["triaged", "review:needs-work", "fix", "tool", "providers", "provider:openai"]
     row = db.get_issue(bindings.issue_key)
-    assert row is not None and row.classification == "review:minor"
+    assert row is not None and row.classification == "review:needs-work"
+    # Bot re-asserts group colors: verdict semaphore, type=purple, area=slate, provider=teal, triaged=neutral.
+    assert colored["review:needs-work"] == "FBCA04"
+    assert colored["fix"] == "8957E5"
+    assert colored["tool"] == "6E7781"
+    assert colored["providers"] == "1F7A8C"
+    assert colored["provider:openai"] == "1F7A8C"
+    assert colored["triaged"] == "D0D7DE"
 
 
 def test_classify_pr_rejects_bad_review_label(db: Database, tmp_path: Path) -> None:
@@ -939,6 +970,97 @@ def test_classify_pr_rejects_bad_review_label(db: Database, tmp_path: Path) -> N
             tool.execute({"review_label": "prio:p1", "type": "fix", "rationale": "wrong namespace"}, _ctx())
     finally:
         _stop_loop(loop, t)
+
+
+def test_classify_pr_removes_other_verdict_labels(db: Database, tmp_path: Path) -> None:
+    """Re-classification drops a stale verdict label so exactly one review:* remains."""
+    from urllib.parse import unquote
+
+    deleted: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path.endswith("/labels"):
+            added = json.loads(request.content)["labels"]
+            # PR already carried a prior verdict from an earlier review.
+            return httpx.Response(200, json=[{"name": n} for n in [*added, "review:needs-discussion"]])
+        if request.method == "DELETE" and "/labels/" in request.url.path:
+            deleted.append(unquote(request.url.path.rsplit("/labels/", 1)[1]))
+            return httpx.Response(200, json=[])
+        if request.method == "PATCH" and "/labels/" in request.url.path:
+            return httpx.Response(200, json={})
+        return httpx.Response(404, json={"message": "unrouted"})
+
+    bindings, loop, t = _review_bindings(db, tmp_path, httpx.MockTransport(handler))
+    try:
+        tool = next(x for x in build(bindings) if x.name == "classify_pr")
+        result = tool.execute(
+            {"review_label": "review:ready", "type": "fix", "rationale": "fix verified, ready to merge"},
+            _ctx(),
+        )
+    finally:
+        _stop_loop(loop, t)
+
+    assert deleted == ["review:needs-discussion"]
+    assert "review:needs-discussion" not in result
+    assert "review:ready" in result
+
+
+def test_pr_review_reconcile_downgrades_ready_when_not_approved(db: Database, tmp_path: Path) -> None:
+    from urllib.parse import unquote
+    from robomp.host_tools import _pr_review_reconcile_verdict_label
+
+    deleted: list[str] = []
+    colored: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if request.method == "POST" and path.endswith("/issues/99/labels"):
+            return httpx.Response(200, json=[{"name": n} for n in json.loads(request.content)["labels"]])
+        if request.method == "DELETE" and "/labels/" in path:
+            deleted.append(unquote(path.rsplit("/labels/", 1)[1]))
+            return httpx.Response(200, json=[])
+        if request.method == "PATCH" and "/labels/" in path:
+            colored[unquote(path.rsplit("/labels/", 1)[1])] = json.loads(request.content)["color"]
+            return httpx.Response(200, json={})
+        return httpx.Response(404, json={"message": "unrouted"})
+
+    bindings, loop, t = _review_bindings(db, tmp_path, httpx.MockTransport(handler))
+    try:
+        db.set_issue_classification(bindings.issue_key, "review:ready")
+        # An APPROVE keeps review:ready untouched.
+        assert _pr_review_reconcile_verdict_label(bindings, event="APPROVE") is None
+        assert db.get_issue(bindings.issue_key).classification == "review:ready"
+        # A non-APPROVE event downgrades the stale ready verdict.
+        changed = _pr_review_reconcile_verdict_label(bindings, event="COMMENT")
+    finally:
+        _stop_loop(loop, t)
+
+    assert changed == "review:needs-work"
+    assert db.get_issue(bindings.issue_key).classification == "review:needs-work"
+    assert deleted == ["review:ready"]
+    assert colored.get("review:needs-work") == "FBCA04"
+
+
+def test_pr_review_reconcile_noop_for_non_ready_verdict(db: Database, tmp_path: Path) -> None:
+    from robomp.host_tools import _pr_review_reconcile_verdict_label
+
+    touched: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        touched.append(request.method)
+        return httpx.Response(200, json=[])
+
+    bindings, loop, t = _review_bindings(db, tmp_path, httpx.MockTransport(handler))
+    try:
+        db.set_issue_classification(bindings.issue_key, "review:needs-discussion")
+        result = _pr_review_reconcile_verdict_label(bindings, event="COMMENT")
+    finally:
+        _stop_loop(loop, t)
+
+    assert result is None
+    assert db.get_issue(bindings.issue_key).classification == "review:needs-discussion"
+    assert touched == []
+
 
 
 def test_pr_review_comment_stages_and_submit_flushes_one_comment_review(db: Database, tmp_path: Path) -> None:
@@ -981,7 +1103,7 @@ def test_pr_review_comment_stages_and_submit_flushes_one_comment_review(db: Data
         assert rows[0].path == "src/app.py"
 
         with pytest.raises(RpcCommandError, match="terminal review events are disabled"):
-            submit_tool.execute({"body": "review:minor — one blocking issue", "event": "APPROVE"}, _ctx())
+            submit_tool.execute({"body": "review:needs-work — one blocking issue", "event": "APPROVE"}, _ctx())
         result = "rejected"
     finally:
         _stop_loop(loop, t)
@@ -1082,6 +1204,54 @@ def test_run_pr_review_helper_invokes_bun_with_pr_paths_and_allowlisted_env(
     assert captured["kwargs"]["cwd"] == str(bindings.workspace.repo_dir)
     assert captured["kwargs"]["env"]["PATH"] == "/bin"
     assert "GITHUB_TOKEN" not in captured["kwargs"]["env"]
+
+
+def test_review_mode_repo_command_env_includes_hoa_db(
+    db: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import subprocess as _sp
+
+    monkeypatch.setenv("PATH", "/bin")
+    monkeypatch.setenv("GITHUB_TOKEN", "secret")
+    captured: dict[str, Any] = {}
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _sp.CompletedProcess[str]:
+        captured["kwargs"] = kwargs
+        return _sp.CompletedProcess(cmd, 0, stdout="ok", stderr="")
+
+    bindings, loop, t = _review_bindings(db, tmp_path, httpx.MockTransport(lambda _r: httpx.Response(500)))
+    bindings = replace(
+        bindings,
+        settings=Settings.model_construct(
+            pr_review_hoa_db_host="db",
+            pr_review_hoa_db_name="postgres",
+            pr_review_hoa_db_user="postgres",
+            pr_review_hoa_db_pass="postgres",
+            pr_review_hoa_db_port="5432",
+            pr_review_hoa_redis_host="cache",
+        ),
+    )
+    helper = tmp_path / "pr-review-helper.js"
+    helper.write_text("", encoding="utf-8")
+    monkeypatch.setattr(pr_review_tools.subprocess, "run", fake_run)
+    try:
+        env = host_tools._repo_command_env(bindings)
+        run_pr_review_helper(bindings, helper, ["validate"], 30.0, "PR review validation failed")
+    finally:
+        _stop_loop(loop, t)
+
+    helper_env = captured["kwargs"]["env"]
+    for source in (env, helper_env):
+        assert source["ENV"] == "dev"
+        assert source["IS_LOCAL"] == "1"
+        assert source["DB_HOST"] == "db"
+        assert source["DB_NAME"] == "postgres"
+        assert source["DB_USER"] == "postgres"
+        assert source["DB_PASS"] == "postgres"
+        assert source["DB_PORT"] == "5432"
+        assert source["REDIS_HOST"] == "cache"
+        assert "GITHUB_TOKEN" not in source
+
 
 
 def test_submit_pr_review_refuses_when_pr_head_changed(
@@ -1483,7 +1653,7 @@ def test_submit_pr_review_refuses_clean_when_local_verification_failed(db: Datab
     try:
         submit_tool = next(x for x in build(bindings) if x.name == "submit_pr_review")
         with pytest.raises(RpcCommandError, match="local verification failed"):
-            submit_tool.execute({"body": "review:clean — scoped fix.", "event": "COMMENT"}, _ctx())
+            submit_tool.execute({"body": "review:ready — scoped fix.", "event": "COMMENT"}, _ctx())
     finally:
         _stop_loop(loop, t)
 
@@ -2135,6 +2305,69 @@ def test_prepare_pr_review_verify_fixes_fetches_unreachable_prior_sha(
     assert ("git", "fetch", "origin", old_sha) in commands
     assert ("git", "diff", "--no-color", f"{old_sha}..{head_sha}", "--", "src/app.py") in commands
 
+
+def test_prepare_pr_review_incremental_fresh_for_old_commented(
+    db: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    helper = tmp_path / "pr-review-helper.js"
+    _write_pr_review_helper(helper)
+    bindings, loop, t = _review_bindings(db, tmp_path, httpx.MockTransport(lambda _r: httpx.Response(500)))
+    head_sha = bindings.review_head_sha or ""
+    old_sha = "b" * 40
+    bindings = replace(bindings, settings=Settings.model_construct(pr_review_helper=helper, request_timeout_seconds=30.0, bot_login="robomp-bot"))
+
+    async def _get_pull_request(repo_full: str, number: int):
+        return PullRequestInfo(repo="octo/widget", number=99, html_url="u", head_ref="h", base_ref="main", state="open", author="alice", head_repo="octo/widget", title="t", body="b", head_sha=head_sha)
+
+    async def _list_pr_files(repo_full: str, number: int):
+        return [PullRequestFileInfo("src/app.py", "modified", 1, 1)]
+
+    async def _list_pr_reviews(repo_full: str, number: int):
+        return [PullRequestReviewInfo(100, "robomp-bot", "nit: rename", "COMMENTED", "t", commit_id=old_sha)]
+
+    async def _empty(repo_full: str, number: int):
+        return []
+
+    async def _get_authenticated_login():
+        return "robomp-bot"
+
+    def _diff(_bindings: ToolBindings, cmd, *, timeout=None):
+        if cmd == ("git", "rev-parse", "HEAD"):
+            return host_tools.subprocess.CompletedProcess(list(cmd), 0, stdout=f"{head_sha}\n", stderr="")
+        if cmd == ("git", "diff", "--no-color", "origin/main...HEAD"):
+            return host_tools.subprocess.CompletedProcess(list(cmd), 0, stdout="diff --git a/src/app.py b/src/app.py\n--- a/src/app.py\n+++ b/src/app.py\n@@ -1,1 +1,2 @@\n old\n+new\n", stderr="")
+        if cmd == ("git", "rev-parse", "--verify", "--quiet", old_sha):
+            return host_tools.subprocess.CompletedProcess(list(cmd), 0, stdout=f"{old_sha}\n", stderr="")
+        assert cmd == ("git", "diff", "--no-color", f"{old_sha}..{head_sha}", "--", "src/app.py")
+        return host_tools.subprocess.CompletedProcess(list(cmd), 0, stdout="diff --git a/src/app.py b/src/app.py\n--- a/src/app.py\n+++ b/src/app.py\n@@ -2,1 +2,2 @@\n old\n+fix\n", stderr="")
+
+    monkeypatch.setattr(bindings.github, "get_pull_request", _get_pull_request)
+    monkeypatch.setattr(bindings.github, "list_pr_files", _list_pr_files)
+    monkeypatch.setattr(bindings.github, "list_pr_reviews", _list_pr_reviews)
+    monkeypatch.setattr(bindings.github, "list_review_threads", _empty)
+    monkeypatch.setattr(bindings.github, "list_pr_commits", _empty)
+    monkeypatch.setattr(bindings.github, "get_authenticated_login", _get_authenticated_login)
+    monkeypatch.setattr(bindings.github, "list_comments", _empty)
+    monkeypatch.setattr(host_tools, "_run_repo_command", _diff)
+    try:
+        tool = next(x for x in build(bindings) if x.name == "prepare_pr_review")
+        tool.execute({}, _ctx())
+    finally:
+        _stop_loop(loop, t)
+
+    evidence = json.loads((bindings.workspace.session_dir / "pr-review-evidence.json").read_text(encoding="utf-8"))
+    # Non-blocking prior: helper-facing mode stays "fresh" so APPROVE remains reachable,
+    # but the agent still gets the incremental delta and skips delegation (delta_diff present).
+    assert evidence["mode"] == "fresh"
+    assert evidence["delta_diff"].startswith("diff --git")
+    assert evidence["delta_unavailable_reason"] is None
+    assert evidence["prior_review"]["state"] == "COMMENTED"
+    assert evidence["prior_review"]["sha"] == old_sha
+    assert "all_reviewer_cr_review_ids" not in evidence["prior_review"]
+    assert evidence["reviewer_prior_inline_comments_unioned"] is None
+    assert evidence["reviewer_prior_review_bodies"] == []
+
+
 def test_prepare_pr_review_refuses_stale_workspace_head(
     db: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2383,6 +2616,77 @@ def test_validate_pr_review_requires_delegate_for_required_domains(db: Database,
             tool.execute({"findings": []}, _ctx())
     finally:
         _stop_loop(loop, t)
+
+
+def test_prepare_pr_review_incremental_neutralizes_delegation(
+    db: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The helper enforces delegation off classification.domains_required in BOTH the validate
+    # gate and the submit payload. An incremental re-review must drop non-correctness domains so
+    # neither forces delegation.
+    helper = tmp_path / "pr-review-helper.js"
+    helper.write_text(
+        '''
+const cmd = process.argv[2];
+function arg(name){const i=process.argv.indexOf(name);return i===-1?null:process.argv[i+1];}
+if (cmd === "classify") {
+  await Bun.write(arg("--out"), JSON.stringify({
+    risk_level: "critical",
+    delegation_required: true,
+    domains_required: ["security", "data", "correctness"],
+    reviewability: {status: "reviewable"},
+    model_diversity: {cross_family_review_recommended: false}
+  }));
+} else { throw new Error("unexpected cmd "+cmd); }
+''',
+        encoding="utf-8",
+    )
+    bindings, loop, t = _review_bindings(db, tmp_path, httpx.MockTransport(lambda _r: httpx.Response(500)))
+    head_sha = bindings.review_head_sha or ""
+    old_sha = "b" * 40
+    bindings = replace(bindings, settings=Settings.model_construct(pr_review_helper=helper, request_timeout_seconds=30.0, bot_login="robomp-bot"))
+
+    async def _get_pull_request(repo_full: str, number: int):
+        return PullRequestInfo(repo="octo/widget", number=99, html_url="u", head_ref="h", base_ref="main", state="open", author="alice", head_repo="octo/widget", title="t", body="b", head_sha=head_sha)
+
+    async def _list_pr_files(repo_full: str, number: int):
+        return [PullRequestFileInfo("src/app.py", "modified", 1, 1)]
+
+    async def _list_pr_reviews(repo_full: str, number: int):
+        return [PullRequestReviewInfo(100, "robomp-bot", "nit", "COMMENTED", "t", commit_id=old_sha)]
+
+    async def _empty(repo_full: str, number: int):
+        return []
+
+    async def _get_authenticated_login():
+        return "robomp-bot"
+
+    def _diff(_bindings: ToolBindings, cmd, *, timeout=None):
+        if cmd == ("git", "rev-parse", "HEAD"):
+            return host_tools.subprocess.CompletedProcess(list(cmd), 0, stdout=f"{head_sha}\n", stderr="")
+        if cmd == ("git", "diff", "--no-color", "origin/main...HEAD"):
+            return host_tools.subprocess.CompletedProcess(list(cmd), 0, stdout="diff --git a/src/app.py b/src/app.py\n", stderr="")
+        if cmd == ("git", "rev-parse", "--verify", "--quiet", old_sha):
+            return host_tools.subprocess.CompletedProcess(list(cmd), 0, stdout=f"{old_sha}\n", stderr="")
+        return host_tools.subprocess.CompletedProcess(list(cmd), 0, stdout="diff --git a/src/app.py b/src/app.py\n--- a/src/app.py\n+++ b/src/app.py\n@@ -2,1 +2,2 @@\n old\n+fix\n", stderr="")
+
+    monkeypatch.setattr(bindings.github, "get_pull_request", _get_pull_request)
+    monkeypatch.setattr(bindings.github, "list_pr_files", _list_pr_files)
+    monkeypatch.setattr(bindings.github, "list_pr_reviews", _list_pr_reviews)
+    monkeypatch.setattr(bindings.github, "list_review_threads", _empty)
+    monkeypatch.setattr(bindings.github, "list_pr_commits", _empty)
+    monkeypatch.setattr(bindings.github, "get_authenticated_login", _get_authenticated_login)
+    monkeypatch.setattr(bindings.github, "list_comments", _empty)
+    monkeypatch.setattr(host_tools, "_run_repo_command", _diff)
+    try:
+        tool = next(x for x in build(bindings) if x.name == "prepare_pr_review")
+        tool.execute({}, _ctx())
+    finally:
+        _stop_loop(loop, t)
+
+    classification = json.loads((bindings.workspace.session_dir / "pr-review-classification.json").read_text(encoding="utf-8"))
+    assert classification["domains_required"] == ["correctness"]
+    assert classification["delegation_required"] is False
 
 
 def test_delegate_pr_review_writes_metadata_and_unblocks_validate(
@@ -5084,3 +5388,79 @@ def test_gh_post_comment_skips_suffix_when_feature_disabled(db: Database, tmp_pa
 
     assert captured["body"] == {"body": "Here's the answer"}
     assert db.get_pending_closure(bindings.issue_key) is None
+
+
+def test_submit_pr_review_recovers_when_prior_review_already_landed(db: Database, tmp_path: Path) -> None:
+    # A stale pending reservation whose GitHub review actually landed must be
+    # finalized (recorded + marked succeeded) WITHOUT re-posting a duplicate.
+    holder: dict[str, Any] = {}
+    post_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal post_calls
+        if request.method == "GET" and request.url.path == "/repos/octo/widget/pulls/99/reviews":
+            return httpx.Response(
+                200,
+                json=[{
+                    "id": 77, "user": {"login": "robomp-bot"}, "body": "prior review",
+                    "state": "COMMENTED", "submitted_at": "t", "commit_id": holder["head"],
+                }],
+            )
+        if request.method == "POST" and request.url.path.endswith("/reviews"):
+            post_calls += 1
+            return httpx.Response(500, json={"message": "should not re-post"})
+        return httpx.Response(404, json={"message": "unrouted"})
+
+    bindings, loop, t = _review_bindings(db, tmp_path, httpx.MockTransport(handler))
+    bindings = replace(bindings, settings=Settings.model_construct(bot_login="robomp-bot"))
+    holder["head"] = bindings.review_head_sha
+    operation_key = (
+        f"submit_pr_review:{bindings.issue_key}:COMMENT:"
+        f"{host_tools._side_effect_payload_suffix({'body': 'summary', 'comments': [], 'event': 'COMMENT', 'commit_id': bindings.review_head_sha})}"
+    )
+    assert db.reserve_side_effect(operation_key)
+    try:
+        tool = next(x for x in build(bindings) if x.name == "submit_pr_review")
+        result = tool.execute({"body": "summary"}, _ctx())
+    finally:
+        _stop_loop(loop, t)
+
+    assert "side effect recovered" in result
+    assert post_calls == 0
+    assert db.has_completed_pr_review("octo/widget", 99, bindings.review_head_sha)
+    assert db.side_effect_succeeded(operation_key)
+
+
+def test_submit_pr_review_redrives_when_prior_attempt_never_landed(db: Database, tmp_path: Path) -> None:
+    # A stale pending reservation with NO matching GitHub review means the prior
+    # attempt died before posting; release the dead reservation and re-submit.
+    post_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal post_calls
+        if request.method == "GET" and request.url.path == "/repos/octo/widget/pulls/99/reviews":
+            return httpx.Response(200, json=[])
+        if request.method == "POST" and request.url.path.endswith("/reviews"):
+            post_calls += 1
+            return httpx.Response(
+                200,
+                json={"id": 88, "user": {"login": "robomp-bot"}, "body": json.loads(request.content)["body"], "state": "COMMENTED", "submitted_at": "t"},
+            )
+        return httpx.Response(404, json={"message": "unrouted"})
+
+    bindings, loop, t = _review_bindings(db, tmp_path, httpx.MockTransport(handler))
+    bindings = replace(bindings, settings=Settings.model_construct(bot_login="robomp-bot"))
+    operation_key = (
+        f"submit_pr_review:{bindings.issue_key}:COMMENT:"
+        f"{host_tools._side_effect_payload_suffix({'body': 'summary', 'comments': [], 'event': 'COMMENT', 'commit_id': bindings.review_head_sha})}"
+    )
+    assert db.reserve_side_effect(operation_key)
+    try:
+        tool = next(x for x in build(bindings) if x.name == "submit_pr_review")
+        result = tool.execute({"body": "summary"}, _ctx())
+    finally:
+        _stop_loop(loop, t)
+
+    assert "submitted PR review id=88" in result
+    assert post_calls == 1
+    assert db.side_effect_succeeded(operation_key)

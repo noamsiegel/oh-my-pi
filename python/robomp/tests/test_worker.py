@@ -18,7 +18,11 @@ import pytest
 from robomp import worker
 from robomp.config import Settings
 from robomp.git_ops import DirtyState
-from robomp.task_outcome import DeferredTask
+from robomp.task_outcome import (
+    INFRA_UNAVAILABLE_MARKER,
+    MAX_INFRA_UNAVAILABLE_ATTEMPTS,
+    InfrastructureUnavailable,
+)
 
 class _FakeRpcClient:
     instances: list[_FakeRpcClient] = []
@@ -768,16 +772,30 @@ def test_auth_broker_preflight_reports_connection_failure(monkeypatch: pytest.Mo
     assert "Connection refused" in reason
 
 
-def test_auth_broker_preflight_defers_without_retry_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_auth_broker_preflight_defers_with_capped_retry_limit(monkeypatch: pytest.MonkeyPatch) -> None:
     def fake_urlopen(_request, timeout: float):
         raise URLError("Connection refused")
 
+    monkeypatch.delenv("ROBOMP_AUTH_BROKER_DEFER_MAX_ATTEMPTS", raising=False)
     monkeypatch.setenv("OMP_AUTH_BROKER_URL", "http://host.docker.internal:18765")
     monkeypatch.setattr(worker, "urlopen", fake_urlopen)
-    with pytest.raises(DeferredTask) as exc:
+    with pytest.raises(InfrastructureUnavailable) as exc:
         worker._defer_if_auth_broker_unavailable()  # noqa: SLF001
-    assert exc.value.outcome.retry_limit is None
+    # Capped, not None: it must dead-letter instead of retrying forever.
+    assert exc.value.outcome.retry_limit == MAX_INFRA_UNAVAILABLE_ATTEMPTS
     assert exc.value.outcome.retry_delay_seconds == 300.0
+    assert exc.value.outcome.reason is not None
+    assert exc.value.outcome.reason.startswith(INFRA_UNAVAILABLE_MARKER)
+    assert "Connection refused" in exc.value.outcome.reason
+
+
+def test_auth_broker_defer_attempts_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ROBOMP_AUTH_BROKER_DEFER_MAX_ATTEMPTS", "3")
+    assert worker._auth_broker_defer_attempts() == 3  # noqa: SLF001
+    monkeypatch.setenv("ROBOMP_AUTH_BROKER_DEFER_MAX_ATTEMPTS", "garbage")
+    assert worker._auth_broker_defer_attempts() == MAX_INFRA_UNAVAILABLE_ATTEMPTS  # noqa: SLF001
+    monkeypatch.setenv("ROBOMP_AUTH_BROKER_DEFER_MAX_ATTEMPTS", "0")
+    assert worker._auth_broker_defer_attempts() == 1  # noqa: SLF001
 
 
 def test_review_pr_prompt_includes_verify_fixes_focus(tmp_path: Path, settings: Settings) -> None:
@@ -858,6 +876,63 @@ async def test_run_rpc_review_pr_forces_high_thinking(tmp_path: Path, settings: 
     finally:
         loop.close()
     assert _FakeRpcClient.instances[0].kwargs["thinking"] == "high"
+
+@pytest.mark.asyncio
+async def test_run_rpc_review_pr_injects_hoa_db_env(tmp_path: Path, settings: Settings) -> None:
+    review_settings = settings.model_copy(
+        update={
+            "pr_review_hoa_db_host": "db",
+            "pr_review_hoa_db_name": "postgres",
+            "pr_review_hoa_db_user": "postgres",
+            "pr_review_hoa_db_pass": "postgres",
+            "pr_review_hoa_db_port": "5432",
+            "pr_review_hoa_redis_host": "cache",
+        }
+    )
+    inputs, bindings = _make_inputs(tmp_path, review_settings, session_has_jsonl=False)
+    loop = asyncio.new_event_loop()
+    try:
+        worker._run_rpc_blocking(
+            inputs,
+            task_kind="review_pr",
+            prompt="kickoff",
+            loop=loop,
+            bindings=bindings,  # type: ignore[arg-type]
+        )
+    finally:
+        loop.close()
+    env = _FakeRpcClient.instances[0].kwargs["env"]
+    assert env["ENV"] == "dev"
+    assert env["IS_LOCAL"] == "1"
+    assert env["DB_HOST"] == "db"
+    assert env["DB_NAME"] == "postgres"
+    assert env["DB_USER"] == "postgres"
+    assert env["DB_PASS"] == "postgres"
+    assert env["DB_PORT"] == "5432"
+    assert env["REDIS_HOST"] == "cache"
+
+
+@pytest.mark.asyncio
+async def test_run_rpc_triage_omits_hoa_db_env(tmp_path: Path, settings: Settings) -> None:
+    configured = settings.model_copy(
+        update={"pr_review_hoa_db_host": "db", "pr_review_hoa_redis_host": "cache"}
+    )
+    inputs, bindings = _make_inputs(tmp_path, configured, session_has_jsonl=False)
+    loop = asyncio.new_event_loop()
+    try:
+        worker._run_rpc_blocking(
+            inputs,
+            task_kind="triage_issue",
+            prompt="x",
+            loop=loop,
+            bindings=bindings,  # type: ignore[arg-type]
+        )
+    finally:
+        loop.close()
+    env = _FakeRpcClient.instances[0].kwargs["env"]
+    for key in ("ENV", "IS_LOCAL", "DB_HOST", "DB_NAME", "DB_USER", "DB_PASS", "DB_PORT", "REDIS_HOST"):
+        assert key not in env
+
 
 
 @pytest.mark.asyncio

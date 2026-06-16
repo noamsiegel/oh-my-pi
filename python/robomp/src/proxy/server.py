@@ -425,11 +425,11 @@ def create_proxy_app(settings: ProxySettings) -> FastAPI:
         return JSONResponse(_serialize(info))
 
     @app.get("/gh/v1/pull_requests")
-    async def list_open_pull_requests(request: Request, repo: str, limit: int = 30) -> JSONResponse:
+    async def list_pull_requests(request: Request, repo: str, state: str = "open", limit: int = 30) -> JSONResponse:
         await _authenticate(request)
         github: GitHubClient = request.app.state.github
         try:
-            items = await github.list_open_pull_requests(repo, limit=limit)
+            items = await github.list_pull_requests(repo, state=state, limit=limit)  # type: ignore[arg-type]
         except GitHubError as exc:
             return _gh_error_response(exc)
         return JSONResponse({"items": [_serialize(item) for item in items]})
@@ -549,6 +549,19 @@ def create_proxy_app(settings: ProxySettings) -> FastAPI:
             return _gh_error_response(exc)
         return JSONResponse(_serialize(info))
 
+    @app.post("/gh/v1/update_comment")
+    async def update_comment(request: Request) -> JSONResponse:
+        data = await _json_body(request)
+        repo = _require_str(data.get("repo"), "repo")
+        comment_id = _require_int(data.get("comment_id"), "comment_id")
+        body = _require_str(data.get("body"), "body")
+        github: GitHubClient = request.app.state.github
+        try:
+            info = await github.update_comment(repo, comment_id, body)
+        except GitHubError as exc:
+            return _gh_error_response(exc)
+        return JSONResponse(_serialize(info))
+
     @app.post("/gh/v1/open_pull_request")
     async def open_pull_request(request: Request) -> JSONResponse:
         data = await _json_body(request)
@@ -605,6 +618,35 @@ def create_proxy_app(settings: ProxySettings) -> FastAPI:
         except GitHubError as exc:
             return _gh_error_response(exc)
         return JSONResponse({"labels": list(applied)})
+
+    @app.post("/gh/v1/remove_issue_label")
+    async def remove_issue_label(request: Request) -> JSONResponse:
+        data = await _json_body(request)
+        repo = _require_str(data.get("repo"), "repo")
+        number = _require_int(data.get("number"), "number")
+        name = _require_str(data.get("name"), "name")
+        github: GitHubClient = request.app.state.github
+        try:
+            remaining = await github.remove_issue_label(repo, number, name)
+        except GitHubError as exc:
+            return _gh_error_response(exc)
+        return JSONResponse({"labels": list(remaining)})
+
+    @app.post("/gh/v1/set_label")
+    async def set_label(request: Request) -> JSONResponse:
+        data = await _json_body(request)
+        repo = _require_str(data.get("repo"), "repo")
+        name = _require_str(data.get("name"), "name")
+        color = _require_str(data.get("color"), "color")
+        description = data.get("description")
+        github: GitHubClient = request.app.state.github
+        try:
+            await github.set_label(
+                repo, name, color=color, description=description if isinstance(description, str) else None
+            )
+        except GitHubError as exc:
+            return _gh_error_response(exc)
+        return JSONResponse({"ok": True})
 
     @app.post("/gh/v1/submit_pr_review")
     async def submit_pr_review(request: Request) -> JSONResponse:

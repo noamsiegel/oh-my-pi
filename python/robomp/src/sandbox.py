@@ -48,6 +48,7 @@ import shutil
 import signal
 import stat
 import subprocess
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -97,6 +98,93 @@ class Workspace:
         if self.review_head_sha:
             return pr_review_workspace_key(self.repo_full_name, self.issue_number, self.review_head_sha)
         return workspace_key(self.repo_full_name, self.issue_number)
+
+
+@dataclass(slots=True)
+class WorkspaceGcEntry:
+    """Parsed metadata for one candidate workspace directory."""
+
+    root: Path
+    repo: str
+    number: int
+    head_sha: str | None
+    mtime: float
+    size_bytes: int
+
+    @property
+    def issue_key(self) -> str:
+        return f"{self.repo}#{self.number}"
+
+
+@dataclass(slots=True)
+class WorkspaceGcResult:
+    """Outcome of a single ``gc_workspaces`` sweep."""
+
+    evicted: int
+    freed_bytes: int
+    total_bytes: int
+    free_bytes: int
+    remaining_bytes: int
+    scanned: int
+
+
+@dataclass(slots=True)
+class WorkspaceStorageStats:
+    """Snapshot of workspace disk consumption for metrics."""
+
+    entries: int
+    bytes: int
+    free_bytes: int
+    total_bytes: int
+
+
+_HEX40_RE = re.compile(r"[0-9a-fA-F]{40}")
+
+
+def _dir_size_bytes(path: Path) -> int:
+    """Sum on-disk byte size of ``path`` without following symlink targets."""
+    total = 0
+    for current_root, dirs, files in os.walk(path, topdown=True, followlinks=False):
+        current = Path(current_root)
+        for name in files:
+            try:
+                total += (current / name).lstat().st_size
+            except OSError:
+                continue
+        for name in dirs:
+            try:
+                st = (current / name).lstat()
+            except OSError:
+                continue
+            if stat.S_ISLNK(st.st_mode):
+                total += st.st_size
+    return total
+
+
+def _parse_workspace_dir_name(name: str) -> tuple[str, int, str | None] | None:
+    """Fallback parse of a workspace directory name into (repo, number, head_sha).
+
+    Recognizes ``<repo_key>__<number>__<40hex>`` (PR review) and
+    ``<repo_key>__<number>`` (legacy issue). Returns ``None`` for malformed
+    names so GC never deletes directories it cannot identify.
+    """
+    parts = name.split("__")
+    if len(parts) < 2:
+        return None
+    last = parts[-1]
+    if _HEX40_RE.fullmatch(last):
+        if len(parts) < 3:
+            return None
+        number_str = parts[-2]
+        repo_key = "__".join(parts[:-2])
+        head_sha: str | None = last.lower()
+    else:
+        number_str = last
+        repo_key = "__".join(parts[:-1])
+        head_sha = None
+    if not repo_key or not number_str.isdigit():
+        return None
+    return repo_key.replace("__", "/"), int(number_str), head_sha
 
 
 def _slug(text: str, *, length: int = 40) -> str:
@@ -1144,6 +1232,201 @@ class SandboxManager:
             if child.is_dir() and child.name.startswith(prefix):
                 self._remove_workspace_root(repo, child)
 
+    # ---- workspace garbage collection ----
+    @staticmethod
+    def _parse_workspace_entry(child: Path) -> WorkspaceGcEntry | None:
+        """Resolve a direct child of the workspace root into a GC entry.
+
+        Prefers the PR-review manifest; falls back to the directory name.
+        Returns ``None`` for ``_pool``, non-directories, and unparseable
+        names so GC never deletes directories it cannot identify.
+        """
+        if child.name == "_pool" or not child.is_dir():
+            return None
+        repo: str | None = None
+        number: int | None = None
+        head_sha: str | None = None
+        manifest = SandboxManager._read_pr_review_manifest(child / ".omp-session")
+        if manifest is not None:
+            m_repo = manifest.get("repo")
+            m_number = manifest.get("pr_number")
+            m_head = manifest.get("head_sha")
+            if (
+                isinstance(m_repo, str)
+                and isinstance(m_number, int)
+                and not isinstance(m_number, bool)
+                and isinstance(m_head, str)
+                and _HEX40_RE.fullmatch(m_head)
+            ):
+                repo, number, head_sha = m_repo, m_number, m_head.lower()
+        if repo is None or number is None:
+            parsed = _parse_workspace_dir_name(child.name)
+            if parsed is None:
+                return None
+            repo, number, head_sha = parsed
+        try:
+            mtime = child.stat().st_mtime
+        except OSError:
+            return None
+        return WorkspaceGcEntry(
+            root=child,
+            repo=repo,
+            number=number,
+            head_sha=head_sha,
+            mtime=mtime,
+            size_bytes=_dir_size_bytes(child),
+        )
+
+    def iter_workspace_entries(self) -> tuple[WorkspaceGcEntry, ...]:
+        """Return parsed workspace entries sorted oldest-first by mtime."""
+        if not self.root.exists():
+            return ()
+        entries: list[WorkspaceGcEntry] = []
+        for child in self.root.iterdir():
+            entry = self._parse_workspace_entry(child)
+            if entry is not None:
+                entries.append(entry)
+        entries.sort(key=lambda e: (e.mtime, e.root.name))
+        return tuple(entries)
+
+    def workspace_storage_stats(self) -> WorkspaceStorageStats:
+        """Summed workspace byte usage plus disk free/total for metrics."""
+        entries = self.iter_workspace_entries()
+        total_size = sum(e.size_bytes for e in entries)
+        usage_path = self.root if self.root.exists() else self.root.parent
+        try:
+            usage = shutil.disk_usage(usage_path)
+            free_bytes, total_bytes = usage.free, usage.total
+        except OSError:
+            free_bytes = total_bytes = 0
+        return WorkspaceStorageStats(
+            entries=len(entries),
+            bytes=total_size,
+            free_bytes=free_bytes,
+            total_bytes=total_bytes,
+        )
+
+    def remove_superseded_pr_review_workspaces(self, *, repo: str, number: int, keep_head_sha: str) -> int:
+        """Remove same-PR review workspaces whose head SHA is not ``keep_head_sha``."""
+        keep = _validate_pr_head_sha(keep_head_sha)
+        if not self.root.exists():
+            return 0
+        prefix = workspace_key(repo, number) + "__"
+        removed = 0
+        for child in tuple(self.root.iterdir()):
+            if not child.is_dir() or not child.name.startswith(prefix):
+                continue
+            suffix = child.name[len(prefix):]
+            if not _HEX40_RE.fullmatch(suffix) or suffix.lower() == keep:
+                continue
+            self._remove_workspace_root(repo, child)
+            removed += 1
+            log.info(
+                "pr_review workspace superseded head removed",
+                extra={"repo": repo, "pr": number, "head": suffix.lower(), "path": str(child)},
+            )
+        return removed
+
+    def gc_workspaces(
+        self,
+        *,
+        max_age_seconds: float,
+        max_bytes: int,
+        min_free_bytes: int,
+        protected_issue_keys: frozenset[str] = frozenset(),
+        now: float | None = None,
+    ) -> WorkspaceGcResult:
+        """Evict workspaces by TTL, then by size/free-space pressure, oldest-first.
+
+        Protected issue keys are never evicted. ``_pool`` is never touched.
+        Returns counts/bytes estimated before deletion; deletion is best-effort.
+        """
+        entries = self.iter_workspace_entries()
+        scanned = len(entries)
+        usage_path = self.root if self.root.exists() else self.root.parent
+        try:
+            usage = shutil.disk_usage(usage_path)
+            initial_free, disk_total = usage.free, usage.total
+        except OSError:
+            initial_free = disk_total = 0
+        total_workspace_bytes = sum(e.size_bytes for e in entries)
+        now_ts = now if now is not None else time.time()
+        candidates = [e for e in entries if e.issue_key not in protected_issue_keys]
+        evict_roots: set[Path] = set()
+        freed = 0
+
+        if max_age_seconds > 0:
+            for entry in candidates:
+                if now_ts - entry.mtime >= max_age_seconds:
+                    evict_roots.add(entry.root)
+                    freed += entry.size_bytes
+
+        def needs_more() -> bool:
+            if max_bytes > 0 and (total_workspace_bytes - freed) > max_bytes:
+                return True
+            if min_free_bytes > 0 and (initial_free + freed) < min_free_bytes:
+                return True
+            return False
+
+        for entry in candidates:
+            if entry.root in evict_roots:
+                continue
+            if not needs_more():
+                break
+            evict_roots.add(entry.root)
+            freed += entry.size_bytes
+
+        evicted = 0
+        freed_bytes = 0
+        for entry in candidates:
+            if entry.root not in evict_roots:
+                continue
+            try:
+                self._remove_workspace_root(entry.repo, entry.root)
+            except OSError as exc:
+                log.warning(
+                    "workspace gc remove failed",
+                    extra={"path": str(entry.root), "err": str(exc)},
+                )
+                continue
+            evicted += 1
+            freed_bytes += entry.size_bytes
+
+        return WorkspaceGcResult(
+            evicted=evicted,
+            freed_bytes=freed_bytes,
+            total_bytes=disk_total,
+            free_bytes=initial_free + freed_bytes,
+            remaining_bytes=total_workspace_bytes - freed_bytes,
+            scanned=scanned,
+        )
+
+    def gc_clone_pools(self) -> int:
+        """Run ``git worktree prune`` + ``git gc --auto`` on each clone pool dir.
+
+        Returns the count of pool dirs where either command succeeded. Best-effort:
+        non-zero exits are logged, never raised.
+        """
+        if not self.pool.exists():
+            return 0
+        swept = 0
+        for child in tuple(self.pool.iterdir()):
+            if not child.is_dir():
+                continue
+            prune = _safe_run(
+                ["git", "worktree", "prune"], cwd=child, timeout=_DEFAULT_SUBPROCESS_TIMEOUT_SECONDS
+            )
+            collect = _safe_run(
+                ["git", "gc", "--auto"], cwd=child, timeout=_DEFAULT_SUBPROCESS_TIMEOUT_SECONDS
+            )
+            if prune.returncode == 0 or collect.returncode == 0:
+                swept += 1
+            if prune.returncode != 0:
+                log.warning("clone pool worktree prune failed", extra={"pool": str(child), "rc": prune.returncode})
+            if collect.returncode != 0:
+                log.warning("clone pool gc failed", extra={"pool": str(child), "rc": collect.returncode})
+        return swept
+
 
 __all__ = [
     "GitCommandError",
@@ -1151,6 +1434,9 @@ __all__ = [
     "LocalGitTransport",
     "SandboxManager",
     "Workspace",
+    "WorkspaceGcEntry",
+    "WorkspaceGcResult",
+    "WorkspaceStorageStats",
     "make_branch",
     "rename_workspace_branch",
     "validate_branch_slug",

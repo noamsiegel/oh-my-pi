@@ -167,6 +167,54 @@ def _format_process_output(stdout: Any, stderr: Any) -> str:
     return "\n".join(part for part in parts if part) or "(no output)"
 
 
+def pr_review_runtime_env(settings: Settings | None) -> dict[str, str]:
+    """Non-secret Django env exposing the local review DB/Redis sidecars.
+
+    Only populated for incoming-PR review sandboxes that have an HOA DB host
+    configured. The credentials describe the throwaway review database only;
+    no GitHub tokens or production secrets are ever included here.
+    """
+    if settings is None or not settings.pr_review_hoa_db_host.strip():
+        return {}
+    env = {
+        "ENV": "dev",
+        "IS_LOCAL": "1",
+        "DB_NAME": settings.pr_review_hoa_db_name,
+        "DB_USER": settings.pr_review_hoa_db_user,
+        "DB_PASS": settings.pr_review_hoa_db_pass,
+        "DB_HOST": settings.pr_review_hoa_db_host,
+        "DB_PORT": settings.pr_review_hoa_db_port,
+    }
+    redis_host = settings.pr_review_hoa_redis_host.strip()
+    if redis_host:
+        env["REDIS_HOST"] = redis_host
+    return env
+
+
+_COMMENT_REVIEW_RETRYABLE_MARKERS = (
+    "promotedsection is not defined",
+    "command not found: uv",
+    "`uv` is not installed",
+    "`uv` is unavailable",
+    "uv is not installed",
+    "uv is unavailable",
+    "manage.py`/`yarn` unavailable",
+    "manage.py/yarn unavailable",
+    "yarn unavailable",
+    "command not found: yarn",
+)
+
+
+def pr_review_comment_retryable(review_body: str) -> bool:
+    """True when a prior COMMENT review reflects a transient tooling failure.
+
+    Such reviews are not a real verdict, so they must not anchor an incremental
+    verify-fixes pass: keep doing full reviews until a genuine review lands.
+    """
+    body = review_body.lower()
+    return any(marker in body for marker in _COMMENT_REVIEW_RETRYABLE_MARKERS)
+
+
 def _repo_command_env(bindings: ToolBindings, *, include_auth_broker: bool = False) -> dict[str, str]:
     env: dict[str, str] = {
         key: value
@@ -187,6 +235,8 @@ def _repo_command_env(bindings: ToolBindings, *, include_auth_broker: bool = Fal
             "GIT_COMMITTER_EMAIL": bindings.author_email,
         }
     )
+    if bindings.review_mode:
+        env.update(pr_review_runtime_env(bindings.settings))
     env["GIT_TERMINAL_PROMPT"] = "0"
     return env
 
@@ -224,6 +274,8 @@ __all__ = [
     "pr_review_model_family",
     "pr_review_parse_diff_anchors",
     "pr_review_paths",
+    "pr_review_comment_retryable",
+    "pr_review_runtime_env",
     "run_pr_review_helper",
     "save_json_checked",
 ]

@@ -21,7 +21,12 @@ from robomp.cancellation import (
 from robomp.config import Settings
 from robomp.db import Database, EventRow
 from robomp.git_ops import GitCommandError
-from robomp.queue import WorkerPool, _failure_summary
+from robomp.queue import (
+    WorkerPool,
+    _failure_summary,
+    _is_retryable_pr_workspace_error,
+    _is_superseded_pr_head_error,
+)
 from robomp.slot_pool import SlotPool
 from tests.fakes import (
     RecordingGitHub as _RecordingGitHub,
@@ -395,6 +400,57 @@ async def test_run_event_marks_failed_when_not_shutting_down(
     assert "regular failure" in stored.last_error
 
 
+def test_is_superseded_pr_head_error_matches_head_mismatch() -> None:
+    err = "git rev-parse FETCH_HEAD failed: PR head mismatch: expected aaa, got bbb"
+    assert _is_superseded_pr_head_error(err) is True
+    assert _is_superseded_pr_head_error("git fetch failed: early EOF") is False
+
+
+def test_worktree_remove_timeout_is_retryable() -> None:
+    err = "Command '['git', 'worktree', 'remove', '--force', '/data/ws/repo']' timed out after 120.0 seconds"
+    assert _is_retryable_pr_workspace_error(_row("wt", event_type="pull_request", attempts=1), err) is True
+    # attempts exhausted -> stop retrying
+    assert _is_retryable_pr_workspace_error(_row("wt2", event_type="pull_request", attempts=2), err) is False
+    # non-PR event -> not a workspace-prep retry
+    assert _is_retryable_pr_workspace_error(_row("wt3", event_type="issues", attempts=1), err) is False
+
+
+@pytest.mark.asyncio
+async def test_run_event_skips_superseded_pr_head(
+    settings: Settings, db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A 'PR head mismatch' during workspace prep marks the event skipped (the
+    newer head reviews itself) and never posts a failure comment."""
+    db.record_event(
+        delivery_id="d-superseded",
+        event_type="pull_request",
+        repo="octo/widget",
+        issue_key="octo/widget#1",
+        payload={"action": "synchronize", "pull_request": {"number": 1}},
+        state="running",
+    )
+    row = _row("d-superseded", event_type="pull_request")
+    pool = _make_pool(settings, db)
+
+    async def fake_dispatch(self: WorkerPool, r: EventRow, *, slot_uid: int | None = None) -> None:
+        raise GitCommandError(["git", "rev-parse", "FETCH_HEAD"], 128, "", "PR head mismatch: expected aaa, got bbb")
+
+    posted: list[tuple[str, str]] = []
+
+    async def spy_comment(r: EventRow, error: str) -> None:
+        posted.append((r.delivery_id, error))
+
+    monkeypatch.setattr(WorkerPool, "_dispatch", fake_dispatch)
+    monkeypatch.setattr(pool, "_post_failure_comment", spy_comment)
+    await pool._run_event(row)  # noqa: SLF001
+
+    stored = db.get_event("d-superseded")
+    assert stored is not None
+    assert stored.state == "skipped"
+    assert "superseded" in (stored.last_error or "")
+    assert posted == []
+
+
 @pytest.mark.asyncio
 async def test_cancel_unknown_delivery_returns_false(settings: Settings, db: Database) -> None:
     """Cancelling an unknown delivery is a no-op that returns False."""
@@ -561,6 +617,9 @@ async def test_failure_comment_post_github_error_still_marks_failed_and_records_
 
     class FailingGitHub:
         async def post_comment(self, repo: str, number: int, body: str) -> object:
+            raise GitHubError(500, "GitHub API error")
+
+        async def update_comment(self, repo: str, comment_id: int, body: str) -> object:
             raise GitHubError(500, "GitHub API error")
 
     pool = _make_pool_with_github(settings, db, FailingGitHub())

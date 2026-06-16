@@ -174,6 +174,9 @@ def test_kickoff_pr_review_formats_head_repo_and_origin_base() -> None:
     assert "automatically appended Review process details" in out
     assert "Orchestrator focus: `fresh`" in out
     assert "{{" not in out
+    assert "uv --directory apps/hoa run --frozen python manage.py test" in out
+    assert "DB_HOST=db" in out
+    assert "uv --directory apps/hoa run --locked python manage.py test" not in out
 
 
 def test_kickoff_pr_review_verify_fixes_focus_renders_prior_review() -> None:
@@ -183,7 +186,8 @@ def test_kickoff_pr_review_verify_fixes_focus_renders_prior_review() -> None:
         workspace=_Workspace(),
         review_focus=PrReviewFocus(
             mode="verify-fixes",
-            reason="verify fixes",
+            reason="incremental re-review of delta since prior bot COMMENTED review",
+            prior_review_state="COMMENTED",
             prior_review_commit_id="1" * 40,
             prior_review_id=100,
             prior_review_submitted_at="t",
@@ -191,6 +195,11 @@ def test_kickoff_pr_review_verify_fixes_focus_renders_prior_review() -> None:
     )
     assert "Orchestrator focus: `verify-fixes`" in out
     assert "1" * 40 in out
+    assert "state `COMMENTED`" in out
+    # Incremental re-reviews review the delta and never re-delegate.
+    assert "Do NOT call `delegate_pr_review`" in out
+    assert "incremental re-review" in out
+    assert "{{" not in out
 
 
 def test_review_completion_reminder_mentions_submit_only() -> None:

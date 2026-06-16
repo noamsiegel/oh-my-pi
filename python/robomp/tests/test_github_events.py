@@ -642,26 +642,28 @@ def test_route_pr_merged_carries_no_submitter() -> None:
     assert decision.submitter is None
 
 
-def test_route_check_run_completed_queues_review_pr_from_pull_requests() -> None:
+def test_route_check_run_completed_probes_ci_from_pull_requests() -> None:
     decision = route(
         "check_run",
         {"action": "completed", "check_run": {"pull_requests": [{"number": 9}]}, "repository": {"full_name": "octo/widget"}},
         allowlist=ALLOWLIST,
         bot_login=BOT,
     )
-    assert decision.task == "review_pr"
+    # CI-completion webhooks route to the cheap CI probe, which enqueues a full
+    # review_pr only once CI is green.
+    assert decision.task == "probe_pr_review_ci"
     assert decision.issue_key == "octo/widget#9"
     assert decision.reason == "check_run.completed"
 
 
-def test_route_check_suite_completed_queues_review_pr_from_pull_requests() -> None:
+def test_route_check_suite_completed_probes_ci_from_pull_requests() -> None:
     decision = route(
         "check_suite",
         {"action": "completed", "check_suite": {"pull_requests": [{"number": 9}]}, "repository": {"full_name": "octo/widget"}},
         allowlist=ALLOWLIST,
         bot_login=BOT,
     )
-    assert decision.task == "review_pr"
+    assert decision.task == "probe_pr_review_ci"
     assert decision.issue_key == "octo/widget#9"
     assert decision.reason == "check_suite.completed"
 

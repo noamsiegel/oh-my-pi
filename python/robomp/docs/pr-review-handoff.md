@@ -16,13 +16,33 @@ Confirmed decisions:
   review, so it falls back to `COMMENT`. (Originally COMMENT-only; terminal `APPROVE`
   re-enabled 2026-06 — see the §"runnable verification" note.)
 - **Runnable verification (2026-06).** The review sandbox ships a real toolchain
-  (`python`+`uv`, `node`+`corepack yarn@1.22.22`, `actionlint`; see `Dockerfile.robomp`) and
-  the PR worktree hydrates the **whole touched project** — the `apps/hoa` Django project
-  (excluding the heavy `hoa-web` workspace) for backend changes, or the `apps/hoa/hoa-web`
-  yarn workspace for frontend changes (`git_ops.pr_sparse_checkout_patterns`). This lets the
-  agent install deps and actually run targeted tests/lint/typecheck/actionlint instead of
-  reporting `ModuleNotFoundError: No module named 'hoa'` or `vitest: command not found`.
-  Tests that genuinely need infra (database, external services) defer to the PR's CI status.
+  (`python`+`uv`, `node`+`corepack yarn@1.22.22`, `actionlint`; see `Dockerfile.robomp`) plus
+  PostgreSQL + Redis sidecars (`pr-review-db`/`pr-review-cache`, reachable as `db`/`cache`;
+  `pr_review_runtime_env` exports `DB_HOST=db`, `REDIS_HOST=cache`, and the matching
+  `DB_NAME`/`DB_USER`/`DB_PASS`/`DB_PORT` into incoming-PR review sandboxes only). The PR
+  worktree hydrates the **whole touched project** — the `apps/hoa` Django project (excluding
+  the heavy `hoa-web` workspace) for backend changes, or the `apps/hoa/hoa-web` yarn workspace
+  for frontend changes (`git_ops.pr_sparse_checkout_patterns`). This lets the agent install
+  deps and actually run targeted DB-backed Django tests via `uv --directory apps/hoa run
+  --frozen python manage.py test <dotted paths> --noinput`, plus lint/typecheck/actionlint,
+  instead of reporting `ModuleNotFoundError: No module named 'hoa'`, `vitest: command not
+  found`, or a spurious "database unavailable". A targeted command that runs non-zero is a
+  real failure that blocks a clean verdict; only surfaces needing infra outside the sandbox
+  (an external service or a secret the reviewer doesn't hold) stay `unavailable`.
+- **One full review, then incremental re-reviews (2026-06).** The first labeled review of a
+  PR is the full, delegated pass. Every later head (new commits → `synchronize`/reconciler)
+  re-reviews only the delta against the bot's last reviewed head: `_pr_review_focus` sets
+  `mode=verify-fixes` for any prior bot review (APPROVE/COMMENT/CHANGES_REQUESTED) on an older
+  reachable head, the agent reviews only `prepare_pr_review`'s `delta_diff`, and delegation is skipped: for any
+  incremental re-review `prepare_pr_review` drops the non-correctness `domains_required` from the
+  classification, so neither the `validate_pr_review` delegation gate nor the `submit_pr_review`
+  payload coverage check (both read `classification.domains_required`) forces delegation. A prior
+  `CHANGES_REQUESTED` additionally verifies its blocking findings (evidence
+  `mode=verify-fixes`, carrying `reviewer_prior_*`); a prior `APPROVE`/`COMMENT` keeps evidence
+  `mode=fresh` so the helper's verdict can still reach `APPROVE` (prior non-blocking notes are
+  advisory, never approval-blockers). A transient-failure COMMENT does not anchor; if the prior
+  head is unreachable (force-push/rebase) or the delta cannot be computed, it falls back to a
+  fresh full review.
 - **SQLite staging.** Inline comments are staged in a sqlite table, flushed in one review.
   Survives `--continue` resume; honours "DB is the only source of truth, in-memory state is
   just `_inflight`."
