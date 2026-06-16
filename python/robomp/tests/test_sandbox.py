@@ -25,6 +25,7 @@ from robomp.git_ops import (
 )
 from robomp.git_ops import (
     normalize_pr_sparse_paths,
+    pr_sparse_checkout_patterns,
 )
 from robomp.sandbox import (
     SandboxManager,
@@ -1767,6 +1768,117 @@ def test_prepare_pr_worktree_sparse_hydrates_changed_paths_only(tmp_path: Path) 
     )
     assert "-base payload" in diff_proc.stdout
     assert "+changed payload" in diff_proc.stdout
+
+
+def test_pr_sparse_checkout_patterns_backend_only_excludes_frontend() -> None:
+    patterns = pr_sparse_checkout_patterns(("apps/hoa/api/tests/actions/test_x.py",))
+    assert patterns == ("/apps/hoa/", "!/apps/hoa/hoa-web/")
+
+
+def test_pr_sparse_checkout_patterns_frontend_only() -> None:
+    patterns = pr_sparse_checkout_patterns(
+        ("apps/hoa/hoa-web/apps/admin/src/routes/specific/charge/list.tsx",)
+    )
+    assert patterns == ("/apps/hoa/hoa-web/",)
+
+
+def test_pr_sparse_checkout_patterns_backend_and_frontend_hydrate_whole_root() -> None:
+    patterns = pr_sparse_checkout_patterns(
+        (
+            "apps/hoa/api/models.py",
+            "apps/hoa/hoa-web/apps/admin/src/list.tsx",
+        )
+    )
+    # A change spanning both projects hydrates all of apps/hoa with no exclusion.
+    assert patterns == ("/apps/hoa/",)
+
+
+def test_pr_sparse_checkout_patterns_non_hoa_stays_file_scoped() -> None:
+    assert pr_sparse_checkout_patterns((".github/workflows/ci.yml",)) == (
+        ".github/workflows/ci.yml",
+    )
+
+
+def test_pr_sparse_checkout_patterns_mixes_hoa_root_and_other_files() -> None:
+    patterns = pr_sparse_checkout_patterns(
+        ("apps/hoa/api/x.py", ".github/workflows/ci.yml")
+    )
+    assert patterns[0] == "/apps/hoa/"
+    assert "!/apps/hoa/hoa-web/" in patterns
+    assert ".github/workflows/ci.yml" in patterns
+    # HOA backend support files (manage.py/pyproject/uv.lock) added by
+    # normalize_pr_sparse_paths must not leak out as standalone file patterns —
+    # they are already covered by the hydrated `/apps/hoa/` root.
+    assert "apps/hoa/manage.py" not in patterns
+
+
+def test_prepare_pr_worktree_hydrates_django_project_excluding_frontend(tmp_path: Path) -> None:
+    """A backend change hydrates the whole Django project (so `hoa.settings`
+    imports resolve for `manage.py test`) but leaves the heavy `hoa-web`
+    frontend workspace out of the checkout."""
+    upstream = _partial_clone_upstream(tmp_path)
+    pool = tmp_path / "pool"
+    _git(
+        [
+            "clone",
+            "--filter=blob:none",
+            "--no-tags",
+            "--branch",
+            "main",
+            f"file://{upstream}",
+            str(pool),
+        ],
+        cwd=tmp_path,
+    )
+    # Base contains a full apps/hoa project plus a hoa-web frontend file.
+    _commit_new_blob_upstream(upstream, tmp_path, path="apps/hoa/hoa/settings.py", content="SETTINGS = 1\n")
+    _commit_new_blob_upstream(upstream, tmp_path, path="apps/hoa/manage.py", content="# manage\n")
+    _commit_new_blob_upstream(upstream, tmp_path, path="apps/hoa/api/models.py", content="MODELS = 0\n")
+    _commit_new_blob_upstream(upstream, tmp_path, path="apps/hoa/hoa-web/package.json", content="{}\n")
+
+    pr_seed = tmp_path / "pr-seed"
+    _git(["clone", f"file://{upstream}", str(pr_seed)], cwd=tmp_path)
+    (pr_seed / "apps/hoa/api/models.py").write_text("MODELS = 1\n", encoding="utf-8")
+    _git(["-C", str(pr_seed), "add", "apps/hoa/api/models.py"], cwd=tmp_path)
+    subprocess.run(
+        ["git", "-C", str(pr_seed), "commit", "-m", "modify api"],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=os.environ
+        | {
+            "GIT_AUTHOR_NAME": "t",
+            "GIT_AUTHOR_EMAIL": "t@t",
+            "GIT_COMMITTER_NAME": "t",
+            "GIT_COMMITTER_EMAIL": "t@t",
+        },
+    )
+    pr_sha = subprocess.run(
+        ["git", "-C", str(pr_seed), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    _git(["-C", str(pr_seed), "push", "origin", "HEAD:refs/pull/9/head"], cwd=tmp_path)
+
+    ws_dir = tmp_path / "pr-hoa-ws"
+    result = git_prepare_pr_worktree(
+        pool,
+        ws_dir,
+        pr_number=9,
+        expected_head_sha=pr_sha,
+        base_ref="main",
+        changed_paths=("apps/hoa/api/models.py",),
+        token=None,
+    )
+
+    assert result.hydrated_paths == ("/apps/hoa/", "!/apps/hoa/hoa-web/")
+    assert (ws_dir / "apps/hoa/api/models.py").read_text(encoding="utf-8") == "MODELS = 1\n"
+    # Django settings package present → `manage.py test` can import `hoa.settings`.
+    assert (ws_dir / "apps/hoa/hoa/settings.py").exists()
+    assert (ws_dir / "apps/hoa/manage.py").exists()
+    # Heavy frontend workspace stays out of the checkout.
+    assert not (ws_dir / "apps/hoa/hoa-web/package.json").exists()
 
 
 @pytest.mark.parametrize("bad_path", ["../x", "/x", ".git/config", "dir/.git/config", "", "a\0b"])

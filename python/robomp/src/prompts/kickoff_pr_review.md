@@ -44,10 +44,14 @@ If focus is `verify-fixes`, this is not a fresh full review. Your job is:
   Submit `APPROVE` when clean. On self-authored PRs, GitHub cannot accept author terminal
   reviews, so submit `COMMENT` with the would-approve/would-request-changes result.
   Use `submit_pr_review(event="COMMENT")` otherwise only when an explicit environment limitation prevents judging the PR.
-- **No false clean.** Never use `review:clean`, `APPROVE`, or “clean review” if any required
-  local verification could not run, failed, or has unclear status; if prior external inline
-  review comments exist on the current head, either independently find/carry the issue or
-  explicitly explain why each is obsolete/non-blocking before any clean verdict.
+- **No false clean.** Never use `review:clean`, `APPROVE`, or “clean review” if a local
+  check you were able to run failed/errored or has unclear status. The review workspace
+  ships a real toolchain (`python`+`uv`, `node`+`corepack yarn`, `actionlint`) and the whole
+  touched project is hydrated, so “couldn’t run” is valid ONLY for checks that genuinely need
+  infra you lack (database, external API, secrets) — defer those to the PR’s CI status and
+  mark them `unavailable` with the reason. If prior external inline review comments exist on
+  the current head, either independently find/carry the issue or explicitly explain why each
+  is obsolete/non-blocking before any clean verdict.
 </critical>
 
 # Phase 0 — orient
@@ -118,8 +122,22 @@ touch. Review with the lens of someone who will own this code:
   isolation) it doesn't actually implement?
 
 For each concrete finding, add it to a candidate findings array. Include a structured
-`verification` ledger when calling `validate_pr_review`; failed/error/unavailable checks
-block clean verdicts.
+`verification` ledger when calling `validate_pr_review`.
+
+**Run local verification — the tools are installed and the project is hydrated.** The
+worktree is a read-only checkout of the whole touched project (the backend Django project,
+or the `hoa-web` yarn workspace), with `python`/`uv`, `node`/`corepack yarn`, and
+`actionlint` on PATH. Install deps, then run the targeted checks for the changed surface:
+- Backend (`apps/hoa`): `uv run python manage.py test <targeted dotted paths>` for tests
+  that don’t need a live database; `uv run python -m py_compile` / targeted imports for
+  quick sanity.
+- Frontend (`apps/hoa/hoa-web`): `corepack yarn install` once, then
+  `yarn --cwd apps/<member> test:run <files>`, plus `eslint`/`tsc` on the changed files.
+- Workflows (`.github/workflows`): `actionlint <files>`.
+Record each as a `verification` check. A check that RUNS and fails/errors blocks a clean
+verdict. A check that genuinely needs infra you don’t have (database, external service,
+secrets) → set `status:"unavailable"` with the reason and lean on the PR’s CI result for
+that surface; never mark a check you could have run as `unavailable`.
 
 ```
 validate_pr_review(findings=[{"path":"src/foo.ts","line":42,"body":"...","severity":"required","intent":"required_change","suggestion":{"kind":"github_suggestion","replacement":"exact replacement lines"}},{"path":"src/bar.ts","line":9,"body":"Decision needed before changing this contract.","severity":"required","intent":"required_change","no_suggestion_reason":"design_decision"}], verification={"checks":[{"name":"targeted tests","status":"passed","command":"..."}]}, prior_external_dispositions=[{"comment_id":123,"disposition":"resolved","rationale":"current diff removed the bad path"}])
@@ -164,12 +182,15 @@ When done, flush everything in one review:
 submit_pr_review(body="<summary>", event="APPROVE|REQUEST_CHANGES|COMMENT")
 ```
 
-- Use the event recommended by `validate_pr_review`: `REQUEST_CHANGES` for any critical/required finding,
-  `APPROVE` when clean, `COMMENT` only for advisory/no-review-request or explicit environment/
-  self-authored limitations.
+- Use the event recommended by `validate_pr_review`: `APPROVE` when no critical/required
+  finding remains, `REQUEST_CHANGES` (the helper may downgrade this to `COMMENT`) for a
+  blocking finding, `COMMENT` for self-authored PRs or an explicit environment limitation.
 - Do not submit REQUEST_CHANGES unless at least one validated inline finding will be posted; resolve stale verify-status body concerns or add a concrete anchored finding first.
-- Failed, unavailable, or unrun local verification means **not clean**. Use
-  `submit_pr_review(event="COMMENT")` with the limitation, or carry a finding, but do not summarize as clean.
+- A runnable local check that failed/errored — or a check you skipped but could have run —
+  means **not clean**: `submit_pr_review(event="COMMENT")` with the limitation, or carry a
+  finding; never summarize as clean. Checks that genuinely need unavailable infra are exempt
+  when the PR’s CI for that surface is green (or only unrelated-failing): mark them
+  `unavailable` and a clean PR may still `APPROVE`.
 - Self-authored PRs cannot accept terminal reviews from the author; use `COMMENT` and say it
   would otherwise approve/request changes.
 - The body summary must be 2–5 terse lines above the automatically appended Review process details.

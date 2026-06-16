@@ -2,12 +2,26 @@
 
 Wire robomp to **review pull requests opened by contributors** (and other bots), in two
 phases: (1) classify + rank, (2) a real line-by-line review posted as one GitHub review.
-robomp **never merges, closes, approves, or pushes** — the rank label is the verdict; the
-maintainer acts on it.
+robomp **never merges, closes, or pushes**. It posts a ranked GitHub review; with terminal
+events enabled it also issues the merge-gating `APPROVE`/`REQUEST_CHANGES` verdict.
 
 Confirmed decisions:
-- **COMMENT-only.** `submit_pr_review` always uses `event="COMMENT"`. Never `APPROVE` /
-  `REQUEST_CHANGES` (those gate merge — the maintainer's call).
+- **Terminal review events (current).** With `ROBOMP_PR_REVIEW_TERMINAL_EVENTS=true` (the
+  deployed default), `validate_pr_review` recommends `APPROVE` for a clean review (no
+  blocking findings, no unresolved prior verify-fixes items) regardless of whether a review
+  was explicitly requested, and `submit_pr_review` posts it. `REQUEST_CHANGES` is currently
+  downgraded to `COMMENT` by the helper (`recommendReviewEvent`); blocking findings still
+  post inline as a `COMMENT` review. A self-authored PR cannot accept an author terminal
+  review, so it falls back to `COMMENT`. (Originally COMMENT-only; terminal `APPROVE`
+  re-enabled 2026-06 — see the §"runnable verification" note.)
+- **Runnable verification (2026-06).** The review sandbox ships a real toolchain
+  (`python`+`uv`, `node`+`corepack yarn@1.22.22`, `actionlint`; see `Dockerfile.robomp`) and
+  the PR worktree hydrates the **whole touched project** — the `apps/hoa` Django project
+  (excluding the heavy `hoa-web` workspace) for backend changes, or the `apps/hoa/hoa-web`
+  yarn workspace for frontend changes (`git_ops.pr_sparse_checkout_patterns`). This lets the
+  agent install deps and actually run targeted tests/lint/typecheck/actionlint instead of
+  reporting `ModuleNotFoundError: No module named 'hoa'` or `vitest: command not found`.
+  Tests that genuinely need infra (database, external services) defer to the PR's CI status.
 - **SQLite staging.** Inline comments are staged in a sqlite table, flushed in one review.
   Survives `--continue` resume; honours "DB is the only source of truth, in-memory state is
   just `_inflight`."

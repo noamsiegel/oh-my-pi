@@ -610,6 +610,72 @@ def normalize_pr_sparse_paths(paths: Iterable[str]) -> tuple[str, ...]:
     return tuple(normalized)
 
 
+# Project roots in the reviewed monorepo (mainstay-io/monorepo). A PR-review
+# workspace is a ``--no-cone`` sparse checkout: hydrating only the changed files
+# is enough to *read* a diff but not to *run* the project's targeted tests. A
+# Django ``manage.py test`` import-chains through ``hoa.settings`` + INSTALLED_APPS
+# (a changed-files-only checkout fails with ``ModuleNotFoundError: No module
+# named 'hoa'``), and a ``hoa-web`` vitest run needs the whole yarn workspace.
+# So a change inside a recognized project hydrates that whole project root,
+# excluding the nested (heavy) frontend workspace when only the backend changed.
+_HOA_BACKEND_ROOT = "apps/hoa/"
+_HOA_FRONTEND_ROOT = "apps/hoa/hoa-web/"
+
+
+def pr_sparse_checkout_patterns(paths: Iterable[str]) -> tuple[str, ...]:
+    """``git sparse-checkout set --no-cone`` patterns for a PR-review worktree.
+
+    Changed files inside a recognized project root hydrate the whole root so the
+    agent can run that project's targeted tests; everything else stays
+    file-scoped (workflows, infra, unrelated apps) to keep the checkout small.
+    Patterns use gitignore semantics: a leading-slash directory pattern includes
+    the subtree, a leading ``!`` excludes a nested subtree, and the last matching
+    pattern wins.
+    """
+    # Classify from the *raw* changed paths only. `normalize_pr_sparse_paths`
+    # injects HOA backend tooling (manage.py/pyproject/uv.lock) for any apps/hoa
+    # path, which would make a frontend-only change look like it also touched the
+    # backend; those support files are superseded by whole-root hydration here.
+    changed: list[str] = []
+    seen_changed: set[str] = set()
+    for raw in paths:
+        _append_safe_sparse_path(changed, seen_changed, raw)
+    if not changed:
+        raise ValueError("PR sparse checkout requires at least one changed path")
+
+    touched_frontend = any(p.startswith(_HOA_FRONTEND_ROOT) for p in changed)
+    touched_backend = any(
+        p.startswith(_HOA_BACKEND_ROOT) and not p.startswith(_HOA_FRONTEND_ROOT)
+        for p in changed
+    )
+
+    patterns: list[str] = []
+    seen: set[str] = set()
+
+    def add(pattern: str) -> None:
+        if pattern not in seen:
+            seen.add(pattern)
+            patterns.append(pattern)
+
+    if touched_backend:
+        add(f"/{_HOA_BACKEND_ROOT}")
+        if not touched_frontend:
+            # Backend-only change: keep the heavy frontend workspace out.
+            add(f"!/{_HOA_FRONTEND_ROOT}")
+    elif touched_frontend:
+        add(f"/{_HOA_FRONTEND_ROOT}")
+
+    # Files outside the hydrated HOA roots keep file-scoped hydration.
+    for path in changed:
+        if path.startswith(_HOA_BACKEND_ROOT):
+            continue
+        add(path)
+
+    if not patterns:
+        raise ValueError("PR sparse checkout requires at least one changed path")
+    return tuple(patterns)
+
+
 def _is_safe_pr_base_ref(base_ref: str) -> bool:
     if not base_ref or base_ref.startswith("-") or base_ref.startswith("/") or ".." in base_ref:
         return False
@@ -707,7 +773,8 @@ def prepare_pr_worktree(
     if pr_number <= 0:
         raise ValueError(f"invalid PR number: {pr_number!r}")
     expected_head_sha = _validate_commit_sha(expected_head_sha)
-    paths = normalize_pr_sparse_paths(changed_paths)
+    validation_paths = normalize_pr_sparse_paths(changed_paths)
+    sparse_patterns = pr_sparse_checkout_patterns(changed_paths)
     if not _is_safe_pr_base_ref(base_ref):
         raise ValueError(f"invalid PR base ref: {base_ref!r}")
     if repo_dir.exists():
@@ -749,13 +816,13 @@ def prepare_pr_worktree(
         _run_git(sparse_init, cwd=repo_dir, token=token, safe_directory=safe_directory, timeout=timeout),
         ["git", *sparse_init],
     )
-    _sparse_checkout_set(repo_dir, paths, token=token, safe_directory=safe_directory, timeout=timeout)
+    _sparse_checkout_set(repo_dir, sparse_patterns, token=token, safe_directory=safe_directory, timeout=timeout)
     checkout_args = ["checkout", "--force"]
     _check(
         _run_git(checkout_args, cwd=repo_dir, token=token, safe_directory=safe_directory, timeout=timeout),
         ["git", *checkout_args],
     )
-    for path in paths:
+    for path in validation_paths:
         _git_ref_exists(repo_dir, "HEAD", path, token=token, timeout=timeout)
         _git_ref_exists(repo_dir, f"origin/{base_ref}", path, token=token, timeout=timeout)
     diff_args = ["diff", "--name-only", f"origin/{base_ref}...HEAD", "--"]
@@ -763,7 +830,7 @@ def prepare_pr_worktree(
         _run_git(diff_args, cwd=repo_dir, token=token, safe_directory=safe_directory, timeout=timeout),
         ["git", *diff_args],
     )
-    return PrWorktreeResult(head=rev_parse_head(repo_dir, safe_directory=safe_directory), hydrated_paths=paths)
+    return PrWorktreeResult(head=rev_parse_head(repo_dir, safe_directory=safe_directory), hydrated_paths=sparse_patterns)
 
 
 @dataclass(slots=True, frozen=True)
@@ -980,6 +1047,7 @@ __all__ = [
     "fetch_ref",
     "normalize_pr_sparse_paths",
     "prepare_pr_worktree",
+    "pr_sparse_checkout_patterns",
     "push",
     "redact_credentials",
     "redact_secrets",

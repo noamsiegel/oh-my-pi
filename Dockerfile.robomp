@@ -54,14 +54,25 @@ RUN pip install --no-cache-dir \
         "pydantic>=2.6" "pydantic-settings>=2.2" "python-dotenv>=1.0" \
         "click>=8.1" "uv>=0.9" \
     && pip install --no-cache-dir --no-deps .
-RUN printf '%s\n' \
-        '#!/bin/sh' \
-        'cwd="${PWD}"' \
-        'if [ "${1:-}" = "--cwd" ]; then cwd="$2"; shift 2; fi' \
-        'if [ "${1:-}" = "install" ]; then exec /opt/bun/bin/bun --cwd "$cwd" install "$@"; fi' \
-        'exec /opt/bun/bin/bun --cwd "$cwd" run "$@"' \
-        > /usr/local/bin/yarn \
-    && chmod +x /usr/local/bin/yarn
+# Real Node.js + Yarn Classic (via Corepack) + actionlint for the PR-review
+# sandbox. The reviewed monorepo (apps/hoa) pins `nodejs 20.x` in
+# `.tool-versions` and `yarn@1.22.22` in `package.json#packageManager`. The
+# agent needs a genuine Node toolchain to `yarn install` and run vitest / eslint
+# / tsc / vite and lint workflows locally — the previous bun→yarn shim could not
+# execute node-shebang test binaries (`vitest: command not found`) and silently
+# diverged from `yarn.lock`. Bun stays (the PR-review helper is a `.ts` run by
+# bun); only the fake `yarn` shim is replaced.
+ARG NODE_MAJOR=20
+ARG ACTIONLINT_VERSION=1.7.7
+RUN curl -fsSL "https://deb.nodesource.com/setup_${NODE_MAJOR}.x" | bash - \
+    && apt-get install -y --no-install-recommends nodejs ca-certificates tar \
+    && rm -rf /var/lib/apt/lists/* \
+    && corepack enable \
+    && corepack prepare yarn@1.22.22 --activate \
+    && ARCH="$(dpkg --print-architecture)" \
+    && curl -fsSL "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_${ARCH}.tar.gz" \
+       | tar -xz -C /usr/local/bin actionlint \
+    && node --version && corepack --version && yarn --version && actionlint --version
 
 # Host agent config is mounted read-only under /srv/agent-home-stage with
 # host-controlled permissions. The entrypoint copies it into root-owned
