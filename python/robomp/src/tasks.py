@@ -198,6 +198,51 @@ async def _post_pr_review_started_comment(
     )
 
 
+async def _post_pr_review_ci_gate_comment(
+    *,
+    db: Database,
+    github: GitHubBackend,
+    key: str,
+    repo_full: str,
+    pr_number: int,
+    head_sha: str,
+    ci: PullRequestCiStatusInfo,
+) -> None:
+    """Post a one-time notice that review is gated on CI, keyed per head SHA so
+    retries and reconciler cycles never repost. Only called for terminal skips
+    (failed / timed-out CI), never for transient pending deferrals."""
+    operation_key = f"post_pr_review_ci_gate_notice:{key}:{head_sha}"
+    if not db.reserve_side_effect(operation_key):
+        succeeded = db.side_effect_succeeded(operation_key)
+        message = "side effect already succeeded: %s" if succeeded else "side effect already pending: %s"
+        log.info(message, operation_key, extra={"key": key, "operation_key": operation_key, "succeeded": succeeded})
+        return
+    body = (
+        "Robo-MS won’t review this PR until all CI checks pass "
+        f"({ci.failed_count} failing, {ci.pending_count} pending of {ci.total_count} checks). "
+        "I’ll review automatically once the checks are green — push fixes or re-run CI and I’ll pick it up."
+    )
+    try:
+        comment = await github.post_comment(repo_full, pr_number, body)
+    except GitHubError as exc:
+        db.mark_side_effect_failed(operation_key, str(exc))
+        db.log_tool_call(
+            issue_key=key,
+            tool=operation_key,
+            args={"repo": repo_full, "pr": pr_number, "head_sha": head_sha, "ci_state": ci.state},
+            error=str(exc),
+        )
+        log.warning("CI gate comment failed", extra={"repo": repo_full, "pr": pr_number, "err": str(exc)})
+        return
+    db.mark_side_effect_succeeded(operation_key)
+    db.log_tool_call(
+        issue_key=key,
+        tool=operation_key,
+        args={"repo": repo_full, "pr": pr_number, "head_sha": head_sha, "ci_state": ci.state},
+        result={"comment_id": comment.id},
+    )
+
+
 async def _fetch_thread(
     github: GitHubBackend,
     repo: str,
@@ -542,6 +587,16 @@ async def review_pr(
                     "failed": ci_status.failed_count,
                 },
             )
+            if ci_outcome.state == "skipped":
+                await _post_pr_review_ci_gate_comment(
+                    db=db,
+                    github=github,
+                    key=key,
+                    repo_full=repo_full,
+                    pr_number=pr_number,
+                    head_sha=pr.head_sha,
+                    ci=ci_status,
+                )
             return ci_outcome
     review_labeled = "triaged" in labels or any(label.startswith("review:") for label in labels)
     try:

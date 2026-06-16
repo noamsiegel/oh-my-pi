@@ -226,6 +226,8 @@ async def test_review_pr_defers_when_ci_pending_before_fetching_reviews_or_works
     assert "waiting for PR CI checks" in (outcome.reason or "")
     assert github.list_pr_reviews_called is False
     assert github.list_pr_files_called is False
+    # Transient pending deferral must not post a notice (would spam every PR).
+    assert github.posted_comments == []
 
 
 @pytest.mark.asyncio
@@ -239,6 +241,8 @@ async def test_review_pr_skips_when_ci_failed(settings) -> None:
     assert outcome.state == "skipped"
     assert (outcome.reason or "").startswith("skip: PR CI checks failed")
     assert github.list_pr_reviews_called is False
+    assert len(github.posted_comments) == 1
+    assert "until all CI checks pass" in github.posted_comments[0]
 
 
 @pytest.mark.asyncio
@@ -608,3 +612,5 @@ async def test_review_pr_skips_when_ci_pending_timeout_elapsed(settings) -> None
     assert outcome.state == "skipped"
     assert (outcome.reason or "").startswith("skip: PR CI checks did not complete before timeout")
     assert github.list_pr_reviews_called is False
+    assert len(github.posted_comments) == 1
+    assert "until all CI checks pass" in github.posted_comments[0]
