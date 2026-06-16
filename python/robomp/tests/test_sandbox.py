@@ -1799,6 +1799,19 @@ def test_pr_sparse_checkout_patterns_non_hoa_stays_file_scoped() -> None:
     )
 
 
+def test_pr_sparse_checkout_patterns_accepts_single_use_iterator() -> None:
+    # `prepare_pr_worktree` materializes the iterable, but the function itself
+    # must also tolerate a one-shot iterator without silently dropping paths.
+    patterns = pr_sparse_checkout_patterns(iter(("apps/hoa/api/x.py",)))
+    assert patterns == ("/apps/hoa/", "!/apps/hoa/hoa-web/")
+
+
+def test_pr_sparse_checkout_patterns_bare_frontend_root_hydrates_frontend() -> None:
+    # A path equal to the bare root (no trailing slash) must not be misread as a
+    # backend-only change that excludes the frontend workspace.
+    assert pr_sparse_checkout_patterns(("apps/hoa/hoa-web",)) == ("/apps/hoa/hoa-web/",)
+
+
 def test_pr_sparse_checkout_patterns_mixes_hoa_root_and_other_files() -> None:
     patterns = pr_sparse_checkout_patterns(
         ("apps/hoa/api/x.py", ".github/workflows/ci.yml")
@@ -1868,7 +1881,8 @@ def test_prepare_pr_worktree_hydrates_django_project_excluding_frontend(tmp_path
         pr_number=9,
         expected_head_sha=pr_sha,
         base_ref="main",
-        changed_paths=("apps/hoa/api/models.py",),
+        # A single-use iterator must survive both internal normalizers.
+        changed_paths=iter(("apps/hoa/api/models.py",)),
         token=None,
     )
 

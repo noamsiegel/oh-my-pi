@@ -3,7 +3,8 @@
 Wire robomp to **review pull requests opened by contributors** (and other bots), in two
 phases: (1) classify + rank, (2) a real line-by-line review posted as one GitHub review.
 robomp **never merges, closes, or pushes**. It posts a ranked GitHub review; with terminal
-events enabled it also issues the merge-gating `APPROVE`/`REQUEST_CHANGES` verdict.
+events enabled it also issues a merge-gating `APPROVE` on a clean review (blocking reviews
+currently post as `COMMENT` until `REQUEST_CHANGES` is re-enabled — see the decision below).
 
 Confirmed decisions:
 - **Terminal review events (current).** With `ROBOMP_PR_REVIEW_TERMINAL_EVENTS=true` (the

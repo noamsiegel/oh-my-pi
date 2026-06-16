@@ -54,25 +54,47 @@ RUN pip install --no-cache-dir \
         "pydantic>=2.6" "pydantic-settings>=2.2" "python-dotenv>=1.0" \
         "click>=8.1" "uv>=0.9" \
     && pip install --no-cache-dir --no-deps .
-# Real Node.js + Yarn Classic (via Corepack) + actionlint for the PR-review
-# sandbox. The reviewed monorepo (apps/hoa) pins `nodejs 20.x` in
-# `.tool-versions` and `yarn@1.22.22` in `package.json#packageManager`. The
-# agent needs a genuine Node toolchain to `yarn install` and run vitest / eslint
-# / tsc / vite and lint workflows locally — the previous bun→yarn shim could not
-# execute node-shebang test binaries (`vitest: command not found`) and silently
-# diverged from `yarn.lock`. Bun stays (the PR-review helper is a `.ts` run by
-# bun); only the fake `yarn` shim is replaced.
-ARG NODE_MAJOR=20
+# Real Node.js + Yarn Classic + actionlint for the PR-review sandbox. The
+# reviewed monorepo (apps/hoa) pins `nodejs 20.x` in `.tool-versions` and
+# `yarn@1.22.22` in `package.json#packageManager`. The agent needs a genuine
+# Node toolchain to `yarn install` and run vitest / eslint / tsc / vite and lint
+# workflows locally — the previous bun→yarn shim could not execute node-shebang
+# test binaries (`vitest: command not found`) and silently diverged from
+# `yarn.lock`. Bun stays (the PR-review helper is a `.ts` run by bun); only the
+# fake `yarn` shim is replaced.
+#
+# Every artifact is version-pinned AND sha256-verified before it runs as root:
+# the official Node tarball (no `curl|bash` of a NodeSource installer), a
+# registry-pinned global Yarn, and the actionlint release archive. Bump the
+# version + the matching per-arch sha256 deliberately when the monorepo pin moves.
+ARG NODE_VERSION=20.11.0
+ARG NODE_SHA256_arm64=402178cd5438b9ed89bffafc119e2bd4148616390bcdfd7089090ffc4615c981
+ARG NODE_SHA256_amd64=9556262f6cd4c020af027782afba31ca6d1a37e45ac0b56cecd2d5a4daf720e0
+ARG YARN_VERSION=1.22.22
 ARG ACTIONLINT_VERSION=1.7.7
-RUN curl -fsSL "https://deb.nodesource.com/setup_${NODE_MAJOR}.x" | bash - \
-    && apt-get install -y --no-install-recommends nodejs ca-certificates tar \
-    && rm -rf /var/lib/apt/lists/* \
-    && corepack enable \
-    && corepack prepare yarn@1.22.22 --activate \
-    && ARCH="$(dpkg --print-architecture)" \
-    && curl -fsSL "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_${ARCH}.tar.gz" \
-       | tar -xz -C /usr/local/bin actionlint \
-    && node --version && corepack --version && yarn --version && actionlint --version
+ARG ACTIONLINT_SHA256_arm64=401942f9c24ed71e4fe71b76c7d638f66d8633575c4016efd2977ce7c28317d0
+ARG ACTIONLINT_SHA256_amd64=023070a287cd8cccd71515fedc843f1985bf96c436b7effaecce67290e7e0757
+RUN set -eux; \
+    arch="$(dpkg --print-architecture)"; \
+    case "$arch" in \
+      arm64) node_sha="$NODE_SHA256_arm64"; al_sha="$ACTIONLINT_SHA256_arm64" ;; \
+      amd64) node_sha="$NODE_SHA256_amd64"; al_sha="$ACTIONLINT_SHA256_amd64" ;; \
+      *) echo "unsupported build arch: $arch" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSLo /tmp/node.tar.gz "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-${arch}.tar.gz"; \
+    echo "${node_sha}  /tmp/node.tar.gz" | sha256sum -c -; \
+    tar -xzf /tmp/node.tar.gz -C /opt; \
+    mv "/opt/node-v${NODE_VERSION}-linux-${arch}" /opt/node; \
+    rm /tmp/node.tar.gz; \
+    rm -f /usr/local/bin/yarn; \
+    ln -sf /opt/node/bin/node /opt/node/bin/npm /opt/node/bin/npx /usr/local/bin/; \
+    npm install -g "yarn@${YARN_VERSION}"; \
+    ln -sf /opt/node/bin/yarn /usr/local/bin/yarn; \
+    curl -fsSLo /tmp/actionlint.tar.gz "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_${arch}.tar.gz"; \
+    echo "${al_sha}  /tmp/actionlint.tar.gz" | sha256sum -c -; \
+    tar -xzf /tmp/actionlint.tar.gz -C /usr/local/bin actionlint; \
+    rm /tmp/actionlint.tar.gz; \
+    node --version; yarn --version; npm --version; actionlint --version
 
 # Host agent config is mounted read-only under /srv/agent-home-stage with
 # host-controlled permissions. The entrypoint copies it into root-owned

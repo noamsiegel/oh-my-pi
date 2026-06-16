@@ -40,10 +40,12 @@ If focus is `verify-fixes`, this is not a fresh full review. Your job is:
   surrounding code before judging.
 - **No duplicates.** Check prior comments/reviews available through `fetch_pr` context or
   `fetch_thread`; do not repeat existing findings.
-- **Terminal policy.** Submit `REQUEST_CHANGES` for any remaining critical/required finding.
-  Submit `APPROVE` when clean. On self-authored PRs, GitHub cannot accept author terminal
-  reviews, so submit `COMMENT` with the would-approve/would-request-changes result.
-  Use `submit_pr_review(event="COMMENT")` otherwise only when an explicit environment limitation prevents judging the PR.
+- **Terminal policy.** `REQUEST_CHANGES` is currently downgraded to `COMMENT` by the review
+  helper, so a blocking review posts as a `COMMENT` that carries the inline critical/required
+  findings. Submit `APPROVE` when clean. On self-authored PRs, GitHub cannot accept author
+  terminal reviews, so submit `COMMENT` with the would-approve/would-request-changes result.
+  Use `submit_pr_review(event="COMMENT")` otherwise only when an explicit environment
+  limitation prevents judging the PR.
 - **No false clean.** Never use `review:clean`, `APPROVE`, or “clean review” if a local
   check you were able to run failed/errored or has unclear status. The review workspace
   ships a real toolchain (`python`+`uv`, `node`+`corepack yarn`, `actionlint`) and the whole
@@ -121,18 +123,22 @@ touch. Review with the lens of someone who will own this code:
 - **Silent contract violations** — does it advertise behavior (validation, caching,
   isolation) it doesn't actually implement?
 
-For each concrete finding, add it to a candidate findings array. Include a structured
-`verification` ledger when calling `validate_pr_review`.
+For each concrete finding, add it to a candidate findings array. Always include a structured
+`verification` ledger when calling `validate_pr_review` — at least one check, even on a
+trivial PR. If nothing is runnable, record an explicit `status:"unavailable"`/`"not_run"`
+entry with the reason; never approve with an empty ledger.
 
 **Run local verification — the tools are installed and the project is hydrated.** The
 worktree is a read-only checkout of the whole touched project (the backend Django project,
-or the `hoa-web` yarn workspace), with `python`/`uv`, `node`/`corepack yarn`, and
-`actionlint` on PATH. Install deps, then run the targeted checks for the changed surface:
-- Backend (`apps/hoa`): `uv run python manage.py test <targeted dotted paths>` for tests
-  that don’t need a live database; `uv run python -m py_compile` / targeted imports for
-  quick sanity.
-- Frontend (`apps/hoa/hoa-web`): `corepack yarn install` once, then
-  `yarn --cwd apps/<member> test:run <files>`, plus `eslint`/`tsc` on the changed files.
+or the `hoa-web` yarn workspace), with `python`/`uv`, `node`, `yarn` (Classic 1.22.x), and
+`actionlint` on PATH. Run from the project root and use locked installs so a missing
+lockfile update surfaces as a failure instead of being silently rewritten:
+- Backend (`apps/hoa`): `uv --directory apps/hoa run --locked python manage.py test
+  <targeted dotted paths>` for tests that don’t need a live database; `python -m py_compile`
+  / targeted imports for quick sanity.
+- Frontend (`apps/hoa/hoa-web`): `yarn --cwd apps/hoa/hoa-web install --frozen-lockfile`
+  once, then `yarn --cwd apps/hoa/hoa-web/<workspace-member> test:run <files>`, plus
+  `eslint` / `tsc` on the changed files.
 - Workflows (`.github/workflows`): `actionlint <files>`.
 Record each as a `verification` check. A check that RUNS and fails/errors blocks a clean
 verdict. A check that genuinely needs infra you don’t have (database, external service,
@@ -183,8 +189,9 @@ submit_pr_review(body="<summary>", event="APPROVE|REQUEST_CHANGES|COMMENT")
 ```
 
 - Use the event recommended by `validate_pr_review`: `APPROVE` when no critical/required
-  finding remains, `REQUEST_CHANGES` (the helper may downgrade this to `COMMENT`) for a
-  blocking finding, `COMMENT` for self-authored PRs or an explicit environment limitation.
+  finding remains. A blocking finding currently posts as a `COMMENT` with inline comments
+  (`REQUEST_CHANGES` is temporarily downgraded by the helper); `COMMENT` also covers
+  self-authored PRs and explicit environment limitations.
 - Do not submit REQUEST_CHANGES unless at least one validated inline finding will be posted; resolve stale verify-status body concerns or add a concrete anchored finding first.
 - A runnable local check that failed/errored — or a check you skipped but could have run —
   means **not clean**: `submit_pr_review(event="COMMENT")` with the limitation, or carry a

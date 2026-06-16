@@ -62,6 +62,7 @@ from robomp.git_ops import (
     fetch_prune as git_fetch_prune,
     fetch_ref as git_fetch_ref,
     prepare_pr_worktree as git_prepare_pr_worktree,
+    pr_sparse_checkout_patterns,
     redact_credentials,
     push as git_push,
 )
@@ -822,6 +823,7 @@ class SandboxManager:
         head_sha: str,
         base_ref: str,
         changed_paths: tuple[str, ...],
+        hydrated_paths: tuple[str, ...],
     ) -> None:
         (session_dir / "pr-review-workspace.json").write_text(
             json.dumps(
@@ -831,6 +833,7 @@ class SandboxManager:
                     "head_sha": head_sha,
                     "base_ref": base_ref,
                     "changed_paths": list(changed_paths),
+                    "hydrated_paths": list(hydrated_paths),
                     "prepared_at": datetime.now(UTC).isoformat(),
                 },
                 indent=2,
@@ -915,11 +918,20 @@ class SandboxManager:
                     env=slot_git_env,
                     **slot_git_kwargs,
                 )
+                expected_patterns: tuple[str, ...] = ()
+                if requested_changed_paths:
+                    try:
+                        expected_patterns = pr_sparse_checkout_patterns(requested_changed_paths)
+                    except ValueError:
+                        expected_patterns = ()
                 manifest_matches = (
                     manifest is not None
                     and manifest.get("head_sha") == requested_head_sha
                     and manifest.get("base_ref") == pr_base_ref
                     and tuple(manifest.get("changed_paths") or ()) == requested_changed_paths
+                    # Rebuild when the sparse-hydration spec changed (stale worktrees
+                    # prepared before a checkout-strategy change carry old patterns).
+                    and tuple(manifest.get("hydrated_paths") or ()) == expected_patterns
                 )
                 head_matches = local_head.returncode == 0 and local_head.stdout.strip().lower() == requested_head_sha
                 if not manifest_matches or not head_matches:
@@ -952,6 +964,7 @@ class SandboxManager:
                     head_sha=requested_head_sha,
                     base_ref=pr_base_ref,
                     changed_paths=requested_changed_paths,
+                    hydrated_paths=result.hydrated_paths,
                 )
             else:
                 # Make sure the requested start point exists locally (best-effort).

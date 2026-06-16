@@ -622,6 +622,13 @@ _HOA_BACKEND_ROOT = "apps/hoa/"
 _HOA_FRONTEND_ROOT = "apps/hoa/hoa-web/"
 
 
+def _path_under_root(path: str, root: str) -> bool:
+    """True when `path` is inside `root` (a trailing-slash dir prefix) or equals
+    the bare root directory itself (a changed path given without a trailing
+    slash). Guards against a project-root path being misclassified."""
+    return path == root.rstrip("/") or path.startswith(root)
+
+
 def pr_sparse_checkout_patterns(paths: Iterable[str]) -> tuple[str, ...]:
     """``git sparse-checkout set --no-cone`` patterns for a PR-review worktree.
 
@@ -643,9 +650,9 @@ def pr_sparse_checkout_patterns(paths: Iterable[str]) -> tuple[str, ...]:
     if not changed:
         raise ValueError("PR sparse checkout requires at least one changed path")
 
-    touched_frontend = any(p.startswith(_HOA_FRONTEND_ROOT) for p in changed)
+    touched_frontend = any(_path_under_root(p, _HOA_FRONTEND_ROOT) for p in changed)
     touched_backend = any(
-        p.startswith(_HOA_BACKEND_ROOT) and not p.startswith(_HOA_FRONTEND_ROOT)
+        _path_under_root(p, _HOA_BACKEND_ROOT) and not _path_under_root(p, _HOA_FRONTEND_ROOT)
         for p in changed
     )
 
@@ -667,7 +674,7 @@ def pr_sparse_checkout_patterns(paths: Iterable[str]) -> tuple[str, ...]:
 
     # Files outside the hydrated HOA roots keep file-scoped hydration.
     for path in changed:
-        if path.startswith(_HOA_BACKEND_ROOT):
+        if _path_under_root(path, _HOA_BACKEND_ROOT):
             continue
         add(path)
 
@@ -773,6 +780,7 @@ def prepare_pr_worktree(
     if pr_number <= 0:
         raise ValueError(f"invalid PR number: {pr_number!r}")
     expected_head_sha = _validate_commit_sha(expected_head_sha)
+    changed_paths = tuple(changed_paths)
     validation_paths = normalize_pr_sparse_paths(changed_paths)
     sparse_patterns = pr_sparse_checkout_patterns(changed_paths)
     if not _is_safe_pr_base_ref(base_ref):
